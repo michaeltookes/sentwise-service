@@ -1,0 +1,11 @@
+{
+  "name": "sentwise-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sentwise managed-inference service — a stateless, zero-retention Cloudflare Worker that proxies drafting requests to Anthropic behind Clerk authentication.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  }
+}

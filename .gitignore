@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+dist/
+
+# Secrets — never commit any real secret material
+*.env
+.env
+.env.*
+!.env.example
+
+# Test / coverage
+coverage/
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
