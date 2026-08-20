@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sentwise-inference",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "313171820c15d1a8f14bed4dbcb699af",
+  "observability": {
+    "enabled": true
+  },
+  // Public, safe-to-commit key. Secrets (CLERK_SECRET_KEY, ANTHROPIC_API_KEY)
+  // are pushed with `wrangler secret put` and never live in this file.
+  "vars": {
+    "CLERK_PUBLISHABLE_KEY": "pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA"
+  }
+}
