@@ -45,6 +45,10 @@ export async function authenticate(request: Request, env: Env): Promise<AuthedUs
 
 const TRIAL_METADATA_KEY = "trialStartedAt";
 
+// TODO(56b): trial state is read from Clerk on every draft, costing two Clerk
+// Backend API calls per request (getUser + updateUserMetadata on first draft).
+// Cache it (KV/D1, short TTL keyed by userId) so steady-state drafts skip the
+// lookup; metering (56b) will introduce that store anyway.
 /**
  * Read the user's trial state, initializing `trialStartedAt` in Clerk
  * privateMetadata on the first authenticated call. Returns account info.
@@ -68,6 +72,11 @@ export async function resolveAccount(
 
   const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
   let startedAt = typeof meta[TRIAL_METADATA_KEY] === "string" ? (meta[TRIAL_METADATA_KEY] as string) : null;
+  // A corrupt/unparseable timestamp must not permanently expire the trial —
+  // treat it as not-started so it re-initializes below.
+  if (startedAt !== null && Number.isNaN(Date.parse(startedAt))) {
+    startedAt = null;
+  }
 
   if (!startedAt && options.initialize) {
     startedAt = new Date().toISOString();

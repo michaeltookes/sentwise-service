@@ -35,6 +35,9 @@ That's the whole job. Metering, caps, rate-limiting, and checkout are **out of s
   `src/`.
 - **The only persisted state** anywhere is a single timestamp — `trialStartedAt` — stored in the
   user's Clerk `privateMetadata` to enforce the trial. No mail, no drafts, no prompts.
+- **Cloudflare invocation logs are disabled** (`observability.logs.invocation_logs: false` in
+  `wrangler.jsonc`), so Cloudflare retains no per-request records — only aggregate metrics (request
+  counts, error rates) with no content.
 
 If you want to verify the claim yourself, read the request path end to end — it is short:
 

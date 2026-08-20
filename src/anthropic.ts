@@ -3,6 +3,7 @@ import {
   ANTHROPIC_VERSION,
   DEFAULT_MAX_TOKENS,
   DEFAULT_MODEL,
+  MAX_TOTAL_CONTENT_CHARS,
   type Env,
 } from "./config";
 import { ApiError } from "./errors";
@@ -48,8 +49,12 @@ export function parseDraftRequest(body: unknown): DraftRequest {
   });
 
   const req: DraftRequest = { messages: parsed };
+  // Cost guard (56a): only the server-chosen default model is allowed, and
+  // maxTokens is clamped, so a client can't run up spend on a bigger model or a
+  // huge completion. TODO(56b): per-account token metering replaces these caps.
   if (b.model !== undefined) {
     if (typeof b.model !== "string") throw new ApiError(400, "invalid_request", "`model` must be a string.");
+    if (b.model !== DEFAULT_MODEL) throw new ApiError(400, "invalid_request", "Unsupported model.");
     req.model = b.model;
   }
   if (b.system !== undefined) {
@@ -58,12 +63,22 @@ export function parseDraftRequest(body: unknown): DraftRequest {
   }
   if (b.maxTokens !== undefined) {
     if (typeof b.maxTokens !== "number") throw new ApiError(400, "invalid_request", "`maxTokens` must be a number.");
-    req.maxTokens = b.maxTokens;
+    // Clamp into [1, DEFAULT_MAX_TOKENS] rather than reject, so a generous client
+    // value still works but can never exceed the server ceiling.
+    req.maxTokens = Math.min(Math.max(Math.floor(b.maxTokens), 1), DEFAULT_MAX_TOKENS);
   }
   if (b.temperature !== undefined) {
     if (typeof b.temperature !== "number") throw new ApiError(400, "invalid_request", "`temperature` must be a number.");
     req.temperature = b.temperature;
   }
+
+  // Bound total input size (system + every message body) to cap upstream cost.
+  const totalChars =
+    (req.system?.length ?? 0) + req.messages.reduce((sum, m) => sum + m.content.length, 0);
+  if (totalChars > MAX_TOTAL_CONTENT_CHARS) {
+    throw new ApiError(413, "request_too_large", "The request is too large to draft.");
+  }
+
   return req;
 }
 

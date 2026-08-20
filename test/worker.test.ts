@@ -121,6 +121,24 @@ describe("POST /v1/draft trial handling", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("re-initializes the trial when trialStartedAt is unparseable", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ trialStartedAt: "not-a-real-date" }));
+    mocks.updateUserMetadata.mockResolvedValue(undefined);
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("hi"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }) }),
+      env,
+    );
+
+    // Treated as not-started -> re-initialized and allowed (not permanently expired).
+    expect(res.status).toBe(200);
+    expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("returns 402 trial_expired after 14 days and never calls Anthropic", async () => {
     const started = new Date(Date.now() - TRIAL_MS - 1000).toISOString();
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });

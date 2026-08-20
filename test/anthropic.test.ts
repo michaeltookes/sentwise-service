@@ -50,6 +50,39 @@ describe("parseDraftRequest", () => {
   it("rejects wrong-typed optional fields", () => {
     expect(() => parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: "big" })).toThrow(ApiError);
   });
+
+  it("rejects a non-default model (cost guard)", () => {
+    try {
+      parseDraftRequest({ model: "claude-opus-4-8", messages: [{ role: "user", content: "x" }] });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      expect((err as ApiError).status).toBe(400);
+      expect((err as ApiError).type).toBe("invalid_request");
+    }
+    // The default model is accepted.
+    expect(parseDraftRequest({ model: DEFAULT_MODEL, messages: [{ role: "user", content: "x" }] }).model).toBe(DEFAULT_MODEL);
+  });
+
+  it("clamps maxTokens into [1, DEFAULT_MAX_TOKENS]", () => {
+    expect(parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 10_000_000 }).maxTokens).toBe(DEFAULT_MAX_TOKENS);
+    expect(parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 0 }).maxTokens).toBe(1);
+    expect(parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 256 }).maxTokens).toBe(256);
+  });
+
+  it("rejects an oversized request with 413 request_too_large", () => {
+    const huge = "a".repeat(200_001);
+    try {
+      parseDraftRequest({ messages: [{ role: "user", content: huge }] });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      expect((err as ApiError).status).toBe(413);
+      expect((err as ApiError).type).toBe("request_too_large");
+    }
+    // Just under the limit (system + messages) is fine.
+    expect(() => parseDraftRequest({ system: "a".repeat(100_000), messages: [{ role: "user", content: "b".repeat(99_999) }] })).not.toThrow();
+  });
 });
 
 describe("forwardToAnthropic", () => {

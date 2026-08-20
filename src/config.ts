@@ -26,3 +26,8 @@ export const DEFAULT_MAX_TOKENS = 4096;
 // Full-featured trial length. Enforced server-side (56a decision).
 export const TRIAL_DAYS = 14;
 export const TRIAL_MS = TRIAL_DAYS * 24 * 60 * 60 * 1000;
+
+// Blunt input caps to bound Anthropic cost until per-account metering (56b)
+// replaces them. TODO(56b): swap these fixed limits for per-account token
+// metering, daily/monthly caps, and rate limiting.
+export const MAX_TOTAL_CONTENT_CHARS = 200_000;
