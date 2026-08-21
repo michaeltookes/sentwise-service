@@ -32,7 +32,7 @@ export default {
 
       // Browser landing pages for the Google / OpenRouter round-trips (item 59).
       if (isCallbackPath(pathname) && request.method === "GET") {
-        return renderCallbackPage(pathname, url.searchParams);
+        return renderCallbackPage(pathname);
       }
 
       if (pathname === "/v1/me" && request.method === "GET") {
