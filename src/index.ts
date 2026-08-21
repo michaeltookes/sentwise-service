@@ -2,12 +2,15 @@ import { authenticate, requireActiveTrial, resolveAccount } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
 import type { Env } from "./config";
+import { isCallbackPath, renderCallbackPage } from "./callback";
 
 /**
  * Sentwise managed-inference Worker (backlog 56a).
  *
  * Routes:
  *   GET  /healthz    -> liveness, no auth
+ *   GET  /auth/callback, /openrouter/callback -> browser landing pages that hand
+ *        the OAuth / key-provisioning result to the Mac app's sentwise:// scheme
  *   GET  /v1/me      -> { userId, email, trial } for the account display
  *   POST /v1/draft   -> forwards a drafting request to Anthropic (trial-gated)
  *
@@ -25,6 +28,11 @@ export default {
     try {
       if (pathname === "/healthz" && request.method === "GET") {
         return Response.json({ status: "ok" });
+      }
+
+      // Browser landing pages for the Google / OpenRouter round-trips (item 59).
+      if (isCallbackPath(pathname) && request.method === "GET") {
+        return renderCallbackPage(pathname, url.searchParams);
       }
 
       if (pathname === "/v1/me" && request.method === "GET") {
@@ -49,7 +57,12 @@ export default {
       }
 
       // Known paths with the wrong method get 405; everything else 404.
-      if (pathname === "/v1/draft" || pathname === "/v1/me" || pathname === "/healthz") {
+      if (
+        pathname === "/v1/draft" ||
+        pathname === "/v1/me" ||
+        pathname === "/healthz" ||
+        isCallbackPath(pathname)
+      ) {
         return jsonError(405, "method_not_allowed", "Method not allowed.");
       }
       return jsonError(404, "not_found", "Not found.");
