@@ -2,10 +2,38 @@
   "name": "sentwise-service",
   "version": "0.1.0",
   "private": true,
-  "description": "Sentwise managed-inference service — a stateless, zero-retention Cloudflare Worker that proxies drafting requests to Anthropic behind Clerk authentication.",
+  "description": "Sentwise managed-inference service \u2014 a stateless, zero-retention Cloudflare Worker that proxies drafting requests to Anthropic behind Clerk authentication.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "predeploy": "npm run lint && npm run typecheck && npm run test",
+    "gen-dev-vars": "bash scripts/gen-dev-vars.sh",
+    "check-no-body-logging": "bash scripts/check-no-body-logging.sh",
+    "lint": "eslint . && prettier --check .",
+    "lint:fix": "eslint . --fix && prettier --write .",
+    "audit": "npm audit --audit-level=high"
+  },
+  "dependencies": {
+    "@clerk/backend": "^3.16.10"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260820.1",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.0.0"
   }
 }

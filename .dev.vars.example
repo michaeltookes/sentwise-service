@@ -1,0 +1,5 @@
+# Copy to .dev.vars (gitignored) or run `npm run gen-dev-vars` to generate it
+# from ~/.config/sentwise-service/.env. Never commit real values.
+CLERK_PUBLISHABLE_KEY="pk_test_..."
+CLERK_SECRET_KEY="sk_test_..."
+ANTHROPIC_API_KEY="sk-ant-..."
