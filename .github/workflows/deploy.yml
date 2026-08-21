@@ -1,0 +1,39 @@
+name: Deploy
+
+# Deploys the Worker from `main` so production never drifts from the source
+# of truth. Gated by the `production` environment — configure a required
+# reviewer there to keep deploys manual-approval until 56c ships.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy sentwise-inference
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+      - run: npm ci
+      - name: Lint, typecheck, test
+        run: npm run lint && npm run typecheck && npm test
+      - name: Deploy
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Smoke check
+        run: curl -fsS https://sentwise-inference.sentwise-service.workers.dev/healthz

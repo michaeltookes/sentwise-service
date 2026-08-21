@@ -43,12 +43,16 @@ describe("parseDraftRequest", () => {
 
   it("rejects empty or invalid messages", () => {
     expect(() => parseDraftRequest({ messages: [] })).toThrow(ApiError);
-    expect(() => parseDraftRequest({ messages: [{ role: "system", content: "x" }] })).toThrow(ApiError);
+    expect(() => parseDraftRequest({ messages: [{ role: "system", content: "x" }] })).toThrow(
+      ApiError,
+    );
     expect(() => parseDraftRequest({ messages: [{ role: "user", content: 5 }] })).toThrow(ApiError);
   });
 
   it("rejects wrong-typed optional fields", () => {
-    expect(() => parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: "big" })).toThrow(ApiError);
+    expect(() =>
+      parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: "big" }),
+    ).toThrow(ApiError);
   });
 
   it("rejects a non-default model (cost guard)", () => {
@@ -61,13 +65,22 @@ describe("parseDraftRequest", () => {
       expect((err as ApiError).type).toBe("invalid_request");
     }
     // The default model is accepted.
-    expect(parseDraftRequest({ model: DEFAULT_MODEL, messages: [{ role: "user", content: "x" }] }).model).toBe(DEFAULT_MODEL);
+    expect(
+      parseDraftRequest({ model: DEFAULT_MODEL, messages: [{ role: "user", content: "x" }] }).model,
+    ).toBe(DEFAULT_MODEL);
   });
 
   it("clamps maxTokens into [1, DEFAULT_MAX_TOKENS]", () => {
-    expect(parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 10_000_000 }).maxTokens).toBe(DEFAULT_MAX_TOKENS);
-    expect(parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 0 }).maxTokens).toBe(1);
-    expect(parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 256 }).maxTokens).toBe(256);
+    expect(
+      parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 10_000_000 })
+        .maxTokens,
+    ).toBe(DEFAULT_MAX_TOKENS);
+    expect(
+      parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 0 }).maxTokens,
+    ).toBe(1);
+    expect(
+      parseDraftRequest({ messages: [{ role: "user", content: "x" }], maxTokens: 256 }).maxTokens,
+    ).toBe(256);
   });
 
   it("rejects an oversized request with 413 request_too_large", () => {
@@ -81,7 +94,12 @@ describe("parseDraftRequest", () => {
       expect((err as ApiError).type).toBe("request_too_large");
     }
     // Just under the limit (system + messages) is fine.
-    expect(() => parseDraftRequest({ system: "a".repeat(100_000), messages: [{ role: "user", content: "b".repeat(99_999) }] })).not.toThrow();
+    expect(() =>
+      parseDraftRequest({
+        system: "a".repeat(100_000),
+        messages: [{ role: "user", content: "b".repeat(99_999) }],
+      }),
+    ).not.toThrow();
   });
 });
 
@@ -91,7 +109,7 @@ describe("forwardToAnthropic", () => {
     const res = await forwardToAnthropic(
       { system: "sys", messages: [{ role: "user", content: "draft this" }], temperature: 0.4 },
       env,
-      fetchMock as unknown as typeof fetch,
+      fetchMock,
     );
 
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -116,7 +134,7 @@ describe("forwardToAnthropic", () => {
     await forwardToAnthropic(
       { model: "claude-opus-4-8", maxTokens: 256, messages: [{ role: "user", content: "x" }] },
       env,
-      fetchMock as unknown as typeof fetch,
+      fetchMock,
     );
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.model).toBe("claude-opus-4-8");
@@ -126,27 +144,49 @@ describe("forwardToAnthropic", () => {
   });
 
   it("maps Anthropic 429 to a clean rate_limited error", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ error: { type: "rate_limit_error", message: "secret detail" } }), { status: 429 }),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { type: "rate_limit_error", message: "secret detail" } }),
+          { status: 429 },
+        ),
+      );
     await expect(
-      forwardToAnthropic({ messages: [{ role: "user", content: "x" }] }, env, fetchMock as unknown as typeof fetch),
+      forwardToAnthropic(
+        { messages: [{ role: "user", content: "x" }] },
+        env,
+        fetchMock as unknown as typeof fetch,
+      ),
     ).rejects.toMatchObject({ status: 429, type: "rate_limited" });
   });
 
   it("maps an auth failure of OUR key to a generic upstream error (never 401 to the user)", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ error: { type: "authentication_error", message: "bad key" } }), { status: 401 }),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { type: "authentication_error", message: "bad key" } }),
+          { status: 401 },
+        ),
+      );
     await expect(
-      forwardToAnthropic({ messages: [{ role: "user", content: "x" }] }, env, fetchMock as unknown as typeof fetch),
+      forwardToAnthropic(
+        { messages: [{ role: "user", content: "x" }] },
+        env,
+        fetchMock as unknown as typeof fetch,
+      ),
     ).rejects.toMatchObject({ status: 502, type: "upstream_error" });
   });
 
   it("maps a network failure to upstream_unavailable", async () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error("boom"));
     await expect(
-      forwardToAnthropic({ messages: [{ role: "user", content: "x" }] }, env, fetchMock as unknown as typeof fetch),
+      forwardToAnthropic(
+        { messages: [{ role: "user", content: "x" }] },
+        env,
+        fetchMock as unknown as typeof fetch,
+      ),
     ).rejects.toMatchObject({ status: 502, type: "upstream_unavailable" });
   });
 });

@@ -5,9 +5,18 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-test:
+  build-test-lint:
+    name: Build, Test & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,7 +26,11 @@ jobs:
       - run: npm ci
       - name: Privacy guard (no body logging)
         run: npm run check-no-body-logging
+      - name: Lint (ESLint + Prettier)
+        run: npm run lint
       - name: Typecheck
         run: npm run typecheck
       - name: Tests
         run: npm test
+      - name: Dependency audit
+        run: npm run audit

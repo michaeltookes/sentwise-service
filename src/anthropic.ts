@@ -40,7 +40,11 @@ export function parseDraftRequest(body: unknown): DraftRequest {
     }
     const mm = m as Record<string, unknown>;
     if (mm.role !== "user" && mm.role !== "assistant") {
-      throw new ApiError(400, "invalid_request", `messages[${i}].role must be "user" or "assistant".`);
+      throw new ApiError(
+        400,
+        "invalid_request",
+        `messages[${i}].role must be "user" or "assistant".`,
+      );
     }
     if (typeof mm.content !== "string") {
       throw new ApiError(400, "invalid_request", `messages[${i}].content must be a string.`);
@@ -53,22 +57,26 @@ export function parseDraftRequest(body: unknown): DraftRequest {
   // maxTokens is clamped, so a client can't run up spend on a bigger model or a
   // huge completion. TODO(56b): per-account token metering replaces these caps.
   if (b.model !== undefined) {
-    if (typeof b.model !== "string") throw new ApiError(400, "invalid_request", "`model` must be a string.");
+    if (typeof b.model !== "string")
+      throw new ApiError(400, "invalid_request", "`model` must be a string.");
     if (b.model !== DEFAULT_MODEL) throw new ApiError(400, "invalid_request", "Unsupported model.");
     req.model = b.model;
   }
   if (b.system !== undefined) {
-    if (typeof b.system !== "string") throw new ApiError(400, "invalid_request", "`system` must be a string.");
+    if (typeof b.system !== "string")
+      throw new ApiError(400, "invalid_request", "`system` must be a string.");
     req.system = b.system;
   }
   if (b.maxTokens !== undefined) {
-    if (typeof b.maxTokens !== "number") throw new ApiError(400, "invalid_request", "`maxTokens` must be a number.");
+    if (typeof b.maxTokens !== "number")
+      throw new ApiError(400, "invalid_request", "`maxTokens` must be a number.");
     // Clamp into [1, DEFAULT_MAX_TOKENS] rather than reject, so a generous client
     // value still works but can never exceed the server ceiling.
     req.maxTokens = Math.min(Math.max(Math.floor(b.maxTokens), 1), DEFAULT_MAX_TOKENS);
   }
   if (b.temperature !== undefined) {
-    if (typeof b.temperature !== "number") throw new ApiError(400, "invalid_request", "`temperature` must be a number.");
+    if (typeof b.temperature !== "number")
+      throw new ApiError(400, "invalid_request", "`temperature` must be a number.");
     req.temperature = b.temperature;
   }
 
@@ -117,7 +125,11 @@ export async function forwardToAnthropic(
     });
   } catch {
     // Network failure reaching Anthropic — never leak internals.
-    throw new ApiError(502, "upstream_unavailable", "Could not reach the drafting service. Try again shortly.");
+    throw new ApiError(
+      502,
+      "upstream_unavailable",
+      "Could not reach the drafting service. Try again shortly.",
+    );
   }
 
   if (!res.ok) {
@@ -126,9 +138,13 @@ export async function forwardToAnthropic(
 
   let data: AnthropicMessage;
   try {
-    data = (await res.json()) as AnthropicMessage;
+    data = await res.json();
   } catch {
-    throw new ApiError(502, "upstream_invalid_response", "The drafting service returned an unexpected response.");
+    throw new ApiError(
+      502,
+      "upstream_invalid_response",
+      "The drafting service returned an unexpected response.",
+    );
   }
 
   const text = (data.content ?? [])
@@ -160,7 +176,7 @@ interface AnthropicMessage {
  */
 async function safeErrorType(res: Response): Promise<string> {
   try {
-    const body = (await res.json()) as { error?: { type?: string } };
+    const body = await res.json<{ error?: { type?: string } }>();
     return body.error?.type ?? "unknown";
   } catch {
     return "unknown";
@@ -170,14 +186,26 @@ async function safeErrorType(res: Response): Promise<string> {
 function mapAnthropicError(status: number, upstreamType: string): ApiError {
   // Never forward the upstream message body. Map to clean, user-safe errors.
   if (status === 429 || upstreamType === "rate_limit_error") {
-    return new ApiError(429, "rate_limited", "The drafting service is busy. Please try again in a moment.");
+    return new ApiError(
+      429,
+      "rate_limited",
+      "The drafting service is busy. Please try again in a moment.",
+    );
   }
   if (status === 529 || upstreamType === "overloaded_error") {
-    return new ApiError(503, "overloaded", "The drafting service is temporarily overloaded. Try again shortly.");
+    return new ApiError(
+      503,
+      "overloaded",
+      "The drafting service is temporarily overloaded. Try again shortly.",
+    );
   }
   if (status === 400 || upstreamType === "invalid_request_error") {
     return new ApiError(400, "invalid_request", "The drafting request was rejected as malformed.");
   }
   // 401/403 here means OUR server key is bad — that's an internal fault, not the user's.
-  return new ApiError(502, "upstream_error", "The drafting service returned an error. Please try again.");
+  return new ApiError(
+    502,
+    "upstream_error",
+    "The drafting service returned an error. Please try again.",
+  );
 }

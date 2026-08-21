@@ -67,11 +67,15 @@ export async function resolveAccount(
   try {
     user = await clerk.users.getUser(userId);
   } catch {
-    throw new ApiError(502, "account_lookup_failed", "Could not load your account. Please try again.");
+    throw new ApiError(
+      502,
+      "account_lookup_failed",
+      "Could not load your account. Please try again.",
+    );
   }
 
   const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
-  let startedAt = typeof meta[TRIAL_METADATA_KEY] === "string" ? (meta[TRIAL_METADATA_KEY] as string) : null;
+  let startedAt = typeof meta[TRIAL_METADATA_KEY] === "string" ? meta[TRIAL_METADATA_KEY] : null;
   // A corrupt/unparseable timestamp must not permanently expire the trial —
   // treat it as not-started so it re-initializes below.
   if (startedAt !== null && Number.isNaN(Date.parse(startedAt))) {

@@ -7,8 +7,8 @@ backlog item **56a** (account + proxy).
 
 **Deployed:** `https://sentwise-inference.sentwise-service.workers.dev`
 
-This repository is public on purpose. The product's core privacy promise — *your mail is never
-stored on our servers and never becomes training data* — is only credible if the code that handles
+This repository is public on purpose. The product's core privacy promise — _your mail is never
+stored on our servers and never becomes training data_ — is only credible if the code that handles
 your mail is readable. This is that code.
 
 ## What it does
@@ -30,7 +30,7 @@ That's the whole job. Metering, caps, rate-limiting, and checkout are **out of s
 - **Nothing is stored.** There is no database, no KV, no D1, no queue. The request and response live
   in memory for the duration of one `fetch` and are then gone.
 - **Nothing is logged.** The Worker never writes request or response bodies anywhere. The only
-  telemetry is error *types* (e.g. `rate_limited`), never content. This is enforced in CI by
+  telemetry is error _types_ (e.g. `rate_limited`), never content. This is enforced in CI by
   `scripts/check-no-body-logging.sh`, which fails the build if any `console.*` call appears in
   `src/`.
 - **The only persisted state** anywhere is a single timestamp — `trialStartedAt` — stored in the
@@ -50,25 +50,35 @@ src/index.ts      router: /healthz, /v1/me, /v1/draft
 ## API
 
 ### `GET /healthz`
+
 Liveness. No auth. Returns `{ "status": "ok" }`.
 
 ### `GET /v1/me`
+
 Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for display:
 
 ```json
-{ "userId": "user_...", "email": "you@example.com",
-  "trial": { "startedAt": "2026-08-20T...Z", "endsAt": "2026-09-03T...Z", "active": true } }
+{
+  "userId": "user_...",
+  "email": "you@example.com",
+  "trial": { "startedAt": "2026-08-20T...Z", "endsAt": "2026-09-03T...Z", "active": true }
+}
 ```
 
 Viewing your account never starts the trial — the trial begins on your first real draft.
 
 ### `POST /v1/draft`
+
 Requires `Authorization: Bearer <clerk-session-token>`. Body mirrors the app's `LLMRequest`:
 
 ```json
-{ "model": "claude-sonnet-4-6", "system": "…voice profile…",
+{
+  "model": "claude-sonnet-4-6",
+  "system": "…voice profile…",
   "messages": [{ "role": "user", "content": "…" }],
-  "maxTokens": 4096, "temperature": 0.7 }
+  "maxTokens": 4096,
+  "temperature": 0.7
+}
 ```
 
 `model`, `maxTokens`, `temperature`, and `system` are optional (model defaults to

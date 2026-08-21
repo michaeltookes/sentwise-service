@@ -35,7 +35,10 @@ function bearer(token = "good-token"): HeadersInit {
 
 function anthropicOk(text = "drafted") {
   return new Response(
-    JSON.stringify({ content: [{ type: "text", text }], usage: { input_tokens: 3, output_tokens: 2 } }),
+    JSON.stringify({
+      content: [{ type: "text", text }],
+      usage: { input_tokens: 3, output_tokens: 2 },
+    }),
     { status: 200 },
   );
 }
@@ -75,7 +78,11 @@ describe("auth", () => {
   it("rejects an invalid JWT with 401", async () => {
     mocks.verifyToken.mockRejectedValue(new Error("bad signature"));
     const res = await worker.fetch(
-      req("/v1/draft", { method: "POST", headers: bearer("bad"), body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }) }),
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer("bad"),
+        body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }),
+      }),
       env,
     );
     expect(res.status).toBe(401);
@@ -92,7 +99,11 @@ describe("POST /v1/draft trial handling", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const res = await worker.fetch(
-      req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }) }),
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
       env,
     );
 
@@ -114,7 +125,11 @@ describe("POST /v1/draft trial handling", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const res = await worker.fetch(
-      req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }) }),
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
       env,
     );
     expect(res.status).toBe(200);
@@ -129,7 +144,11 @@ describe("POST /v1/draft trial handling", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const res = await worker.fetch(
-      req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }) }),
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
       env,
     );
 
@@ -147,7 +166,11 @@ describe("POST /v1/draft trial handling", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const res = await worker.fetch(
-      req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }) }),
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
       env,
     );
     expect(res.status).toBe(402);
@@ -160,13 +183,19 @@ describe("POST /v1/draft trial handling", () => {
   it("maps an Anthropic error to a clean JSON error", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ trialStartedAt: new Date().toISOString() }));
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ error: { type: "overloaded_error" } }), { status: 529 }),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ error: { type: "overloaded_error" } }), { status: 529 }),
+      );
     vi.stubGlobal("fetch", fetchMock);
 
     const res = await worker.fetch(
-      req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }) }),
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
       env,
     );
     expect(res.status).toBe(503);
@@ -177,7 +206,11 @@ describe("POST /v1/draft trial handling", () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ trialStartedAt: new Date().toISOString() }));
     const res = await worker.fetch(
-      req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify({ messages: [] }) }),
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [] }),
+      }),
       env,
     );
     expect(res.status).toBe(400);
