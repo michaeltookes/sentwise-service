@@ -22,7 +22,7 @@
     "audit": "npm audit --audit-level=high"
   },
   "dependencies": {
-    "@clerk/backend": "^3.16.10"
+    "@clerk/backend": "^3.16.12"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
