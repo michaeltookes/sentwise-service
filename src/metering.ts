@@ -20,7 +20,6 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
 export const WEEK_MS = 7 * DAY_MS;
 export const RATE_WINDOW_MS = 60_000;
 export const RESERVATION_TTL_MS = 15 * 60_000;
-export const MAX_SETTLED_RESERVATION_IDS = 128;
 export const CONSERVATIVE_MESSAGE_FRAMING_TOKENS = 16;
 
 export interface ReservationRecord {
@@ -37,7 +36,7 @@ export interface WindowState {
   tokensUsed: number;
   tokensReserved?: number; // in-flight estimated tokens reserved until settlement/release
   activeReservations?: ReservationRecord[];
-  settledReservationIds?: string[]; // bounded in-window cache; DO marker keys are authoritative
+  settledReservationIds?: string[]; // legacy in-window cache; DO marker keys are authoritative
 }
 
 /** Per-account overrides read from Clerk `privateMetadata.quota` (56c writes these). */

@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import {
-  MAX_SETTLED_RESERVATION_IDS,
   RESERVATION_TTL_MS,
   WEEK_MS,
   type ResolvedLimits,
@@ -9,6 +8,7 @@ import {
 } from "../src/metering";
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
+const OLD_BOUNDED_ARRAY_SIZE = 128;
 
 interface CheckResult {
   allowed: boolean;
@@ -265,7 +265,7 @@ describe("AccountQuota Durable Object", () => {
     expect(settled.window.tokensUsed).toBe(500);
     expect(settled.window.tokensReserved).toBe(0);
     expect(settled.window.activeReservations).toEqual([]);
-    expect(settled.window.settledReservationIds).toEqual(["settle-deferred-1"]);
+    expect(settled.window.settledReservationIds).toEqual([]);
     expect(await pendingSettlements(stub)).toEqual([]);
   });
 
@@ -280,7 +280,7 @@ describe("AccountQuota Durable Object", () => {
       });
       return res.json<T>();
     };
-    const count = MAX_SETTLED_RESERVATION_IDS + 5;
+    const count = OLD_BOUNDED_ARRAY_SIZE + 5;
     const baseNow = Date.now() + 60_000;
     const limits: ResolvedLimits = {
       ...hardLimits,
@@ -310,10 +310,11 @@ describe("AccountQuota Durable Object", () => {
     expect(queuedIds).toContain(`settle-deferred-many-${count - 1}`);
   });
 
-  it("settle keeps a bounded in-window ID cache while markers dedupe older retries", async () => {
-    const uid = "do-settle-bounded";
+  it("settle markers dedupe older retries after many newer settlements", async () => {
+    const uid = "do-settle-marker-dedupe";
     let last!: WindowResult;
-    for (let i = 0; i < MAX_SETTLED_RESERVATION_IDS + 5; i++) {
+    const count = OLD_BOUNDED_ARRAY_SIZE + 5;
+    for (let i = 0; i < count; i++) {
       const reserved = await callDO<ReserveResult>(uid, "/reserve", {
         now: MON + i,
         reservationId: `settled-${i}`,
@@ -328,8 +329,8 @@ describe("AccountQuota Durable Object", () => {
         tokensDelta: 1,
       });
     }
-    expect(last.window.settledReservationIds).toHaveLength(MAX_SETTLED_RESERVATION_IDS);
-    expect(last.window.settledReservationIds?.[0]).toBe("settled-5");
+    expect(last.window.draftsUsed).toBe(count);
+    expect(last.window.tokensUsed).toBe(count);
 
     const retryOldSettlement = await callDO<WindowResult>(uid, "/settle", {
       now: MON + 10_000,
@@ -338,8 +339,34 @@ describe("AccountQuota Durable Object", () => {
       estimatedTokens: 1,
       tokensDelta: 1,
     });
-    expect(retryOldSettlement.window.draftsUsed).toBe(MAX_SETTLED_RESERVATION_IDS + 5);
-    expect(retryOldSettlement.window.tokensUsed).toBe(MAX_SETTLED_RESERVATION_IDS + 5);
+    expect(retryOldSettlement.window.draftsUsed).toBe(count);
+    expect(retryOldSettlement.window.tokensUsed).toBe(count);
+  });
+
+  it("settle still honors legacy settledReservationIds while migrating old windows", async () => {
+    const uid = "do-settle-legacy-dedupe";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("window", {
+        windowStart: MON,
+        resetsAt: MON + WEEK_MS,
+        draftsUsed: 1,
+        tokensUsed: 500,
+        tokensReserved: 0,
+        activeReservations: [],
+        settledReservationIds: ["legacy-settled-1"],
+      } satisfies WindowState);
+    });
+
+    const retryLegacy = await callDO<WindowResult>(uid, "/settle", {
+      now: MON + 10_000,
+      reservationId: "legacy-settled-1",
+      reservationWindowStart: MON,
+      estimatedTokens: 1,
+      tokensDelta: 500,
+    });
+    expect(retryLegacy.window.draftsUsed).toBe(1);
+    expect(retryLegacy.window.tokensUsed).toBe(500);
   });
 
   it("expires abandoned reservations before admitting more hard quota capacity", async () => {

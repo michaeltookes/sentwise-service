@@ -20,7 +20,6 @@
 import type { Env } from "./config";
 import {
   activeReservations,
-  MAX_SETTLED_RESERVATION_IDS,
   pruneStamps,
   pruneExpiredReservations,
   RESERVATION_TTL_MS,
@@ -206,14 +205,14 @@ export class AccountQuota {
         body.reservationWindowStart,
       );
       if (appliesToStoredReservation) {
-        const settledIds = window.settledReservationIds ?? [];
         const reservationId = normalizedId(body.reservationId);
         const marker = reservationId
           ? await txn.get<SettledSettlementMarker>(settledSettlementKey(reservationId))
           : undefined;
         const alreadySettled =
           reservationId !== undefined &&
-          (settledIds.includes(reservationId) || isSettledSettlementMarker(marker));
+          ((window.settledReservationIds ?? []).includes(reservationId) ||
+            isSettledSettlementMarker(marker));
 
         if (!alreadySettled) {
           const active = activeReservations(window);
@@ -226,7 +225,6 @@ export class AccountQuota {
           window.tokensUsed = Math.max(0, window.tokensUsed + body.tokensDelta);
           if (reservationId) {
             window.activeReservations = active.filter((r) => r.id !== reservationId);
-            window.settledReservationIds = appendSettledReservationId(settledIds, reservationId);
             await txn.put(settledSettlementKey(reservationId), { settledAt: body.now });
           }
         }
@@ -407,12 +405,6 @@ function nonNegativeInt(v: number | undefined): number {
 
 function normalizedId(v: string | undefined): string | undefined {
   return typeof v === "string" && v !== "" ? v : undefined;
-}
-
-function appendSettledReservationId(ids: string[], id: string): string[] {
-  // This keeps the window payload bounded; settled_settlement:* keys are the
-  // retry-horizon idempotency records.
-  return [...ids, id].slice(-MAX_SETTLED_RESERVATION_IDS);
 }
 
 function isPendingSettlement(v: unknown): v is PendingSettlement {
