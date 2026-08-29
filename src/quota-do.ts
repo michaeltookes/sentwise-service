@@ -6,7 +6,7 @@
 // Storage keys:
 //   "window" -> WindowState  (weekly usage, in-flight token reservations, reset timestamps)
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
-//   "pending_settlements" -> PendingSettlement[] (alarm-retried settlement metadata)
+//   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
 //   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
@@ -68,8 +68,8 @@ interface PendingSettlement {
   nextAttemptAt: number;
 }
 
-const PENDING_SETTLEMENTS_KEY = "pending_settlements";
-const MAX_PENDING_SETTLEMENTS = 128;
+const LEGACY_PENDING_SETTLEMENTS_KEY = "pending_settlements";
+const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
 const SETTLEMENT_RETRY_BASE_DELAY_MS = 60_000;
 const SETTLEMENT_RETRY_MAX_DELAY_MS = 15 * 60_000;
 
@@ -174,16 +174,15 @@ export class AccountQuota {
     if (!body.reservationId || body.reservationWindowStart === undefined) {
       return new Response("reservation id and window required", { status: 400 });
     }
-    const pending = upsertPendingSettlement(await this.loadPendingSettlements(), {
+    await this.upsertPendingSettlement({
       reservationId: body.reservationId,
       reservationWindowStart: nonNegativeInt(body.reservationWindowStart),
       estimatedTokens: nonNegativeInt(body.estimatedTokens),
       tokensDelta: nonNegativeInt(body.tokensDelta),
       attempts: 0,
       createdAt: body.now,
-      nextAttemptAt: Math.max(Date.now() + 1, body.now),
+      nextAttemptAt: body.now,
     });
-    await this.savePendingSettlements(pending);
     return Response.json({ window: await this.loadWindow(body.now), queued: true });
   }
 
@@ -261,27 +260,61 @@ export class AccountQuota {
   }
 
   private async loadPendingSettlements(): Promise<PendingSettlement[]> {
-    const pending = await this.storage.get<PendingSettlement[]>(PENDING_SETTLEMENTS_KEY);
-    return Array.isArray(pending) ? pending.filter(isPendingSettlement) : [];
+    const pendingByKey = await this.storage.list<PendingSettlement>({
+      prefix: PENDING_SETTLEMENT_KEY_PREFIX,
+    });
+    const pendingById = new Map<string, PendingSettlement>();
+    for (const item of pendingByKey.values()) {
+      if (isPendingSettlement(item)) {
+        pendingById.set(item.reservationId, item);
+      }
+    }
+
+    const legacyPending = await this.storage.get<PendingSettlement[]>(
+      LEGACY_PENDING_SETTLEMENTS_KEY,
+    );
+    if (Array.isArray(legacyPending)) {
+      for (const item of legacyPending) {
+        if (!isPendingSettlement(item) || pendingById.has(item.reservationId)) continue;
+        pendingById.set(item.reservationId, item);
+        await this.storage.put(pendingSettlementKey(item.reservationId), item);
+      }
+      await this.storage.delete(LEGACY_PENDING_SETTLEMENTS_KEY);
+    }
+
+    return [...pendingById.values()];
   }
 
-  private async savePendingSettlements(pending: PendingSettlement[]): Promise<void> {
+  private async upsertPendingSettlement(item: PendingSettlement): Promise<void> {
+    const key = pendingSettlementKey(item.reservationId);
+    const existing = await this.storage.get<PendingSettlement>(key);
+    const next = isPendingSettlement(existing)
+      ? {
+          ...item,
+          attempts: existing.attempts,
+          createdAt: existing.createdAt,
+          nextAttemptAt: Math.min(existing.nextAttemptAt, item.nextAttemptAt),
+        }
+      : item;
+    await this.storage.put(key, next);
+    await this.schedulePendingSettlementAlarm();
+  }
+
+  private async schedulePendingSettlementAlarm(): Promise<void> {
+    const pending = await this.loadPendingSettlements();
     if (pending.length === 0) {
-      await this.storage.delete(PENDING_SETTLEMENTS_KEY);
       await this.storage.deleteAlarm();
       return;
     }
-    await this.storage.put(PENDING_SETTLEMENTS_KEY, pending);
-    await this.storage.setAlarm(new Date(Math.min(...pending.map((p) => p.nextAttemptAt))));
+    const nextAttemptAt = Math.min(...pending.map((p) => p.nextAttemptAt));
+    await this.storage.setAlarm(new Date(Math.max(Date.now() + 1, nextAttemptAt)));
   }
 
   private async processPendingSettlements(now: number): Promise<void> {
     const pending = await this.loadPendingSettlements();
-    const remaining: PendingSettlement[] = [];
 
     for (const item of pending) {
       if (item.nextAttemptAt > now) {
-        remaining.push(item);
         continue;
       }
 
@@ -293,9 +326,10 @@ export class AccountQuota {
           estimatedTokens: item.estimatedTokens,
           tokensDelta: item.tokensDelta,
         });
+        await this.storage.delete(pendingSettlementKey(item.reservationId));
       } catch {
         const attempts = item.attempts + 1;
-        remaining.push({
+        await this.storage.put(pendingSettlementKey(item.reservationId), {
           ...item,
           attempts,
           nextAttemptAt: now + settlementRetryDelayMs(attempts),
@@ -303,7 +337,7 @@ export class AccountQuota {
       }
     }
 
-    await this.savePendingSettlements(remaining);
+    await this.schedulePendingSettlementAlarm();
   }
 }
 
@@ -329,22 +363,8 @@ function isPendingSettlement(v: unknown): v is PendingSettlement {
   );
 }
 
-function upsertPendingSettlement(
-  pending: PendingSettlement[],
-  item: PendingSettlement,
-): PendingSettlement[] {
-  const existing = pending.find((p) => p.reservationId === item.reservationId);
-  const next = existing
-    ? {
-        ...item,
-        attempts: existing.attempts,
-        createdAt: existing.createdAt,
-        nextAttemptAt: Math.min(existing.nextAttemptAt, item.nextAttemptAt),
-      }
-    : item;
-  return [...pending.filter((p) => p.reservationId !== item.reservationId), next].slice(
-    -MAX_PENDING_SETTLEMENTS,
-  );
+function pendingSettlementKey(reservationId: string): string {
+  return `${PENDING_SETTLEMENT_KEY_PREFIX}${reservationId}`;
 }
 
 function settlementRetryDelayMs(attempts: number): number {

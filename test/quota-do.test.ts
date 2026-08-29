@@ -25,6 +25,12 @@ interface ReserveResult {
   estimatedTokens: number;
   window: WindowState;
 }
+interface PendingSettlementRecord {
+  reservationId: string;
+  tokensDelta: number;
+}
+
+const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
 
 const hardLimits: ResolvedLimits = {
   weeklyDraftLimit: 1,
@@ -43,6 +49,15 @@ async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> 
     body: JSON.stringify(body),
   });
   return res.json<T>();
+}
+
+async function pendingSettlements(stub: DurableObjectStub): Promise<PendingSettlementRecord[]> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const pending = await state.storage.list<PendingSettlementRecord>({
+      prefix: PENDING_SETTLEMENT_KEY_PREFIX,
+    });
+    return [...pending.values()];
+  });
 }
 
 describe("AccountQuota Durable Object", () => {
@@ -235,9 +250,7 @@ describe("AccountQuota Durable Object", () => {
     expect(deferred.queued).toBe(true);
     expect(deferred.window.tokensUsed).toBe(0);
 
-    const queued = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get("pending_settlements"),
-    );
+    const queued = await pendingSettlements(stub);
     expect(queued).toEqual([
       expect.objectContaining({
         reservationId: "settle-deferred-1",
@@ -253,10 +266,55 @@ describe("AccountQuota Durable Object", () => {
     expect(settled.window.tokensReserved).toBe(0);
     expect(settled.window.activeReservations).toEqual([]);
     expect(settled.window.settledReservationIds).toEqual(["settle-deferred-1"]);
-    const cleared = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get("pending_settlements"),
-    );
-    expect(cleared).toBeUndefined();
+    expect(await pendingSettlements(stub)).toEqual([]);
+  });
+
+  it("preserves every deferred settlement beyond the old bounded array size", async () => {
+    const uid = "do-settle-deferred-many";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const callStub = async <T>(op: string, body: unknown): Promise<T> => {
+      const res = await stub.fetch(`https://account-quota.internal${op}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return res.json<T>();
+    };
+    const count = MAX_SETTLED_RESERVATION_IDS + 5;
+    const limits: ResolvedLimits = {
+      ...hardLimits,
+      weeklyDraftLimit: count + 1,
+      weeklyTokenLimit: count + 1,
+    };
+
+    for (let i = 0; i < count; i++) {
+      const reserved = await callStub<ReserveResult>("/reserve", {
+        now: MON + i,
+        reservationId: `settle-deferred-many-${i}`,
+        estimatedTokens: 1,
+        limits,
+      });
+      await callStub<WindowResult & { queued: boolean }>("/defer-settlement", {
+        now: MON + 1000 + i,
+        reservationId: reserved.reservationId,
+        reservationWindowStart: reserved.window.windowStart,
+        estimatedTokens: reserved.estimatedTokens,
+        tokensDelta: 1,
+      });
+    }
+
+    const queuedIds = (await pendingSettlements(stub)).map((item) => item.reservationId).sort();
+    expect(queuedIds).toHaveLength(count);
+    expect(queuedIds).toContain("settle-deferred-many-0");
+    expect(queuedIds).toContain(`settle-deferred-many-${count - 1}`);
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+    const settled = await callStub<WindowResult>("/peek", { now: MON + 2000 });
+    expect(settled.window.draftsUsed).toBe(count);
+    expect(settled.window.tokensUsed).toBe(count);
+    expect(await pendingSettlements(stub)).toEqual([]);
   });
 
   it("settle keeps only a bounded dedupe id history", async () => {
