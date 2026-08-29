@@ -157,7 +157,7 @@ after Anthropic succeeds, the completed draft is still returned. Abandoned reser
 - `soft` (default): meter and report, but never block on the weekly quota — `remaining` clamps at 0
   and drafting continues past the cap. The rate limit and the per-request safety cap are always hard.
 - `hard`: also block over-quota drafts with `429 quota_exceeded`; token capacity is reserved with a
-  conservative `UTF-8 input bytes + max_tokens` bound before forwarding.
+  conservative `UTF-8 input bytes + per-message framing + max_tokens` bound before forwarding.
 
 **Error codes:**
 

@@ -76,9 +76,10 @@ export const DEFAULT_WEEKLY_TOKEN_LIMIT = 2_000_000;
 export const DEFAULT_RATE_LIMIT_PER_MIN = 10;
 
 // Per-request token safety cap. The request path uses a conservative bound:
-// UTF-8 input bytes + DEFAULT_MAX_TOKENS (the completion ceiling). 55_000 keeps
-// the default ASCII/code-ish input budget near 50 KB while still rejecting dense
-// multibyte input before it ever reaches Anthropic.
+// UTF-8 input bytes + per-message framing + DEFAULT_MAX_TOKENS (the completion
+// ceiling). 55_000 keeps the default ASCII/code-ish input budget near 50 KB
+// while still rejecting dense multibyte input or many tiny messages before they
+// ever reach Anthropic.
 export const DEFAULT_MAX_TOKENS_PER_REQUEST = 55_000;
 
 // Enforcement mode. "soft" meters and reports but never blocks on quota (only the

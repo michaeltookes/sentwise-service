@@ -507,6 +507,32 @@ describe("56b draft metering", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("includes message framing in the always-hard request safety cap", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-frame-cap" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const capEnv: Env = { ...env, MAX_TOKENS_PER_REQUEST: "100" };
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: Array.from({ length: 7 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: "x",
+          })),
+        }),
+      }),
+      capEnv,
+    );
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as any).error.type).toBe("request_too_large");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("releases a reserved draft when Anthropic fails", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-upstream-fail-release" });
     mocks.getUser.mockResolvedValue(activeTrial());
@@ -541,6 +567,32 @@ describe("56b draft metering", () => {
         body: JSON.stringify({
           maxTokens: 1,
           messages: [{ role: "user", content: "漢字漢字漢字漢字" }],
+        }),
+      }),
+      hardEnv,
+    );
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as any).error.type).toBe("quota_exceeded");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("hard enforcement reserves message framing capacity", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-hard-frame-reserve" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "100", ENFORCEMENT_MODE: "hard" };
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: Array.from({ length: 7 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: "x",
+          })),
         }),
       }),
       hardEnv,

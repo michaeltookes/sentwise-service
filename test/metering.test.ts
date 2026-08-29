@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildQuota,
+  CONSERVATIVE_MESSAGE_FRAMING_TOKENS,
   conservativeRequestTokenBound,
   costUsd,
   estimateRequestTokens,
@@ -141,6 +142,11 @@ describe("estimateRequestTokens", () => {
       104,
     );
     expect(conservativeRequestTokenBound(new TextEncoder().encode("漢字").byteLength, 1)).toBe(7);
+  });
+  it("includes per-message framing in the conservative bound", () => {
+    expect(conservativeRequestTokenBound(10, 100, 3)).toBe(
+      110 + 3 * CONSERVATIVE_MESSAGE_FRAMING_TOKENS,
+    );
   });
 });
 

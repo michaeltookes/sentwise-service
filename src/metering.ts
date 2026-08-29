@@ -21,6 +21,7 @@ export const WEEK_MS = 7 * DAY_MS;
 export const RATE_WINDOW_MS = 60_000;
 export const RESERVATION_TTL_MS = 15 * 60_000;
 export const MAX_SETTLED_RESERVATION_IDS = 128;
+export const CONSERVATIVE_MESSAGE_FRAMING_TOKENS = 16;
 
 export interface ReservationRecord {
   id: string;
@@ -180,9 +181,18 @@ export function estimateRequestTokens(contentChars: number, maxTokens: number): 
   return Math.ceil(contentChars / 4) + maxTokens;
 }
 
-/** Conservative hard-quota bound: UTF-8 input bytes + the completion ceiling. */
-export function conservativeRequestTokenBound(contentBytes: number, maxTokens: number): number {
-  return contentBytes + maxTokens;
+/**
+ * Conservative request bound: UTF-8 input bytes + completion ceiling + chat framing.
+ *
+ * The content byte count bounds tokenizer output for user-controlled text, while
+ * the per-message allowance keeps many tiny messages from bypassing the cap.
+ */
+export function conservativeRequestTokenBound(
+  contentBytes: number,
+  maxTokens: number,
+  framingItems = 0,
+): number {
+  return contentBytes + maxTokens + framingItems * CONSERVATIVE_MESSAGE_FRAMING_TOKENS;
 }
 
 /** Build the exact `quota` wire object from window state + resolved limits. */

@@ -89,7 +89,11 @@ export default {
         // 2) Per-request token safety cap (pre-flight conservative bound).
         const content = draftContentSize(draft.system, draft.messages);
         const maxTokens = draft.maxTokens ?? DEFAULT_MAX_TOKENS;
-        const tokenBound = conservativeRequestTokenBound(content.bytes, maxTokens);
+        const tokenBound = conservativeRequestTokenBound(
+          content.bytes,
+          maxTokens,
+          content.framingItems,
+        );
         if (tokenBound > limits.maxTokensPerRequest) {
           throw new ApiError(413, "request_too_large", "The request is too large to draft.");
         }
@@ -184,13 +188,13 @@ export default {
 function draftContentSize(
   system: string | undefined,
   messages: Array<{ content: string }>,
-): { bytes: number } {
+): { bytes: number; framingItems: number } {
   const enc = new TextEncoder();
   let bytes = system ? enc.encode(system).byteLength : 0;
   for (const message of messages) {
     bytes += enc.encode(message.content).byteLength;
   }
-  return { bytes };
+  return { bytes, framingItems: messages.length + (system === undefined ? 0 : 1) };
 }
 
 async function settleReservedUsage(
