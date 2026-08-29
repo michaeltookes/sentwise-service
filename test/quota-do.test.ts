@@ -310,7 +310,7 @@ describe("AccountQuota Durable Object", () => {
     expect(queuedIds).toContain(`settle-deferred-many-${count - 1}`);
   });
 
-  it("settle keeps only a bounded dedupe id history", async () => {
+  it("settle keeps a bounded in-window ID cache while markers dedupe older retries", async () => {
     const uid = "do-settle-bounded";
     let last!: WindowResult;
     for (let i = 0; i < MAX_SETTLED_RESERVATION_IDS + 5; i++) {

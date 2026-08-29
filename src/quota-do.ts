@@ -410,6 +410,8 @@ function normalizedId(v: string | undefined): string | undefined {
 }
 
 function appendSettledReservationId(ids: string[], id: string): string[] {
+  // This keeps the window payload bounded; settled_settlement:* keys are the
+  // retry-horizon idempotency records.
   return [...ids, id].slice(-MAX_SETTLED_RESERVATION_IDS);
 }
 

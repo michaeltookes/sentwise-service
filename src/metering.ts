@@ -37,7 +37,7 @@ export interface WindowState {
   tokensUsed: number;
   tokensReserved?: number; // in-flight estimated tokens reserved until settlement/release
   activeReservations?: ReservationRecord[];
-  settledReservationIds?: string[]; // bounded random UUIDs used only to dedupe settlement retries
+  settledReservationIds?: string[]; // bounded in-window cache; DO marker keys are authoritative
 }
 
 /** Per-account overrides read from Clerk `privateMetadata.quota` (56c writes these). */
