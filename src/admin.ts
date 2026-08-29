@@ -23,6 +23,12 @@ export function isoForSql(ms: number): string {
 
 /** Aggregate query for one time window. `_sample_interval` reweights AE sampling. */
 export function aggregateSql(dataset: string, sinceIso: string): string {
+  const where = `timestamp >= toDateTime('${sinceIso}') AND blob3 = 'ok'`;
+  const activeAccountsSql =
+    `(SELECT SUM(account_weight) FROM (` +
+    `SELECT index1, MAX(_sample_interval) AS account_weight ` +
+    `FROM ${dataset} WHERE ${where} GROUP BY index1` +
+    `)) AS active_accounts`;
   return (
     `SELECT ` +
     `SUM(_sample_interval) AS drafts, ` +
@@ -30,9 +36,9 @@ export function aggregateSql(dataset: string, sinceIso: string): string {
     `SUM(_sample_interval * double3) AS cost_usd, ` +
     `quantileWeighted(0.5)(double3, _sample_interval) AS cost_p50, ` +
     `quantileWeighted(0.95)(double3, _sample_interval) AS cost_p95, ` +
-    `COUNT(DISTINCT index1) AS active_accounts ` +
+    `${activeAccountsSql} ` +
     `FROM ${dataset} ` +
-    `WHERE timestamp >= toDateTime('${sinceIso}') AND blob3 = 'ok'`
+    `WHERE ${where}`
   );
 }
 

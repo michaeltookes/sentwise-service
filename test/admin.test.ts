@@ -33,7 +33,9 @@ describe("SQL builders", () => {
     expect(sql).toContain("blob3 = 'ok'");
     expect(sql).toContain("quantileWeighted(0.5)");
     expect(sql).toContain("quantileWeighted(0.95)");
-    expect(sql).toContain("COUNT(DISTINCT index1)");
+    expect(sql).toContain("MAX(_sample_interval) AS account_weight");
+    expect(sql).toContain("SUM(account_weight)");
+    expect(sql).not.toContain("COUNT(DISTINCT index1)");
   });
   it("topAccountsSql groups by account and limits to 10", () => {
     const sql = topAccountsSql(USAGE_DATASET, "2026-08-01 00:00:00");
@@ -84,7 +86,7 @@ describe("GET /admin/margin success", () => {
     });
     const fetchMock = vi.fn((_url: string, init: RequestInit) => {
       const sql = init.body as string;
-      if (sql.includes("GROUP BY")) {
+      if (sql.includes("SELECT index1 AS account")) {
         return Promise.resolve(
           Response.json({ data: [{ account: "hashA", cost_usd: "0.30", drafts: "5" }] }),
         );
