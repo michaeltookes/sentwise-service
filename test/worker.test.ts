@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { env as testEnv } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { TRIAL_MS } from "../src/config";
+import { mondayStartUtc, RESERVATION_TTL_MS, WEEK_MS, type WindowState } from "../src/metering";
 
 // Mock @clerk/backend so JWT verification and user lookups are controllable.
 const mocks = vi.hoisted(() => ({
@@ -20,6 +22,7 @@ vi.mock("@clerk/backend", () => ({
 import worker from "../src/index";
 
 const env: Env = {
+  ...testEnv,
   CLERK_SECRET_KEY: "sk_test",
   ANTHROPIC_API_KEY: "sk-ant-test",
   CLERK_PUBLISHABLE_KEY: "pk_test",
@@ -49,6 +52,120 @@ function userWith(privateMetadata: Record<string, unknown>) {
     primaryEmailAddressId: "ema_1",
     emailAddresses: [{ id: "ema_1", emailAddress: "marcus@example.com" }],
     privateMetadata,
+  };
+}
+
+function internalUrl(input: RequestInfo | URL): URL {
+  if (typeof input === "string" || input instanceof URL) return new URL(input);
+  return new URL(input.url);
+}
+
+function internalBody(init: RequestInit | undefined): {
+  now?: number;
+  reservationId?: string;
+  reservationWindowStart?: number;
+  estimatedTokens?: number;
+  tokensDelta?: number;
+} {
+  if (typeof init?.body !== "string") return {};
+  return JSON.parse(init.body) as {
+    now?: number;
+    reservationId?: string;
+    reservationWindowStart?: number;
+    estimatedTokens?: number;
+    tokensDelta?: number;
+  };
+}
+
+function quotaNamespaceWithSettleFailure(now: number): {
+  namespace: DurableObjectNamespace;
+  settleCalls: () => number;
+  deferCalls: () => number;
+  deferredSettlements: () => Array<ReturnType<typeof internalBody>>;
+} {
+  const windowStart = mondayStartUtc(now);
+  let window: WindowState = {
+    windowStart,
+    resetsAt: windowStart + WEEK_MS,
+    draftsUsed: 0,
+    tokensUsed: 0,
+  };
+  let settleCalls = 0;
+  let deferCalls = 0;
+  const deferredSettlements: Array<ReturnType<typeof internalBody>> = [];
+  const stub = {
+    fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = internalUrl(input).pathname;
+      const body = internalBody(init);
+      if (path === "/check") {
+        return Promise.resolve(Response.json({ allowed: true, retryAfterSeconds: 0, window }));
+      }
+      if (path === "/reserve") {
+        const estimatedTokens = body.estimatedTokens ?? 0;
+        window = {
+          ...window,
+          draftsUsed: window.draftsUsed + 1,
+          tokensReserved: (window.tokensReserved ?? 0) + estimatedTokens,
+          activeReservations: [
+            ...(window.activeReservations ?? []),
+            {
+              id: body.reservationId ?? "",
+              estimatedTokens,
+              expiresAt: (body.now ?? now) + RESERVATION_TTL_MS,
+            },
+          ],
+        };
+        return Promise.resolve(
+          Response.json({
+            reserved: true,
+            blockedByQuota: false,
+            reservationId: body.reservationId,
+            estimatedTokens,
+            window,
+          }),
+        );
+      }
+      if (path === "/settle") {
+        settleCalls += 1;
+        return Promise.reject(new Error("settle failed"));
+      }
+      if (path === "/defer-settlement") {
+        deferCalls += 1;
+        deferredSettlements.push(body);
+        return Promise.resolve(Response.json({ window, queued: true }));
+      }
+      if (path === "/release") {
+        if (body.reservationWindowStart === window.windowStart) {
+          const reservation = (window.activeReservations ?? []).find(
+            (r) => r.id === body.reservationId,
+          );
+          window = {
+            ...window,
+            draftsUsed: reservation ? Math.max(0, window.draftsUsed - 1) : window.draftsUsed,
+            tokensReserved: reservation
+              ? Math.max(0, (window.tokensReserved ?? 0) - reservation.estimatedTokens)
+              : window.tokensReserved,
+            activeReservations: (window.activeReservations ?? []).filter(
+              (r) => r.id !== body.reservationId,
+            ),
+          };
+        }
+        return Promise.resolve(Response.json({ window }));
+      }
+      if (path === "/peek") {
+        return Promise.resolve(Response.json({ window }));
+      }
+      return Promise.resolve(new Response("not found", { status: 404 }));
+    }),
+  };
+  return {
+    namespace: {
+      idFromName: vi.fn(() => ({}) as DurableObjectId),
+      get: vi.fn(() => stub as unknown as DurableObjectStub),
+    } as unknown as DurableObjectNamespace,
+    settleCalls: () => settleCalls,
+    deferCalls: () => deferCalls,
+    deferredSettlements: () => deferredSettlements,
   };
 }
 
@@ -108,7 +225,12 @@ describe("POST /v1/draft trial handling", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ text: "hi", usage: { inputTokens: 3, outputTokens: 2 } });
+    const drafted = (await res.json()) as any;
+    expect(drafted.text).toBe("hi");
+    expect(drafted.usage).toEqual({ inputTokens: 3, outputTokens: 2 });
+    // 56b: the draft response now also carries the quota snapshot.
+    expect(drafted.quota.unit).toBe("drafts");
+    expect(drafted.quota.used).toBe(1);
     // Trial initialized in privateMetadata
     expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
     const arg = mocks.updateUserMetadata.mock.calls[0][1];
@@ -248,8 +370,332 @@ describe("routing", () => {
     const res = await worker.fetch(req("/v1/draft", { method: "GET" }), env);
     expect(res.status).toBe(405);
   });
+  it("keeps /admin/margin invisible for wrong methods when ADMIN_TOKEN is unset", async () => {
+    const res = await worker.fetch(req("/admin/margin", { method: "POST" }), {
+      ...env,
+      ADMIN_TOKEN: undefined,
+    });
+    expect(res.status).toBe(404);
+  });
+  it("405s /admin/margin wrong methods only when ADMIN_TOKEN is configured", async () => {
+    const res = await worker.fetch(req("/admin/margin", { method: "POST" }), {
+      ...env,
+      ADMIN_TOKEN: "correct-token",
+    });
+    expect(res.status).toBe(405);
+  });
   it("404s an unknown path", async () => {
     const res = await worker.fetch(req("/nope"), env);
     expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 56b — metering + limits, end to end through the Worker (real AccountQuota DO).
+// ---------------------------------------------------------------------------
+
+function activeTrial() {
+  return userWith({ trialStartedAt: new Date(Date.now() - 1000).toISOString() });
+}
+
+function draftReq(sub: string, content = "draft this") {
+  mocks.verifyToken.mockResolvedValue({ sub });
+  return req("/v1/draft", {
+    method: "POST",
+    headers: bearer(),
+    body: JSON.stringify({ messages: [{ role: "user", content }] }),
+  });
+}
+
+describe("56b draft metering", () => {
+  it("returns the quota snapshot alongside the draft", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-quota" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    const res = await worker.fetch(draftReq("u-quota"), env);
+    expect(res.status).toBe(200);
+    const q = ((await res.json()) as any).quota;
+    expect(q).toMatchObject({
+      unit: "drafts",
+      used: 1,
+      limit: 100, // WEEKLY_DRAFT_LIMIT var default
+      remaining: 99,
+      tokenLimit: 2_000_000,
+      enforcement: "soft",
+      extraPurchased: 0,
+    });
+    expect(q.tokensUsed).toBe(5); // 3 in + 2 out from anthropicOk
+    expect(typeof q.resetsAt).toBe("string");
+    expect(Number.isNaN(Date.parse(q.resetsAt))).toBe(false);
+  });
+
+  it("adds purchased extras to the limit (extraPurchased)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-extra" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        quota: { extraDrafts: 5, extraDraftsWindowStart: mondayStartUtc(Date.now()) },
+      }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    const res = await worker.fetch(draftReq("u-extra"), env);
+    const q = ((await res.json()) as any).quota;
+    expect(q.limit).toBe(105);
+    expect(q.extraPurchased).toBe(5);
+    expect(q.remaining).toBe(104);
+  });
+
+  it("ignores stale purchased extras from a previous weekly window", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-extra-stale" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        quota: { extraDrafts: 5, extraDraftsWindowStart: mondayStartUtc(Date.now()) - WEEK_MS },
+      }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    const res = await worker.fetch(draftReq("u-extra-stale"), env);
+    const q = ((await res.json()) as any).quota;
+    expect(q.limit).toBe(100);
+    expect(q.extraPurchased).toBe(0);
+  });
+
+  it("rate limits with a 429 + Retry-After once the per-minute cap is hit", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-rate" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const rlEnv: Env = { ...env, RATE_LIMIT_PER_MIN: "1" };
+
+    const first = await worker.fetch(draftReq("u-rate"), rlEnv);
+    expect(first.status).toBe(200);
+
+    const second = await worker.fetch(draftReq("u-rate"), rlEnv);
+    expect(second.status).toBe(429);
+    const body = (await second.json()) as any;
+    expect(body.error.type).toBe("rate_limited");
+    expect(body.error.retryAfterSeconds).toBeGreaterThan(0);
+    expect(second.headers.get("Retry-After")).toBeTruthy();
+    // The rate-limited request never reached Anthropic.
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an over-cap request with 413 request_too_large before forwarding", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-big" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    // maxTokensPerRequest = 10; even a tiny request (UTF-8 bytes + DEFAULT_MAX_TOKENS) exceeds it.
+    const capEnv: Env = { ...env, MAX_TOKENS_PER_REQUEST: "10" };
+
+    const res = await worker.fetch(draftReq("u-big"), capEnv);
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as any).error.type).toBe("request_too_large");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the conservative byte bound for the always-hard request safety cap", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-byte-cap" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const capEnv: Env = { ...env, MAX_TOKENS_PER_REQUEST: "20" };
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: [{ role: "user", content: "漢字漢字漢字漢字" }],
+        }),
+      }),
+      capEnv,
+    );
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as any).error.type).toBe("request_too_large");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("includes message framing in the always-hard request safety cap", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-frame-cap" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const capEnv: Env = { ...env, MAX_TOKENS_PER_REQUEST: "100" };
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: Array.from({ length: 7 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: "x",
+          })),
+        }),
+      }),
+      capEnv,
+    );
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as any).error.type).toBe("request_too_large");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("releases a reserved draft when Anthropic fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-upstream-fail-release" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ error: { type: "overloaded_error" } }), { status: 529 }),
+        ),
+    );
+
+    const failed = await worker.fetch(draftReq("u-upstream-fail-release"), env);
+    expect(failed.status).toBe(503);
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const q = ((await me.json()) as any).quota;
+    expect(q.used).toBe(0);
+  });
+
+  it("hard enforcement reserves a conservative byte bound for multibyte input", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-hard-token-reserve" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "20", ENFORCEMENT_MODE: "hard" };
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: [{ role: "user", content: "漢字漢字漢字漢字" }],
+        }),
+      }),
+      hardEnv,
+    );
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as any).error.type).toBe("quota_exceeded");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("hard enforcement reserves message framing capacity", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-hard-frame-reserve" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "100", ENFORCEMENT_MODE: "hard" };
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: Array.from({ length: 7 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: "x",
+          })),
+        }),
+      }),
+      hardEnv,
+    );
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as any).error.type).toBe("quota_exceeded");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves a completed draft response when quota settlement fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-settle-fail" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const quota = quotaNamespaceWithSettleFailure(Date.now());
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const res = await worker.fetch(draftReq("u-settle-fail"), flakyQuotaEnv);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.text).toBe("ok");
+    expect(body.quota.used).toBe(1);
+    expect(body.quota.tokensUsed).toBe(5);
+    expect(body.quota.remaining).toBe(99);
+    expect(quota.settleCalls()).toBe(2);
+    expect(quota.deferCalls()).toBe(1);
+    expect(quota.deferredSettlements()[0]).toMatchObject({
+      reservationWindowStart: expect.any(Number),
+      estimatedTokens: expect.any(Number),
+      tokensDelta: 5,
+    });
+    expect(typeof quota.deferredSettlements()[0].reservationId).toBe("string");
+  });
+
+  it("hard enforcement blocks an over-quota draft with 429 quota_exceeded", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-hard" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const hardEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "hard" };
+
+    const first = await worker.fetch(draftReq("u-hard"), hardEnv);
+    expect(first.status).toBe(200); // draftsUsed -> 1
+
+    const second = await worker.fetch(draftReq("u-hard"), hardEnv);
+    expect(second.status).toBe(429);
+    const body = (await second.json()) as any;
+    expect(body.error.type).toBe("quota_exceeded");
+    expect(typeof body.error.resetsAt).toBe("string");
+    expect(fetchMock).toHaveBeenCalledOnce(); // blocked before the 2nd forward
+  });
+
+  it("soft enforcement meters past the cap but keeps drafting", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-soft" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    // Fresh Response per call — the body is single-use and this test forwards twice.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => anthropicOk("ok")),
+    );
+    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+
+    expect((await worker.fetch(draftReq("u-soft"), softEnv)).status).toBe(200);
+    const res2 = await worker.fetch(draftReq("u-soft"), softEnv);
+    expect(res2.status).toBe(200);
+    const q = ((await res2.json()) as any).quota;
+    expect(q.used).toBe(2);
+    expect(q.limit).toBe(1);
+    expect(q.remaining).toBe(0); // clamped
+  });
+});
+
+describe("56b /v1/me quota", () => {
+  it("includes a zeroed quota snapshot", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-me" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.quota).toMatchObject({
+      unit: "drafts",
+      used: 0,
+      limit: 100,
+      remaining: 100,
+      tokenLimit: 2_000_000,
+      enforcement: "soft",
+      extraPurchased: 0,
+    });
+    // Viewing the account must not start a trial or record usage.
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    // quotaOverride is internal and must not leak into the response.
+    expect("quotaOverride" in body).toBe(false);
   });
 });

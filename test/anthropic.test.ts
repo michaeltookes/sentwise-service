@@ -3,8 +3,10 @@ import { forwardToAnthropic, parseDraftRequest } from "../src/anthropic";
 import { ApiError } from "../src/errors";
 import { DEFAULT_MODEL, DEFAULT_MAX_TOKENS, ANTHROPIC_API_URL } from "../src/config";
 import type { Env } from "../src/config";
+import { env as testEnv } from "cloudflare:test";
 
 const env: Env = {
+  ...testEnv,
   CLERK_SECRET_KEY: "sk_test",
   ANTHROPIC_API_KEY: "sk-ant-test",
   CLERK_PUBLISHABLE_KEY: "pk_test",

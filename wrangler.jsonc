@@ -13,9 +13,34 @@
       "invocation_logs": false,
     },
   },
-  // Public, safe-to-commit key. Secrets (CLERK_SECRET_KEY, ANTHROPIC_API_KEY)
-  // are pushed with `wrangler secret put` and never live in this file.
+  // Public, safe-to-commit key. Secrets (CLERK_SECRET_KEY, ANTHROPIC_API_KEY,
+  // and the 56b ADMIN_TOKEN / CF_ANALYTICS_API_TOKEN) are pushed with
+  // `wrangler secret put` and never live in this file.
   "vars": {
     "CLERK_PUBLISHABLE_KEY": "pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA",
+
+    // --- 56b metering limits (placeholder defaults; final numbers land with 56c) ---
+    "WEEKLY_DRAFT_LIMIT": "100", // drafts per account per week (Mon 00:00 UTC reset)
+    "WEEKLY_TOKEN_LIMIT": "2000000", // input+output tokens per account per week
+    "RATE_LIMIT_PER_MIN": "10", // abuse guard: requests per 60s per account
+    "MAX_TOKENS_PER_REQUEST": "55000", // per-request safety cap (see config.ts derivation)
+    "ENFORCEMENT_MODE": "soft", // "soft" meters only; "hard" also blocks over-quota drafts
+
+    // --- 56b margin dashboard ---
+    // Public Cloudflare account id (already present as `account_id` above); used to
+    // build the Analytics Engine SQL API URL in /admin/margin.
+    "CF_ACCOUNT_ID": "313171820c15d1a8f14bed4dbcb699af",
   },
+
+  // 56b — per-account usage counters (weekly drafts/tokens + sliding rate-limit
+  // window). SQLite-backed Durable Object; stores integers and timestamps only,
+  // never content. Keyed by Clerk userId via idFromName.
+  "durable_objects": {
+    "bindings": [{ "name": "ACCOUNT_QUOTA", "class_name": "AccountQuota" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountQuota"] }],
+
+  // 56b — aggregate, hashed usage metrics for the maintainer margin dashboard.
+  // No content; a SHA-256 of the userId, model, token counts, cost, latency, outcome.
+  "analytics_engine_datasets": [{ "binding": "USAGE_ANALYTICS", "dataset": "sentwise_usage" }],
 }
