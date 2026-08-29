@@ -15,6 +15,8 @@ export interface WindowResult {
 export interface ReserveResult {
   reserved: boolean;
   blockedByQuota: boolean;
+  reservationId: string;
+  estimatedTokens: number;
   window: WindowState;
 }
 
@@ -42,7 +44,7 @@ export function quotaCheck(
 export function quotaReserve(
   env: Env,
   userId: string,
-  body: { now: number; limits: ResolvedLimits },
+  body: { now: number; reservationId: string; estimatedTokens: number; limits: ResolvedLimits },
 ): Promise<ReserveResult> {
   return call<ReserveResult>(env, userId, "/reserve", body);
 }
@@ -53,7 +55,9 @@ export function quotaSettle(
   userId: string,
   body: {
     now: number;
+    reservationId?: string;
     reservationWindowStart?: number;
+    estimatedTokens?: number;
     draftsDelta?: number;
     tokensDelta: number;
   },
@@ -65,7 +69,7 @@ export function quotaSettle(
 export function quotaRelease(
   env: Env,
   userId: string,
-  body: { now: number; reservationWindowStart: number },
+  body: { now: number; reservationWindowStart: number; estimatedTokens: number },
 ): Promise<WindowResult> {
   return call<WindowResult>(env, userId, "/release", body);
 }

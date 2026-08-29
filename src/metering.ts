@@ -20,12 +20,14 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
 export const WEEK_MS = 7 * DAY_MS;
 export const RATE_WINDOW_MS = 60_000;
 
-/** Per-account weekly window state. Stored in the Durable Object. Counters only. */
+/** Per-account weekly window state. Stored in the Durable Object. No content. */
 export interface WindowState {
   windowStart: number; // ms epoch of Monday 00:00 UTC for the current window
   resetsAt: number; // ms epoch when the window rolls (windowStart + WEEK_MS)
   draftsUsed: number;
   tokensUsed: number;
+  tokensReserved?: number; // in-flight estimated tokens reserved until settlement/release
+  settledReservationIds?: string[]; // random UUIDs used only to dedupe settlement retries
 }
 
 /** Per-account overrides read from Clerk `privateMetadata.quota` (56c writes these). */
@@ -137,12 +139,26 @@ export function mondayStartUtc(now: number): number {
 /** A brand-new zeroed window for the week containing `now`. */
 export function freshWindow(now: number): WindowState {
   const windowStart = mondayStartUtc(now);
-  return { windowStart, resetsAt: windowStart + WEEK_MS, draftsUsed: 0, tokensUsed: 0 };
+  return {
+    windowStart,
+    resetsAt: windowStart + WEEK_MS,
+    draftsUsed: 0,
+    tokensUsed: 0,
+    tokensReserved: 0,
+    settledReservationIds: [],
+  };
 }
 
 /** Return the current window, rolling to a fresh one if `now` is at/after reset. */
 export function rollWindow(state: WindowState | undefined | null, now: number): WindowState {
   if (!state || now >= state.resetsAt) return freshWindow(now);
+  if (state.tokensReserved === undefined || state.settledReservationIds === undefined) {
+    return {
+      ...state,
+      tokensReserved: state.tokensReserved ?? 0,
+      settledReservationIds: state.settledReservationIds ?? [],
+    };
+  }
   return state;
 }
 
@@ -179,6 +195,22 @@ export function buildQuota(state: WindowState, limits: ResolvedLimits): Quota {
 /** True when the account is at/over either weekly cap (drafts or tokens). */
 export function isOverQuota(state: WindowState, limits: ResolvedLimits): boolean {
   return state.draftsUsed >= limits.weeklyDraftLimit || state.tokensUsed >= limits.weeklyTokenLimit;
+}
+
+export function reservedTokens(state: WindowState): number {
+  return state.tokensReserved ?? 0;
+}
+
+export function wouldExceedQuota(
+  state: WindowState,
+  limits: ResolvedLimits,
+  draftDelta: number,
+  tokensReservedDelta: number,
+): boolean {
+  return (
+    state.draftsUsed + draftDelta > limits.weeklyDraftLimit ||
+    state.tokensUsed + reservedTokens(state) + tokensReservedDelta > limits.weeklyTokenLimit
+  );
 }
 
 /** Estimated USD cost of one draft, from the model's cost-table row. */

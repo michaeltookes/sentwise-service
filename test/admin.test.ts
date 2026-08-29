@@ -123,7 +123,8 @@ describe("GET /admin/margin success", () => {
     expect(w.activeAccounts).toBe(2);
     expect(w.estCostUsd).toBeCloseTo(0.5, 6);
     expect(w.estCostPerActiveAccountUsd).toBeCloseTo(0.25, 6);
-    expect(w.marginPerActiveAccountUsd).toBeCloseTo(18.75, 6);
+    expect(w.projectedMonthlyCostPerActiveAccountUsd).toBeCloseTo(0.25 * (365 / 12 / 7), 6);
+    expect(w.marginPerActiveAccountUsd).toBeCloseTo(19 - 0.25 * (365 / 12 / 7), 6);
     expect(w.topAccounts[0]).toEqual({ hashedUserId: "hashA", estCostUsd: 0.3, drafts: 5 });
     expect(body.windows["30d"]).toBeDefined();
   });

@@ -37,8 +37,8 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
 - **The only persisted state is counters, timestamps, and one hash — never content:**
   1. `trialStartedAt` in the user's Clerk `privateMetadata` (trial enforcement, 56a).
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
-     weekly drafts/tokens used and a sliding rate-limit window, keyed by Clerk userId. Integers and
-     reset timestamps only — no prompts, no drafts, no emails.
+     weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
+     settlement IDs keyed by Clerk userId. No prompts, no drafts, no emails.
   3. **Aggregate, hashed usage metrics** in Workers Analytics Engine (56b): a SHA-256 hash of the
      userId (never the raw id), the model, token counts, estimated cost, latency, and outcome.
 - **Cloudflare invocation logs are disabled** (`observability.logs.invocation_logs: false` in
@@ -188,9 +188,9 @@ content. See the [Privacy design](#privacy-design--content-stateless-by-construc
 A margin dashboard for the maintainer. Guarded by the `ADMIN_TOKEN` secret (constant-time compare);
 when `ADMIN_TOKEN` is unset the endpoint returns **404** (invisible). It queries Workers Analytics
 Engine's SQL API for the last 7 and 30 days — drafts, tokens, estimated cost, cost-per-draft p50/p95,
-top-10 accounts by cost (hashed ids), active accounts, and estimated cost vs. the assumed \$19/mo
-revenue per active account. If `CF_ANALYTICS_API_TOKEN` is unset (or a query fails) it degrades to
-**503 `analytics_unavailable`**. Reads aggregate hashed metrics only — no content.
+top-10 accounts by cost (hashed ids), active accounts, and projected monthly cost vs. the assumed
+\$19/mo revenue per active account. If `CF_ANALYTICS_API_TOKEN` is unset (or a query fails) it
+degrades to **503 `analytics_unavailable`**. Reads aggregate hashed metrics only — no content.
 
 The per-model cost table lives in `src/config.ts` (`MODEL_COSTS`, Sonnet 4.6 as the default row);
 edit it there when pricing changes or a new model is added.

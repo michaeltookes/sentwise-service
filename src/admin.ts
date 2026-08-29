@@ -13,6 +13,7 @@ import { ASSUMED_MONTHLY_REVENUE_USD, USAGE_DATASET } from "./config";
 import { jsonError } from "./errors";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const AVG_MONTH_DAYS = 365 / 12;
 
 /** Format an epoch-ms instant for the Analytics Engine SQL `toDateTime('...')`. */
 export function isoForSql(ms: number): string {
@@ -89,11 +90,13 @@ async function runSql(env: Env, sql: string, fetchImpl: typeof fetch): Promise<R
   return json.data ?? [];
 }
 
-function shapeWindow(agg: Row | undefined, top: Row[]) {
+function shapeWindow(agg: Row | undefined, top: Row[], windowDays: number) {
   const drafts = num(agg?.drafts);
   const activeAccounts = num(agg?.active_accounts);
   const costUsdTotal = num(agg?.cost_usd);
   const costPerActive = activeAccounts > 0 ? costUsdTotal / activeAccounts : 0;
+  const projectedMonthlyCostPerActive =
+    windowDays > 0 ? costPerActive * (AVG_MONTH_DAYS / windowDays) : 0;
   return {
     drafts,
     tokens: num(agg?.tokens),
@@ -102,8 +105,9 @@ function shapeWindow(agg: Row | undefined, top: Row[]) {
     costPerDraftP95Usd: num(agg?.cost_p95),
     activeAccounts,
     estCostPerActiveAccountUsd: costPerActive,
-    // Positive => the assumed subscription revenue covers inference cost per account.
-    marginPerActiveAccountUsd: ASSUMED_MONTHLY_REVENUE_USD - costPerActive,
+    projectedMonthlyCostPerActiveAccountUsd: projectedMonthlyCostPerActive,
+    // Positive => monthly revenue covers the projected monthly inference cost per account.
+    marginPerActiveAccountUsd: ASSUMED_MONTHLY_REVENUE_USD - projectedMonthlyCostPerActive,
     topAccounts: top.map((r) => ({
       hashedUserId: str(r.account),
       estCostUsd: num(r.cost_usd),
@@ -140,7 +144,7 @@ export async function handleMargin(
       const since = isoForSql(now - days * DAY_MS);
       const [agg] = await runSql(env, aggregateSql(USAGE_DATASET, since), fetchImpl);
       const top = await runSql(env, topAccountsSql(USAGE_DATASET, since), fetchImpl);
-      windows[key] = shapeWindow(agg, top);
+      windows[key] = shapeWindow(agg, top, days);
     }
     return Response.json({
       generatedAt: new Date(now).toISOString(),

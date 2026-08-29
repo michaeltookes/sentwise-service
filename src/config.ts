@@ -3,11 +3,12 @@
 // PRIVACY NOTE (backlog 56a/56b): this Worker is a *content-stateless* drafting
 // proxy. It never logs the contents of `system`/`messages` (the user's mail) or
 // the model's reply, and it never stores them anywhere. The only state it keeps
-// is counters and timestamps, never content:
+// is counters, timestamps, and random settlement IDs, never content:
 //   1. `trialStartedAt` in the user's Clerk `privateMetadata` (56a).
 //   2. Per-account usage counters + timestamps in a Durable Object (`AccountQuota`,
-//      56b) — weekly drafts/tokens used and a sliding rate-limit window. No prompts,
-//      no drafts, no emails; only integers and reset timestamps keyed by Clerk userId.
+//      56b) — weekly drafts/tokens used, in-flight token reservations, a sliding
+//      rate-limit window, and random settlement IDs keyed by Clerk userId. No
+//      prompts, no drafts, no emails.
 //   3. Aggregate, hashed usage metrics in Workers Analytics Engine (56b) — a SHA-256
 //      hash of the userId (never the raw id), model, token counts, estimated cost,
 //      latency, and outcome. No content.

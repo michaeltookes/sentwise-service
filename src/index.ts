@@ -26,8 +26,9 @@ export { AccountQuota } from "./quota-do";
  *   GET  /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
- * only state is counters + timestamps — trial in Clerk, usage in the AccountQuota
- * Durable Object, aggregate hashed metrics in Analytics Engine. See src/config.ts.
+ * only state is counters, timestamps, and random settlement IDs — trial in Clerk,
+ * usage in the AccountQuota Durable Object, aggregate hashed metrics in Analytics
+ * Engine. See src/config.ts.
  */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -99,7 +100,13 @@ export default {
 
         // 3) Weekly quota admission + draft reservation. Hard mode blocks atomically;
         // soft mode reserves and continues so successful drafts are metered once.
-        const reservation = await quotaReserve(env, userId, { now, limits });
+        const reservationId = crypto.randomUUID();
+        const reservation = await quotaReserve(env, userId, {
+          now,
+          reservationId,
+          estimatedTokens: estTokens,
+          limits,
+        });
         if (!reservation.reserved && reservation.blockedByQuota) {
           const resetsAt = buildQuota(reservation.window, limits).resetsAt;
           throw new ApiError(429, "quota_exceeded", "You've used your weekly allowance.", {
@@ -120,6 +127,7 @@ export default {
           await quotaRelease(env, userId, {
             now: Date.now(),
             reservationWindowStart: reservation.window.windowStart,
+            estimatedTokens: reservation.estimatedTokens,
           }).catch(() => undefined);
           await recordUsage(env, {
             userId,
@@ -135,7 +143,14 @@ export default {
 
         // 5) Settle real usage into the reserved window, then report the updated quota.
         const tokensDelta = result.usage.inputTokens + result.usage.outputTokens;
-        const window = await settleReservedUsage(env, userId, reservation.window, tokensDelta);
+        const window = await settleReservedUsage(
+          env,
+          userId,
+          reservation.reservationId,
+          reservation.window,
+          reservation.estimatedTokens,
+          tokensDelta,
+        );
         await recordUsage(env, {
           userId,
           model,
@@ -171,12 +186,16 @@ export default {
 async function settleReservedUsage(
   env: Env,
   userId: string,
+  reservationId: string,
   reservedWindow: WindowState,
+  estimatedTokens: number,
   tokensDelta: number,
 ): Promise<WindowState> {
   const body = {
     now: Date.now(),
+    reservationId,
     reservationWindowStart: reservedWindow.windowStart,
+    estimatedTokens,
     tokensDelta,
   };
   try {
@@ -185,7 +204,11 @@ async function settleReservedUsage(
     try {
       return (await quotaSettle(env, userId, { ...body, now: Date.now() })).window;
     } catch {
-      return { ...reservedWindow, tokensUsed: reservedWindow.tokensUsed + tokensDelta };
+      return {
+        ...reservedWindow,
+        tokensUsed: reservedWindow.tokensUsed + tokensDelta,
+        tokensReserved: Math.max(0, (reservedWindow.tokensReserved ?? 0) - estimatedTokens),
+      };
     }
   }
 }

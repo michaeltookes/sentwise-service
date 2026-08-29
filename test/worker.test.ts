@@ -60,9 +60,17 @@ function internalUrl(input: RequestInfo | URL): URL {
   return new URL(input.url);
 }
 
-function internalBody(init: RequestInit | undefined): { reservationWindowStart?: number } {
+function internalBody(init: RequestInit | undefined): {
+  reservationId?: string;
+  reservationWindowStart?: number;
+  estimatedTokens?: number;
+} {
   if (typeof init?.body !== "string") return {};
-  return JSON.parse(init.body) as { reservationWindowStart?: number };
+  return JSON.parse(init.body) as {
+    reservationId?: string;
+    reservationWindowStart?: number;
+    estimatedTokens?: number;
+  };
 }
 
 function quotaNamespaceWithSettleFailure(now: number): {
@@ -85,8 +93,21 @@ function quotaNamespaceWithSettleFailure(now: number): {
         return Promise.resolve(Response.json({ allowed: true, retryAfterSeconds: 0, window }));
       }
       if (path === "/reserve") {
-        window = { ...window, draftsUsed: window.draftsUsed + 1 };
-        return Promise.resolve(Response.json({ reserved: true, blockedByQuota: false, window }));
+        const estimatedTokens = body.estimatedTokens ?? 0;
+        window = {
+          ...window,
+          draftsUsed: window.draftsUsed + 1,
+          tokensReserved: (window.tokensReserved ?? 0) + estimatedTokens,
+        };
+        return Promise.resolve(
+          Response.json({
+            reserved: true,
+            blockedByQuota: false,
+            reservationId: body.reservationId,
+            estimatedTokens,
+            window,
+          }),
+        );
       }
       if (path === "/settle") {
         settleCalls += 1;
@@ -94,7 +115,11 @@ function quotaNamespaceWithSettleFailure(now: number): {
       }
       if (path === "/release") {
         if (body.reservationWindowStart === window.windowStart) {
-          window = { ...window, draftsUsed: Math.max(0, window.draftsUsed - 1) };
+          window = {
+            ...window,
+            draftsUsed: Math.max(0, window.draftsUsed - 1),
+            tokensReserved: Math.max(0, (window.tokensReserved ?? 0) - (body.estimatedTokens ?? 0)),
+          };
         }
         return Promise.resolve(Response.json({ window }));
       }
@@ -461,6 +486,19 @@ describe("56b draft metering", () => {
     expect(q.used).toBe(0);
   });
 
+  it("hard enforcement blocks when estimated tokens would exceed weekly token capacity", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-hard-token-reserve" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "4000", ENFORCEMENT_MODE: "hard" };
+
+    const res = await worker.fetch(draftReq("u-hard-token-reserve"), hardEnv);
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as any).error.type).toBe("quota_exceeded");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("preserves a completed draft response when quota settlement fails", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-settle-fail" });
     mocks.getUser.mockResolvedValue(activeTrial());
@@ -474,6 +512,7 @@ describe("56b draft metering", () => {
     expect(body.text).toBe("ok");
     expect(body.quota.used).toBe(1);
     expect(body.quota.tokensUsed).toBe(5);
+    expect(body.quota.remaining).toBe(99);
     expect(quota.settleCalls()).toBe(2);
   });
 

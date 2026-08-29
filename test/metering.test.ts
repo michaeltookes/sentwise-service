@@ -10,9 +10,11 @@ import {
   parseEnforcement,
   parseQuotaOverride,
   pruneStamps,
+  reservedTokens,
   resolveLimits,
   rollWindow,
   WEEK_MS,
+  wouldExceedQuota,
   type ResolvedLimits,
   type WindowState,
 } from "../src/metering";
@@ -59,6 +61,8 @@ describe("window rollover", () => {
     expect(w.resetsAt).toBe(MON + WEEK_MS);
     expect(w.draftsUsed).toBe(0);
     expect(w.tokensUsed).toBe(0);
+    expect(w.tokensReserved).toBe(0);
+    expect(w.settledReservationIds).toEqual([]);
   });
   it("keeps an existing window before reset", () => {
     const w: WindowState = {
@@ -66,6 +70,8 @@ describe("window rollover", () => {
       resetsAt: MON + WEEK_MS,
       draftsUsed: 4,
       tokensUsed: 9,
+      tokensReserved: 0,
+      settledReservationIds: [],
     };
     expect(rollWindow(w, MON + 3 * 24 * 60 * 60 * 1000)).toBe(w); // mid-week: unchanged
   });
@@ -80,6 +86,8 @@ describe("window rollover", () => {
     expect(rolled.windowStart).toBe(MON + WEEK_MS);
     expect(rolled.draftsUsed).toBe(0);
     expect(rolled.tokensUsed).toBe(0);
+    expect(rolled.tokensReserved).toBe(0);
+    expect(rolled.settledReservationIds).toEqual([]);
   });
   it("creates a window from null/undefined", () => {
     expect(rollWindow(null, MON).windowStart).toBe(MON);
@@ -264,6 +272,30 @@ describe("isOverQuota", () => {
     expect(
       isOverQuota({ windowStart: 0, resetsAt: 0, draftsUsed: 99, tokensUsed: 1 }, limits),
     ).toBe(false);
+  });
+});
+
+describe("reservation quota helpers", () => {
+  const limits: ResolvedLimits = {
+    weeklyDraftLimit: 2,
+    weeklyTokenLimit: 100,
+    rateLimitPerMin: 10,
+    maxTokensPerRequest: 55_000,
+    enforcement: "hard",
+    extraPurchased: 0,
+  };
+
+  it("counts in-flight token reservations when deciding hard admission", () => {
+    const state: WindowState = {
+      windowStart: 0,
+      resetsAt: WEEK_MS,
+      draftsUsed: 1,
+      tokensUsed: 30,
+      tokensReserved: 60,
+    };
+    expect(reservedTokens(state)).toBe(60);
+    expect(wouldExceedQuota(state, limits, 1, 11)).toBe(true);
+    expect(wouldExceedQuota(state, limits, 1, 10)).toBe(false);
   });
 });
 

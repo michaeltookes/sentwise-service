@@ -15,6 +15,8 @@ interface WindowResult {
 interface ReserveResult {
   reserved: boolean;
   blockedByQuota: boolean;
+  reservationId: string;
+  estimatedTokens: number;
   window: WindowState;
 }
 
@@ -67,14 +69,21 @@ describe("AccountQuota Durable Object", () => {
   it("reserve atomically admits one hard-quota draft and blocks the next", async () => {
     const first = await callDO<ReserveResult>("do-reserve-hard", "/reserve", {
       now: MON,
+      reservationId: "reserve-hard-1",
+      estimatedTokens: 100,
       limits: hardLimits,
     });
     expect(first.reserved).toBe(true);
     expect(first.blockedByQuota).toBe(false);
+    expect(first.reservationId).toBe("reserve-hard-1");
+    expect(first.estimatedTokens).toBe(100);
     expect(first.window.draftsUsed).toBe(1);
+    expect(first.window.tokensReserved).toBe(100);
 
     const second = await callDO<ReserveResult>("do-reserve-hard", "/reserve", {
       now: MON + 1,
+      reservationId: "reserve-hard-2",
+      estimatedTokens: 100,
       limits: hardLimits,
     });
     expect(second.reserved).toBe(false);
@@ -82,30 +91,89 @@ describe("AccountQuota Durable Object", () => {
     expect(second.window.draftsUsed).toBe(1);
   });
 
+  it("reserve counts estimated tokens in hard quota admission", async () => {
+    const limits: ResolvedLimits = {
+      ...hardLimits,
+      weeklyDraftLimit: 10,
+      weeklyTokenLimit: 100,
+    };
+    const first = await callDO<ReserveResult>("do-reserve-tokens", "/reserve", {
+      now: MON,
+      reservationId: "reserve-token-1",
+      estimatedTokens: 80,
+      limits,
+    });
+    expect(first.reserved).toBe(true);
+    expect(first.window.tokensReserved).toBe(80);
+
+    const second = await callDO<ReserveResult>("do-reserve-tokens", "/reserve", {
+      now: MON + 1,
+      reservationId: "reserve-token-2",
+      estimatedTokens: 21,
+      limits,
+    });
+    expect(second.reserved).toBe(false);
+    expect(second.blockedByQuota).toBe(true);
+    expect(second.window.tokensReserved).toBe(80);
+  });
+
   it("release rolls back only the reserved draft in the same window", async () => {
     const reserved = await callDO<ReserveResult>("do-release", "/reserve", {
       now: MON,
+      reservationId: "release-1",
+      estimatedTokens: 250,
       limits: hardLimits,
     });
     const released = await callDO<WindowResult>("do-release", "/release", {
       now: MON + 1,
       reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
     });
     expect(released.window.draftsUsed).toBe(0);
+    expect(released.window.tokensReserved).toBe(0);
   });
 
   it("settle applies token usage to the reserved window without adding another draft", async () => {
     const reserved = await callDO<ReserveResult>("do-settle-reserved", "/reserve", {
       now: MON,
+      reservationId: "settle-reserved-1",
+      estimatedTokens: 250,
       limits: hardLimits,
     });
     const settled = await callDO<WindowResult>("do-settle-reserved", "/settle", {
       now: MON + 1000,
+      reservationId: reserved.reservationId,
       reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
       tokensDelta: 500,
     });
     expect(settled.window.draftsUsed).toBe(1);
     expect(settled.window.tokensUsed).toBe(500);
+    expect(settled.window.tokensReserved).toBe(0);
+  });
+
+  it("settle ignores duplicate retries for the same reservation id", async () => {
+    const reserved = await callDO<ReserveResult>("do-settle-idempotent", "/reserve", {
+      now: MON,
+      reservationId: "settle-idempotent-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    const body = {
+      now: MON + 1000,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    };
+    const first = await callDO<WindowResult>("do-settle-idempotent", "/settle", body);
+    const second = await callDO<WindowResult>("do-settle-idempotent", "/settle", {
+      ...body,
+      now: MON + 2000,
+    });
+    expect(first.window.tokensUsed).toBe(500);
+    expect(second.window.tokensUsed).toBe(500);
+    expect(second.window.tokensReserved).toBe(0);
   });
 
   it("rolls the window to a fresh, zeroed one at the next Monday", async () => {

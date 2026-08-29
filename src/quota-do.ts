@@ -1,24 +1,26 @@
 // AccountQuota Durable Object (56b). One instance per Clerk userId
-// (`idFromName(userId)`). Stores ONLY counters and timestamps — never prompts,
-// never draft content, never emails.
+// (`idFromName(userId)`). Stores ONLY counters, timestamps, and random
+// reservation IDs for settlement dedupe — never prompts, never draft content,
+// never emails.
 //
 // Storage keys:
-//   "window" -> WindowState  (weekly drafts/tokens used + reset timestamps)
+//   "window" -> WindowState  (weekly usage, in-flight token reservations, reset timestamps)
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
 //
 // The Worker calls three ops over the DO's internal fetch (see quota-client.ts):
 //   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
-//   POST /reserve { now, limits } -> { reserved, blockedByQuota, window }
-//   POST /settle  { now, reservationWindowStart, tokensDelta } -> { window }
-//   POST /release { now, reservationWindowStart } -> { window }
+//   POST /reserve { now, reservationId, estimatedTokens, limits } -> { reserved, ... }
+//   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
+//   POST /release { now, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /peek    { now } -> { window }   (read + roll only; no rate-limit, no increment)
 
 import type { Env } from "./config";
 import {
-  isOverQuota,
   pruneStamps,
+  reservedTokens,
   rollWindow,
   RATE_WINDOW_MS,
+  wouldExceedQuota,
   type ResolvedLimits,
   type WindowState,
 } from "./metering";
@@ -29,16 +31,21 @@ interface CheckBody {
 }
 interface SettleBody {
   now: number;
+  reservationId?: string;
   reservationWindowStart?: number;
+  estimatedTokens?: number;
   draftsDelta?: number;
   tokensDelta: number;
 }
 interface ReserveBody {
   now: number;
+  reservationId: string;
+  estimatedTokens: number;
   limits: ResolvedLimits;
 }
 interface ReleaseBody {
   now: number;
+  estimatedTokens: number;
   reservationWindowStart: number;
 }
 interface PeekBody {
@@ -96,14 +103,31 @@ export class AccountQuota {
 
   private async handleReserve(body: ReserveBody): Promise<Response> {
     const window = await this.loadWindow(body.now);
-    if (body.limits.enforcement === "hard" && isOverQuota(window, body.limits)) {
+    const estimatedTokens = nonNegativeInt(body.estimatedTokens);
+    if (
+      body.limits.enforcement === "hard" &&
+      wouldExceedQuota(window, body.limits, 1, estimatedTokens)
+    ) {
       await this.storage.put("window", window);
-      return Response.json({ reserved: false, blockedByQuota: true, window });
+      return Response.json({
+        reserved: false,
+        blockedByQuota: true,
+        reservationId: body.reservationId,
+        estimatedTokens,
+        window,
+      });
     }
 
     window.draftsUsed += 1;
+    window.tokensReserved = reservedTokens(window) + estimatedTokens;
     await this.storage.put("window", window);
-    return Response.json({ reserved: true, blockedByQuota: false, window });
+    return Response.json({
+      reserved: true,
+      blockedByQuota: false,
+      reservationId: body.reservationId,
+      estimatedTokens,
+      window,
+    });
   }
 
   private async handleSettle(body: SettleBody): Promise<Response> {
@@ -112,8 +136,18 @@ export class AccountQuota {
       body.reservationWindowStart,
     );
     if (appliesToStoredReservation) {
-      window.draftsUsed = Math.max(0, window.draftsUsed + (body.draftsDelta ?? 0));
-      window.tokensUsed = Math.max(0, window.tokensUsed + body.tokensDelta);
+      const settledIds = window.settledReservationIds ?? [];
+      if (!body.reservationId || !settledIds.includes(body.reservationId)) {
+        window.draftsUsed = Math.max(0, window.draftsUsed + (body.draftsDelta ?? 0));
+        window.tokensReserved = Math.max(
+          0,
+          reservedTokens(window) - nonNegativeInt(body.estimatedTokens),
+        );
+        window.tokensUsed = Math.max(0, window.tokensUsed + body.tokensDelta);
+        if (body.reservationId) {
+          window.settledReservationIds = [...settledIds, body.reservationId];
+        }
+      }
     }
     await this.storage.put("window", window);
     return Response.json({ window });
@@ -126,6 +160,10 @@ export class AccountQuota {
     );
     if (appliesToStoredReservation) {
       window.draftsUsed = Math.max(0, window.draftsUsed - 1);
+      window.tokensReserved = Math.max(
+        0,
+        reservedTokens(window) - nonNegativeInt(body.estimatedTokens),
+      );
     }
     await this.storage.put("window", window);
     return Response.json({ window });
@@ -150,4 +188,8 @@ export class AccountQuota {
     }
     return { window: rollWindow(stored, now), appliesToStoredReservation: false };
   }
+}
+
+function nonNegativeInt(v: number | undefined): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
