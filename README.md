@@ -34,7 +34,8 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
   telemetry is error _types_ (e.g. `rate_limited`) and **aggregate, hashed** usage metrics, never
   content. This is enforced in CI by `scripts/check-no-body-logging.sh`, which fails the build if any
   `console.*` call appears in `src/`.
-- **The only persisted state is counters, timestamps, and one hash — never content:**
+- **The only persisted state is counters, timestamps, random settlement IDs, and one hash — never
+  content:**
   1. `trialStartedAt` in the user's Clerk `privateMetadata` (trial enforcement, 56a).
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
      weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random

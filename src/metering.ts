@@ -2,8 +2,8 @@
 // trivially unit-testable — no storage, no network, no Clerk. The Durable Object
 // (src/quota-do.ts) and the request handler (src/index.ts) call into these.
 //
-// PRIVACY: this module handles only counters, timestamps, and limits. It never
-// sees prompt or draft content.
+// PRIVACY: this module handles only counters, timestamps, random settlement IDs,
+// and limits. It never sees prompt or draft content.
 
 import {
   DEFAULT_ENFORCEMENT_MODE,
