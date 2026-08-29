@@ -3,7 +3,7 @@
 The managed-inference service for **[Sentwise](https://github.com/michaeltookes/sentwise)** — a
 stateless [Cloudflare Worker](https://workers.cloudflare.com/) that lets a signed-in Sentwise user
 draft email through the model provider **without ever holding an API key**. It is the server half of
-backlog item **56a** (account + proxy).
+backlog items **56a** (account + proxy) and **56b** (metering + limits).
 
 **Deployed:** `https://sentwise-inference.sentwise-service.workers.dev`
 
@@ -22,19 +22,25 @@ reply to) to this Worker with a short-lived Clerk session token. The Worker:
    zero-data-retention terms.
 4. Returns the drafted text and token usage.
 
-That's the whole job. Metering, caps, rate-limiting, and checkout are **out of scope for 56a**
-(items 56b / 56c) and are marked with `TODO(56b)` / `TODO(56c)` in the source.
+Metering, weekly caps, and rate-limiting ship in **56b** (see [Metering](#metering-56b) below).
+Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)` in the source.
 
-## Privacy design — stateless by construction
+## Privacy design — content-stateless by construction
 
-- **Nothing is stored.** There is no database, no KV, no D1, no queue. The request and response live
-  in memory for the duration of one `fetch` and are then gone.
+- **No content is stored.** The user's mail, the prompts, and the drafted reply live in memory for
+  the duration of one `fetch` and are then gone. There is no database of content, and nothing the
+  user writes or receives is persisted anywhere.
 - **Nothing is logged.** The Worker never writes request or response bodies anywhere. The only
-  telemetry is error _types_ (e.g. `rate_limited`), never content. This is enforced in CI by
-  `scripts/check-no-body-logging.sh`, which fails the build if any `console.*` call appears in
-  `src/`.
-- **The only persisted state** anywhere is a single timestamp — `trialStartedAt` — stored in the
-  user's Clerk `privateMetadata` to enforce the trial. No mail, no drafts, no prompts.
+  telemetry is error _types_ (e.g. `rate_limited`) and **aggregate, hashed** usage metrics, never
+  content. This is enforced in CI by `scripts/check-no-body-logging.sh`, which fails the build if any
+  `console.*` call appears in `src/`.
+- **The only persisted state is counters, timestamps, and one hash — never content:**
+  1. `trialStartedAt` in the user's Clerk `privateMetadata` (trial enforcement, 56a).
+  2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
+     weekly drafts/tokens used and a sliding rate-limit window, keyed by Clerk userId. Integers and
+     reset timestamps only — no prompts, no drafts, no emails.
+  3. **Aggregate, hashed usage metrics** in Workers Analytics Engine (56b): a SHA-256 hash of the
+     userId (never the raw id), the model, token counts, estimated cost, latency, and outcome.
 - **Cloudflare invocation logs are disabled** (`observability.logs.invocation_logs: false` in
   `wrangler.jsonc`), so Cloudflare retains no per-request records — only aggregate metrics (request
   counts, error rates) with no content.
@@ -42,9 +48,11 @@ That's the whole job. Metering, caps, rate-limiting, and checkout are **out of s
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, /v1/me, /v1/draft
-  -> src/auth.ts       verify Clerk JWT, check/init the trial (Clerk privateMetadata)
-  -> src/anthropic.ts  forward to Anthropic, map the response — no logging, no storage
+src/index.ts      router: /healthz, /v1/me, /v1/draft, /admin/margin
+  -> src/auth.ts          verify Clerk JWT, check/init the trial + read quota overrides
+  -> src/anthropic.ts     forward to Anthropic, map the response — no logging, no storage
+  -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only
+  -> src/analytics.ts     one aggregate hashed metric per draft — no content
 ```
 
 ## API
@@ -61,7 +69,18 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
 {
   "userId": "user_...",
   "email": "you@example.com",
-  "trial": { "startedAt": "2026-08-20T...Z", "endsAt": "2026-09-03T...Z", "active": true }
+  "trial": { "startedAt": "2026-08-20T...Z", "endsAt": "2026-09-03T...Z", "active": true },
+  "quota": {
+    "unit": "drafts",
+    "used": 12,
+    "limit": 100,
+    "remaining": 88,
+    "resetsAt": "2026-09-07T00:00:00.000Z",
+    "tokensUsed": 240000,
+    "tokenLimit": 2000000,
+    "enforcement": "soft",
+    "extraPurchased": 0
+  }
 }
 ```
 
@@ -82,16 +101,96 @@ Requires `Authorization: Bearer <clerk-session-token>`. Body mirrors the app's `
 ```
 
 `model`, `maxTokens`, `temperature`, and `system` are optional (model defaults to
-`claude-sonnet-4-6`). Returns `{ "text": "…", "usage": { "inputTokens": N, "outputTokens": N } }`.
+`claude-sonnet-4-6`). Returns the drafted text, token usage, and the account's current quota:
+
+```json
+{
+  "text": "…",
+  "usage": { "inputTokens": 1234, "outputTokens": 567 },
+  "quota": {
+    "unit": "drafts",
+    "used": 13,
+    "limit": 100,
+    "remaining": 87,
+    "resetsAt": "2026-09-07T00:00:00.000Z",
+    "tokensUsed": 241801,
+    "tokenLimit": 2000000,
+    "enforcement": "soft",
+    "extraPurchased": 0
+  }
+}
+```
 
 On an expired trial it returns **HTTP 402** with `{ "error": { "type": "trial_expired", … } }`. All
 errors are structured JSON with a stable `error.type`; the Sentwise app maps these to plain messages.
+See [Metering](#metering-56b) for the metering-specific error codes (`rate_limited`,
+`request_too_large`, `quota_exceeded`).
 
 ## The 14-day trial
 
 Full-featured, enforced server-side. On the first authenticated `/v1/draft` call, the Worker stamps
 `trialStartedAt` into the user's Clerk `privateMetadata`. Fourteen days later, `/v1/draft` returns
 `402 trial_expired`. Paid state arrives with checkout in **56c**.
+
+## Metering (56b)
+
+Per-account usage metering, weekly caps, and rate limiting. The model (owner decision 2026-08-29): a
+**weekly allotment that resets weekly**, then pay-per-use overage (the purchase flow is 56c; 56b
+meters, enforces, and surfaces the numbers).
+
+**Window semantics.** The allotment window is one week starting **Monday 00:00 UTC**; it rolls on a
+lazy reset (the next request at/after `resetsAt` starts a fresh, zeroed window). Counters live in the
+`AccountQuota` Durable Object, one instance per Clerk userId. The `quota` object on `/v1/me` and
+`/v1/draft` reports `used` / `limit` / `remaining` (drafts), `tokensUsed` / `tokenLimit`, the
+`resetsAt` timestamp, the `enforcement` mode, and `extraPurchased` (overage credits added to the
+limit for the current window).
+
+**Per-request pipeline** (`POST /v1/draft`): authenticate → trial → parse → **rate-limit** →
+**token safety cap** → **weekly quota** → forward to Anthropic → settle usage → respond.
+
+**Enforcement modes** (`ENFORCEMENT_MODE`):
+
+- `soft` (default): meter and report, but never block on the weekly quota — `remaining` clamps at 0
+  and drafting continues past the cap. The rate limit and the per-request safety cap are always hard.
+- `hard`: also block over-quota drafts with `429 quota_exceeded`.
+
+**Error codes:**
+
+| HTTP | `error.type`        | When                                                                |
+| ---- | ------------------- | ------------------------------------------------------------------- |
+| 429  | `rate_limited`      | Over `RATE_LIMIT_PER_MIN` (sliding 60s). Includes `Retry-After`.    |
+| 413  | `request_too_large` | Estimated request tokens exceed `MAX_TOKENS_PER_REQUEST`.           |
+| 429  | `quota_exceeded`    | Weekly cap reached **and** `ENFORCEMENT_MODE=hard`. Has `resetsAt`. |
+
+**Config vars** (in `wrangler.jsonc` `vars`; placeholder defaults, final numbers land with 56c):
+
+| Var                      | Default   | Meaning                                                 |
+| ------------------------ | --------- | ------------------------------------------------------- |
+| `WEEKLY_DRAFT_LIMIT`     | `100`     | Drafts per account per week.                            |
+| `WEEKLY_TOKEN_LIMIT`     | `2000000` | Input+output tokens per account per week.               |
+| `RATE_LIMIT_PER_MIN`     | `10`      | Requests per 60s per account (abuse guard).             |
+| `MAX_TOKENS_PER_REQUEST` | `55000`   | Per-request safety cap; est. as `chars/4 + max_tokens`. |
+| `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).       |
+
+**Per-account overrides.** `privateMetadata.quota` on the Clerk user —
+`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts? }` — overrides the vars for that account.
+`extraDrafts` is added to the weekly draft limit for the current window (56c writes purchased extras
+here). These are read on the same `getUser` as the trial, so metering adds no extra Clerk round-trip.
+
+**Privacy.** The Durable Object stores only integers and timestamps; it never sees prompt or draft
+content. See the [Privacy design](#privacy-design--content-stateless-by-construction) section.
+
+### `GET /admin/margin` (maintainer only)
+
+A margin dashboard for the maintainer. Guarded by the `ADMIN_TOKEN` secret (constant-time compare);
+when `ADMIN_TOKEN` is unset the endpoint returns **404** (invisible). It queries Workers Analytics
+Engine's SQL API for the last 7 and 30 days — drafts, tokens, estimated cost, cost-per-draft p50/p95,
+top-10 accounts by cost (hashed ids), active accounts, and estimated cost vs. the assumed \$19/mo
+revenue per active account. If `CF_ANALYTICS_API_TOKEN` is unset (or a query fails) it degrades to
+**503 `analytics_unavailable`**. Reads aggregate hashed metrics only — no content.
+
+The per-model cost table lives in `src/config.ts` (`MODEL_COSTS`, Sonnet 4.6 as the default row);
+edit it there when pricing changes or a new model is added.
 
 ## Development
 
@@ -112,13 +211,32 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
 - `CLERK_SECRET_KEY` — Clerk backend key (JWT verification + trial metadata).
 - `ANTHROPIC_API_KEY` — the server-held drafting key.
 - `CLERK_PUBLISHABLE_KEY` — public; committed in `wrangler.jsonc` as a plain var.
+- `ADMIN_TOKEN` — **56b, optional.** Bearer token that guards `GET /admin/margin`; when unset the
+  endpoint 404s.
+- `CF_ANALYTICS_API_TOKEN` — **56b, optional.** A Cloudflare API token with **Account Analytics
+  read** permission, used by `/admin/margin` to query the Analytics Engine SQL API. When unset,
+  `/admin/margin` returns `503 analytics_unavailable`.
 
 Push them to the Worker with (values are read from the file, never printed):
 
 ```bash
 grep '^ANTHROPIC_API_KEY=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put ANTHROPIC_API_KEY
 grep '^CLERK_SECRET_KEY='  ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put CLERK_SECRET_KEY
+# 56b margin dashboard (optional):
+grep '^ADMIN_TOKEN='            ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put ADMIN_TOKEN
+grep '^CF_ANALYTICS_API_TOKEN=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put CF_ANALYTICS_API_TOKEN
 ```
+
+### Metering storage (56b)
+
+Metering adds two Cloudflare bindings, already declared in `wrangler.jsonc`:
+
+- a **Durable Object** namespace `ACCOUNT_QUOTA` (class `AccountQuota`, SQLite-backed via the `v1`
+  migration) for per-account usage counters, and
+- a **Workers Analytics Engine** dataset `USAGE_ANALYTICS` (`sentwise_usage`) for the margin metrics.
+
+No manual provisioning is needed — `wrangler deploy` creates them from the config. The DO and dataset
+store counters and hashed ids only; see [Metering](#metering-56b).
 
 ### Deploy
 
