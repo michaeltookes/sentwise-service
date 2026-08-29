@@ -260,3 +260,155 @@ describe("routing", () => {
     expect(res.status).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 56b — metering + limits, end to end through the Worker (real AccountQuota DO).
+// ---------------------------------------------------------------------------
+
+function activeTrial() {
+  return userWith({ trialStartedAt: new Date(Date.now() - 1000).toISOString() });
+}
+
+function draftReq(sub: string, content = "draft this") {
+  mocks.verifyToken.mockResolvedValue({ sub });
+  return req("/v1/draft", {
+    method: "POST",
+    headers: bearer(),
+    body: JSON.stringify({ messages: [{ role: "user", content }] }),
+  });
+}
+
+describe("56b draft metering", () => {
+  it("returns the quota snapshot alongside the draft", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-quota" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    const res = await worker.fetch(draftReq("u-quota"), env);
+    expect(res.status).toBe(200);
+    const q = ((await res.json()) as any).quota;
+    expect(q).toMatchObject({
+      unit: "drafts",
+      used: 1,
+      limit: 100, // WEEKLY_DRAFT_LIMIT var default
+      remaining: 99,
+      tokenLimit: 2_000_000,
+      enforcement: "soft",
+      extraPurchased: 0,
+    });
+    expect(q.tokensUsed).toBe(5); // 3 in + 2 out from anthropicOk
+    expect(typeof q.resetsAt).toBe("string");
+    expect(Number.isNaN(Date.parse(q.resetsAt))).toBe(false);
+  });
+
+  it("adds purchased extras to the limit (extraPurchased)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-extra" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        quota: { extraDrafts: 5 },
+      }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    const res = await worker.fetch(draftReq("u-extra"), env);
+    const q = ((await res.json()) as any).quota;
+    expect(q.limit).toBe(105);
+    expect(q.extraPurchased).toBe(5);
+    expect(q.remaining).toBe(104);
+  });
+
+  it("rate limits with a 429 + Retry-After once the per-minute cap is hit", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-rate" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const rlEnv: Env = { ...env, RATE_LIMIT_PER_MIN: "1" };
+
+    const first = await worker.fetch(draftReq("u-rate"), rlEnv);
+    expect(first.status).toBe(200);
+
+    const second = await worker.fetch(draftReq("u-rate"), rlEnv);
+    expect(second.status).toBe(429);
+    const body = (await second.json()) as any;
+    expect(body.error.type).toBe("rate_limited");
+    expect(body.error.retryAfterSeconds).toBeGreaterThan(0);
+    expect(second.headers.get("Retry-After")).toBeTruthy();
+    // The rate-limited request never reached Anthropic.
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an over-cap request with 413 request_too_large before forwarding", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-big" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    // maxTokensPerRequest = 10; even a tiny request (chars/4 + DEFAULT_MAX_TOKENS) exceeds it.
+    const capEnv: Env = { ...env, MAX_TOKENS_PER_REQUEST: "10" };
+
+    const res = await worker.fetch(draftReq("u-big"), capEnv);
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as any).error.type).toBe("request_too_large");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("hard enforcement blocks an over-quota draft with 429 quota_exceeded", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-hard" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const hardEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "hard" };
+
+    const first = await worker.fetch(draftReq("u-hard"), hardEnv);
+    expect(first.status).toBe(200); // draftsUsed -> 1
+
+    const second = await worker.fetch(draftReq("u-hard"), hardEnv);
+    expect(second.status).toBe(429);
+    const body = (await second.json()) as any;
+    expect(body.error.type).toBe("quota_exceeded");
+    expect(typeof body.error.resetsAt).toBe("string");
+    expect(fetchMock).toHaveBeenCalledOnce(); // blocked before the 2nd forward
+  });
+
+  it("soft enforcement meters past the cap but keeps drafting", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-soft" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    // Fresh Response per call — the body is single-use and this test forwards twice.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => anthropicOk("ok")),
+    );
+    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+
+    expect((await worker.fetch(draftReq("u-soft"), softEnv)).status).toBe(200);
+    const res2 = await worker.fetch(draftReq("u-soft"), softEnv);
+    expect(res2.status).toBe(200);
+    const q = ((await res2.json()) as any).quota;
+    expect(q.used).toBe(2);
+    expect(q.limit).toBe(1);
+    expect(q.remaining).toBe(0); // clamped
+  });
+});
+
+describe("56b /v1/me quota", () => {
+  it("includes a zeroed quota snapshot", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-me" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.quota).toMatchObject({
+      unit: "drafts",
+      used: 0,
+      limit: 100,
+      remaining: 100,
+      tokenLimit: 2_000_000,
+      enforcement: "soft",
+      extraPurchased: 0,
+    });
+    // Viewing the account must not start a trial or record usage.
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    // quotaOverride is internal and must not leak into the response.
+    expect("quotaOverride" in body).toBe(false);
+  });
+});
