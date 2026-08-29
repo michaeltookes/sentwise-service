@@ -504,14 +504,24 @@ describe("56b draft metering", () => {
     expect(q.used).toBe(0);
   });
 
-  it("hard enforcement blocks when estimated tokens would exceed weekly token capacity", async () => {
+  it("hard enforcement reserves a conservative byte bound for multibyte input", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-hard-token-reserve" });
     mocks.getUser.mockResolvedValue(activeTrial());
     const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
     vi.stubGlobal("fetch", fetchMock);
-    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "4000", ENFORCEMENT_MODE: "hard" };
+    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "20", ENFORCEMENT_MODE: "hard" };
 
-    const res = await worker.fetch(draftReq("u-hard-token-reserve"), hardEnv);
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: [{ role: "user", content: "漢字漢字漢字漢字" }],
+        }),
+      }),
+      hardEnv,
+    );
     expect(res.status).toBe(429);
     expect(((await res.json()) as any).error.type).toBe("quota_exceeded");
     expect(fetchMock).not.toHaveBeenCalled();

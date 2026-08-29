@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildQuota,
+  conservativeRequestTokenBound,
   costUsd,
   estimateRequestTokens,
   freshWindow,
@@ -134,6 +135,12 @@ describe("estimateRequestTokens", () => {
     expect(estimateRequestTokens(0, 100)).toBe(100);
     expect(estimateRequestTokens(10, 100)).toBe(103); // ceil(10/4)=3
     expect(estimateRequestTokens(200_000, 4096)).toBe(54_096);
+  });
+  it("can compute a conservative byte-based hard-quota bound", () => {
+    expect(conservativeRequestTokenBound(new TextEncoder().encode("abcd").byteLength, 100)).toBe(
+      104,
+    );
+    expect(conservativeRequestTokenBound(new TextEncoder().encode("漢字").byteLength, 1)).toBe(7);
   });
 });
 

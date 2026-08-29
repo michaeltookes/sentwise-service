@@ -180,6 +180,11 @@ export function estimateRequestTokens(contentChars: number, maxTokens: number): 
   return Math.ceil(contentChars / 4) + maxTokens;
 }
 
+/** Conservative hard-quota bound: UTF-8 input bytes + the completion ceiling. */
+export function conservativeRequestTokenBound(contentBytes: number, maxTokens: number): number {
+  return contentBytes + maxTokens;
+}
+
 /** Build the exact `quota` wire object from window state + resolved limits. */
 export function buildQuota(state: WindowState, limits: ResolvedLimits): Quota {
   return {

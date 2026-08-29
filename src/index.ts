@@ -4,6 +4,7 @@ import { ApiError, jsonError } from "./errors";
 import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, type Env } from "./config";
 import {
   buildQuota,
+  conservativeRequestTokenBound,
   estimateRequestTokens,
   mondayStartUtc,
   resolveLimits,
@@ -87,16 +88,16 @@ export default {
         }
 
         // 2) Per-request token safety cap (pre-flight estimate).
-        const contentChars =
-          (draft.system?.length ?? 0) +
-          draft.messages.reduce((sum, m) => sum + m.content.length, 0);
-        const estTokens = estimateRequestTokens(
-          contentChars,
-          draft.maxTokens ?? DEFAULT_MAX_TOKENS,
-        );
+        const content = draftContentSize(draft.system, draft.messages);
+        const maxTokens = draft.maxTokens ?? DEFAULT_MAX_TOKENS;
+        const estTokens = estimateRequestTokens(content.chars, maxTokens);
         if (estTokens > limits.maxTokensPerRequest) {
           throw new ApiError(413, "request_too_large", "The request is too large to draft.");
         }
+        const reservedTokens =
+          limits.enforcement === "hard"
+            ? conservativeRequestTokenBound(content.bytes, maxTokens)
+            : estTokens;
 
         // 3) Weekly quota admission + draft reservation. Hard mode blocks atomically;
         // soft mode reserves and continues so successful drafts are metered once.
@@ -104,7 +105,7 @@ export default {
         const reservation = await quotaReserve(env, userId, {
           now,
           reservationId,
-          estimatedTokens: estTokens,
+          estimatedTokens: reservedTokens,
           limits,
         });
         if (!reservation.reserved && reservation.blockedByQuota) {
@@ -184,6 +185,20 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+function draftContentSize(
+  system: string | undefined,
+  messages: Array<{ content: string }>,
+): { chars: number; bytes: number } {
+  const enc = new TextEncoder();
+  let chars = system?.length ?? 0;
+  let bytes = system ? enc.encode(system).byteLength : 0;
+  for (const message of messages) {
+    chars += message.content.length;
+    bytes += enc.encode(message.content).byteLength;
+  }
+  return { chars, bytes };
+}
 
 async function settleReservedUsage(
   env: Env,
