@@ -25,8 +25,10 @@ export function isoForSql(ms: number): string {
 export function aggregateSql(dataset: string, sinceIso: string): string {
   const where = `timestamp >= toDateTime('${sinceIso}') AND blob3 = 'ok'`;
   const activeAccountsSql =
-    `(SELECT SUM(account_weight) FROM (` +
-    `SELECT index1, MAX(_sample_interval) AS account_weight ` +
+    `(SELECT SUM(1 / greatest(inclusion_probability, 0.000001)) FROM (` +
+    `SELECT index1, ` +
+    `if(min(_sample_interval) <= 1, 1.0, ` +
+    `1 - exp(SUM(log(1 - (1 / toFloat64(_sample_interval)))))) AS inclusion_probability ` +
     `FROM ${dataset} WHERE ${where} GROUP BY index1` +
     `)) AS active_accounts`;
   return (

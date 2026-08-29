@@ -33,8 +33,9 @@ describe("SQL builders", () => {
     expect(sql).toContain("blob3 = 'ok'");
     expect(sql).toContain("quantileWeighted(0.5)");
     expect(sql).toContain("quantileWeighted(0.95)");
-    expect(sql).toContain("MAX(_sample_interval) AS account_weight");
-    expect(sql).toContain("SUM(account_weight)");
+    expect(sql).toContain("inclusion_probability");
+    expect(sql).toContain("toFloat64(_sample_interval)");
+    expect(sql).toContain("SUM(1 / greatest(inclusion_probability");
     expect(sql).not.toContain("COUNT(DISTINCT index1)");
   });
   it("topAccountsSql groups by account and limits to 10", () => {

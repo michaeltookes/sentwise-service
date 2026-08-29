@@ -169,13 +169,13 @@ after Anthropic succeeds, the completed draft is still returned. Abandoned reser
 
 **Config vars** (in `wrangler.jsonc` `vars`; placeholder defaults, final numbers land with 56c):
 
-| Var                      | Default   | Meaning                                                 |
-| ------------------------ | --------- | ------------------------------------------------------- |
-| `WEEKLY_DRAFT_LIMIT`     | `100`     | Drafts per account per week.                            |
-| `WEEKLY_TOKEN_LIMIT`     | `2000000` | Input+output tokens per account per week.               |
-| `RATE_LIMIT_PER_MIN`     | `10`      | Requests per 60s per account (abuse guard).             |
-| `MAX_TOKENS_PER_REQUEST` | `55000`   | Per-request safety cap; est. as `chars/4 + max_tokens`. |
-| `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).       |
+| Var                      | Default   | Meaning                                                      |
+| ------------------------ | --------- | ------------------------------------------------------------ |
+| `WEEKLY_DRAFT_LIMIT`     | `100`     | Drafts per account per week.                                 |
+| `WEEKLY_TOKEN_LIMIT`     | `2000000` | Input+output tokens per account per week.                    |
+| `RATE_LIMIT_PER_MIN`     | `10`      | Requests per 60s per account (abuse guard).                  |
+| `MAX_TOKENS_PER_REQUEST` | `55000`   | Per-request safety cap; bound as `UTF-8 bytes + max_tokens`. |
+| `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).            |
 
 **Per-account overrides.** `privateMetadata.quota` on the Clerk user —
 `{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart? }` — overrides the

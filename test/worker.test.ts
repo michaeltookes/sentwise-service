@@ -475,10 +475,33 @@ describe("56b draft metering", () => {
     mocks.getUser.mockResolvedValue(activeTrial());
     const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
     vi.stubGlobal("fetch", fetchMock);
-    // maxTokensPerRequest = 10; even a tiny request (chars/4 + DEFAULT_MAX_TOKENS) exceeds it.
+    // maxTokensPerRequest = 10; even a tiny request (UTF-8 bytes + DEFAULT_MAX_TOKENS) exceeds it.
     const capEnv: Env = { ...env, MAX_TOKENS_PER_REQUEST: "10" };
 
     const res = await worker.fetch(draftReq("u-big"), capEnv);
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as any).error.type).toBe("request_too_large");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the conservative byte bound for the always-hard request safety cap", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-byte-cap" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const capEnv: Env = { ...env, MAX_TOKENS_PER_REQUEST: "20" };
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({
+          maxTokens: 1,
+          messages: [{ role: "user", content: "漢字漢字漢字漢字" }],
+        }),
+      }),
+      capEnv,
+    );
     expect(res.status).toBe(413);
     expect(((await res.json()) as any).error.type).toBe("request_too_large");
     expect(fetchMock).not.toHaveBeenCalled();

@@ -75,10 +75,10 @@ export const DEFAULT_WEEKLY_TOKEN_LIMIT = 2_000_000;
 // Abuse-prevention rate limit (sliding 60s window), per account.
 export const DEFAULT_RATE_LIMIT_PER_MIN = 10;
 
-// Per-request token safety cap. Derivation: MAX_TOTAL_CONTENT_CHARS / 4 (a rough
-// chars->tokens ratio for the input) + DEFAULT_MAX_TOKENS (the completion ceiling)
-// = 200_000 / 4 + 4_096 = 50_000 + 4_096 ≈ 54_096, rounded up to 55_000. A single
-// request estimated above this is rejected 413 before it ever reaches Anthropic.
+// Per-request token safety cap. The request path uses a conservative bound:
+// UTF-8 input bytes + DEFAULT_MAX_TOKENS (the completion ceiling). 55_000 keeps
+// the default ASCII/code-ish input budget near 50 KB while still rejecting dense
+// multibyte input before it ever reaches Anthropic.
 export const DEFAULT_MAX_TOKENS_PER_REQUEST = 55_000;
 
 // Enforcement mode. "soft" meters and reports but never blocks on quota (only the

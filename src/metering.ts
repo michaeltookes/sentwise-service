@@ -175,7 +175,7 @@ export function pruneStamps(
   return stamps.filter((t) => t > cutoff);
 }
 
-/** Rough token estimate for the safety cap: input chars/4 + the completion ceiling. */
+/** Rough token estimate: input chars/4 + the completion ceiling. */
 export function estimateRequestTokens(contentChars: number, maxTokens: number): number {
   return Math.ceil(contentChars / 4) + maxTokens;
 }
