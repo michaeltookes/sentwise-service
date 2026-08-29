@@ -26,7 +26,7 @@ export { AccountQuota } from "./quota-do";
  *   GET  /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
- * only state is counters, timestamps, and random settlement IDs — trial in Clerk,
+ * only state is counters, timestamps, and random reservation IDs — trial in Clerk,
  * usage in the AccountQuota Durable Object, aggregate hashed metrics in Analytics
  * Engine. See src/config.ts.
  */
@@ -124,11 +124,13 @@ export default {
           result = await forwardToAnthropic(draft, env);
         } catch (err) {
           const outcome = err instanceof ApiError ? err.type : "internal_error";
-          await quotaRelease(env, userId, {
-            now: Date.now(),
-            reservationWindowStart: reservation.window.windowStart,
-            estimatedTokens: reservation.estimatedTokens,
-          }).catch(() => undefined);
+          await releaseReservedUsage(
+            env,
+            userId,
+            reservation.reservationId,
+            reservation.window,
+            reservation.estimatedTokens,
+          );
           await recordUsage(env, {
             userId,
             model,
@@ -209,6 +211,31 @@ async function settleReservedUsage(
         tokensUsed: reservedWindow.tokensUsed + tokensDelta,
         tokensReserved: Math.max(0, (reservedWindow.tokensReserved ?? 0) - estimatedTokens),
       };
+    }
+  }
+}
+
+async function releaseReservedUsage(
+  env: Env,
+  userId: string,
+  reservationId: string,
+  reservedWindow: WindowState,
+  estimatedTokens: number,
+): Promise<void> {
+  const body = {
+    now: Date.now(),
+    reservationId,
+    reservationWindowStart: reservedWindow.windowStart,
+    estimatedTokens,
+  };
+  try {
+    await quotaRelease(env, userId, body);
+  } catch {
+    try {
+      await quotaRelease(env, userId, { ...body, now: Date.now() });
+    } catch {
+      // The reservation also has a DO-side TTL, so a repeated release outage
+      // cannot hold quota capacity until the weekly reset.
     }
   }
 }

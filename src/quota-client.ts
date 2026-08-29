@@ -69,7 +69,12 @@ export function quotaSettle(
 export function quotaRelease(
   env: Env,
   userId: string,
-  body: { now: number; reservationWindowStart: number; estimatedTokens: number },
+  body: {
+    now: number;
+    reservationId?: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+  },
 ): Promise<WindowResult> {
   return call<WindowResult>(env, userId, "/release", body);
 }

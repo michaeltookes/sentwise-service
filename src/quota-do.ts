@@ -16,7 +16,11 @@
 
 import type { Env } from "./config";
 import {
+  activeReservations,
+  MAX_SETTLED_RESERVATION_IDS,
   pruneStamps,
+  pruneExpiredReservations,
+  RESERVATION_TTL_MS,
   reservedTokens,
   rollWindow,
   RATE_WINDOW_MS,
@@ -45,6 +49,7 @@ interface ReserveBody {
 }
 interface ReleaseBody {
   now: number;
+  reservationId?: string;
   estimatedTokens: number;
   reservationWindowStart: number;
 }
@@ -120,6 +125,14 @@ export class AccountQuota {
 
     window.draftsUsed += 1;
     window.tokensReserved = reservedTokens(window) + estimatedTokens;
+    window.activeReservations = [
+      ...activeReservations(window),
+      {
+        id: body.reservationId,
+        estimatedTokens,
+        expiresAt: body.now + RESERVATION_TTL_MS,
+      },
+    ];
     await this.storage.put("window", window);
     return Response.json({
       reserved: true,
@@ -138,14 +151,19 @@ export class AccountQuota {
     if (appliesToStoredReservation) {
       const settledIds = window.settledReservationIds ?? [];
       if (!body.reservationId || !settledIds.includes(body.reservationId)) {
-        window.draftsUsed = Math.max(0, window.draftsUsed + (body.draftsDelta ?? 0));
-        window.tokensReserved = Math.max(
-          0,
-          reservedTokens(window) - nonNegativeInt(body.estimatedTokens),
-        );
+        const active = activeReservations(window);
+        const reservation = active.find((r) => r.id === body.reservationId);
+        const estimatedTokens =
+          reservation?.estimatedTokens ?? nonNegativeInt(body.estimatedTokens);
+        const draftsDelta = body.draftsDelta ?? (body.reservationId && !reservation ? 1 : 0);
+        window.draftsUsed = Math.max(0, window.draftsUsed + draftsDelta);
+        window.tokensReserved = Math.max(0, reservedTokens(window) - estimatedTokens);
         window.tokensUsed = Math.max(0, window.tokensUsed + body.tokensDelta);
         if (body.reservationId) {
-          window.settledReservationIds = [...settledIds, body.reservationId];
+          window.activeReservations = active.filter((r) => r.id !== body.reservationId);
+        }
+        if (body.reservationId) {
+          window.settledReservationIds = appendSettledReservationId(settledIds, body.reservationId);
         }
       }
     }
@@ -159,11 +177,17 @@ export class AccountQuota {
       body.reservationWindowStart,
     );
     if (appliesToStoredReservation) {
-      window.draftsUsed = Math.max(0, window.draftsUsed - 1);
-      window.tokensReserved = Math.max(
-        0,
-        reservedTokens(window) - nonNegativeInt(body.estimatedTokens),
-      );
+      const active = activeReservations(window);
+      const reservation = active.find((r) => r.id === body.reservationId);
+      if (!body.reservationId || reservation) {
+        const estimatedTokens =
+          reservation?.estimatedTokens ?? nonNegativeInt(body.estimatedTokens);
+        window.draftsUsed = Math.max(0, window.draftsUsed - 1);
+        window.tokensReserved = Math.max(0, reservedTokens(window) - estimatedTokens);
+        if (body.reservationId) {
+          window.activeReservations = active.filter((r) => r.id !== body.reservationId);
+        }
+      }
     }
     await this.storage.put("window", window);
     return Response.json({ window });
@@ -184,7 +208,10 @@ export class AccountQuota {
       return { window: rollWindow(stored, now), appliesToStoredReservation: true };
     }
     if (stored?.windowStart === reservationWindowStart) {
-      return { window: stored, appliesToStoredReservation: true };
+      return {
+        window: pruneExpiredReservations(stored, now),
+        appliesToStoredReservation: true,
+      };
     }
     return { window: rollWindow(stored, now), appliesToStoredReservation: false };
   }
@@ -192,4 +219,8 @@ export class AccountQuota {
 
 function nonNegativeInt(v: number | undefined): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+}
+
+function appendSettledReservationId(ids: string[], id: string): string[] {
+  return [...ids, id].slice(-MAX_SETTLED_RESERVATION_IDS);
 }

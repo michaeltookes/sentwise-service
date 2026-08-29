@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { env as testEnv } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { TRIAL_MS } from "../src/config";
-import { mondayStartUtc, WEEK_MS, type WindowState } from "../src/metering";
+import { mondayStartUtc, RESERVATION_TTL_MS, WEEK_MS, type WindowState } from "../src/metering";
 
 // Mock @clerk/backend so JWT verification and user lookups are controllable.
 const mocks = vi.hoisted(() => ({
@@ -61,12 +61,14 @@ function internalUrl(input: RequestInfo | URL): URL {
 }
 
 function internalBody(init: RequestInit | undefined): {
+  now?: number;
   reservationId?: string;
   reservationWindowStart?: number;
   estimatedTokens?: number;
 } {
   if (typeof init?.body !== "string") return {};
   return JSON.parse(init.body) as {
+    now?: number;
     reservationId?: string;
     reservationWindowStart?: number;
     estimatedTokens?: number;
@@ -98,6 +100,14 @@ function quotaNamespaceWithSettleFailure(now: number): {
           ...window,
           draftsUsed: window.draftsUsed + 1,
           tokensReserved: (window.tokensReserved ?? 0) + estimatedTokens,
+          activeReservations: [
+            ...(window.activeReservations ?? []),
+            {
+              id: body.reservationId ?? "",
+              estimatedTokens,
+              expiresAt: (body.now ?? now) + RESERVATION_TTL_MS,
+            },
+          ],
         };
         return Promise.resolve(
           Response.json({
@@ -115,10 +125,18 @@ function quotaNamespaceWithSettleFailure(now: number): {
       }
       if (path === "/release") {
         if (body.reservationWindowStart === window.windowStart) {
+          const reservation = (window.activeReservations ?? []).find(
+            (r) => r.id === body.reservationId,
+          );
           window = {
             ...window,
-            draftsUsed: Math.max(0, window.draftsUsed - 1),
-            tokensReserved: Math.max(0, (window.tokensReserved ?? 0) - (body.estimatedTokens ?? 0)),
+            draftsUsed: reservation ? Math.max(0, window.draftsUsed - 1) : window.draftsUsed,
+            tokensReserved: reservation
+              ? Math.max(0, (window.tokensReserved ?? 0) - reservation.estimatedTokens)
+              : window.tokensReserved,
+            activeReservations: (window.activeReservations ?? []).filter(
+              (r) => r.id !== body.reservationId,
+            ),
           };
         }
         return Promise.resolve(Response.json({ window }));

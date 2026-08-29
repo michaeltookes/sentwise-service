@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
-import { WEEK_MS, type ResolvedLimits, type WindowState } from "../src/metering";
+import {
+  MAX_SETTLED_RESERVATION_IDS,
+  RESERVATION_TTL_MS,
+  WEEK_MS,
+  type ResolvedLimits,
+  type WindowState,
+} from "../src/metering";
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 
@@ -79,6 +85,9 @@ describe("AccountQuota Durable Object", () => {
     expect(first.estimatedTokens).toBe(100);
     expect(first.window.draftsUsed).toBe(1);
     expect(first.window.tokensReserved).toBe(100);
+    expect(first.window.activeReservations).toEqual([
+      { id: "reserve-hard-1", estimatedTokens: 100, expiresAt: MON + RESERVATION_TTL_MS },
+    ]);
 
     const second = await callDO<ReserveResult>("do-reserve-hard", "/reserve", {
       now: MON + 1,
@@ -126,11 +135,32 @@ describe("AccountQuota Durable Object", () => {
     });
     const released = await callDO<WindowResult>("do-release", "/release", {
       now: MON + 1,
+      reservationId: reserved.reservationId,
       reservationWindowStart: reserved.window.windowStart,
       estimatedTokens: reserved.estimatedTokens,
     });
     expect(released.window.draftsUsed).toBe(0);
     expect(released.window.tokensReserved).toBe(0);
+    expect(released.window.activeReservations).toEqual([]);
+  });
+
+  it("release is idempotent when retried for the same reservation id", async () => {
+    const reserved = await callDO<ReserveResult>("do-release-idempotent", "/reserve", {
+      now: MON,
+      reservationId: "release-idempotent-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    const body = {
+      now: MON + 1,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+    };
+    await callDO<WindowResult>("do-release-idempotent", "/release", body);
+    const second = await callDO<WindowResult>("do-release-idempotent", "/release", body);
+    expect(second.window.draftsUsed).toBe(0);
+    expect(second.window.tokensReserved).toBe(0);
   });
 
   it("settle applies token usage to the reserved window without adding another draft", async () => {
@@ -150,6 +180,7 @@ describe("AccountQuota Durable Object", () => {
     expect(settled.window.draftsUsed).toBe(1);
     expect(settled.window.tokensUsed).toBe(500);
     expect(settled.window.tokensReserved).toBe(0);
+    expect(settled.window.activeReservations).toEqual([]);
   });
 
   it("settle ignores duplicate retries for the same reservation id", async () => {
@@ -174,6 +205,60 @@ describe("AccountQuota Durable Object", () => {
     expect(first.window.tokensUsed).toBe(500);
     expect(second.window.tokensUsed).toBe(500);
     expect(second.window.tokensReserved).toBe(0);
+  });
+
+  it("settle keeps only a bounded dedupe id history", async () => {
+    const uid = "do-settle-bounded";
+    let last!: WindowResult;
+    for (let i = 0; i < MAX_SETTLED_RESERVATION_IDS + 5; i++) {
+      const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+        now: MON + i,
+        reservationId: `settled-${i}`,
+        estimatedTokens: 1,
+        limits: { ...hardLimits, weeklyDraftLimit: 1_000, weeklyTokenLimit: 1_000 },
+      });
+      last = await callDO<WindowResult>(uid, "/settle", {
+        now: MON + i,
+        reservationId: reserved.reservationId,
+        reservationWindowStart: reserved.window.windowStart,
+        estimatedTokens: reserved.estimatedTokens,
+        tokensDelta: 1,
+      });
+    }
+    expect(last.window.settledReservationIds).toHaveLength(MAX_SETTLED_RESERVATION_IDS);
+    expect(last.window.settledReservationIds?.[0]).toBe("settled-5");
+  });
+
+  it("expires abandoned reservations before admitting more hard quota capacity", async () => {
+    const limits: ResolvedLimits = {
+      ...hardLimits,
+      weeklyDraftLimit: 1,
+      weeklyTokenLimit: 500,
+    };
+    const first = await callDO<ReserveResult>("do-expire-reservation", "/reserve", {
+      now: MON,
+      reservationId: "expire-1",
+      estimatedTokens: 400,
+      limits,
+    });
+    expect(first.reserved).toBe(true);
+
+    const second = await callDO<ReserveResult>("do-expire-reservation", "/reserve", {
+      now: MON + RESERVATION_TTL_MS + 1,
+      reservationId: "expire-2",
+      estimatedTokens: 400,
+      limits,
+    });
+    expect(second.reserved).toBe(true);
+    expect(second.window.draftsUsed).toBe(1);
+    expect(second.window.tokensReserved).toBe(400);
+    expect(second.window.activeReservations).toEqual([
+      {
+        id: "expire-2",
+        estimatedTokens: 400,
+        expiresAt: MON + RESERVATION_TTL_MS + 1 + RESERVATION_TTL_MS,
+      },
+    ]);
   });
 
   it("rolls the window to a fresh, zeroed one at the next Monday", async () => {

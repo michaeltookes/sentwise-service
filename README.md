@@ -34,12 +34,12 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
   telemetry is error _types_ (e.g. `rate_limited`) and **aggregate, hashed** usage metrics, never
   content. This is enforced in CI by `scripts/check-no-body-logging.sh`, which fails the build if any
   `console.*` call appears in `src/`.
-- **The only persisted state is counters, timestamps, random settlement IDs, and one hash — never
+- **The only persisted state is counters, timestamps, random reservation IDs, and one hash — never
   content:**
   1. `trialStartedAt` in the user's Clerk `privateMetadata` (trial enforcement, 56a).
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
      weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
-     settlement IDs keyed by Clerk userId. No prompts, no drafts, no emails.
+     reservation IDs keyed by Clerk userId. No prompts, no drafts, no emails.
   3. **Aggregate, hashed usage metrics** in Workers Analytics Engine (56b): a SHA-256 hash of the
      userId (never the raw id), the model, token counts, estimated cost, latency, and outcome.
 - **Cloudflare invocation logs are disabled** (`observability.logs.invocation_logs: false` in
@@ -149,7 +149,8 @@ limit for the current window).
 **Per-request pipeline** (`POST /v1/draft`): authenticate → trial → parse → **rate-limit** →
 **token safety cap** → **atomic weekly quota reservation** → forward to Anthropic → settle usage →
 respond. If Anthropic fails after reservation, the reserved draft is released; if settlement fails
-after Anthropic succeeds, the completed draft is still returned.
+after Anthropic succeeds, the completed draft is still returned. Abandoned reservations expire after
+15 minutes so leaked capacity is reclaimed before the weekly reset.
 
 **Enforcement modes** (`ENFORCEMENT_MODE`):
 

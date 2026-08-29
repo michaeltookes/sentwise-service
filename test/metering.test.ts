@@ -10,6 +10,8 @@ import {
   parseEnforcement,
   parseQuotaOverride,
   pruneStamps,
+  pruneExpiredReservations,
+  RESERVATION_TTL_MS,
   reservedTokens,
   resolveLimits,
   rollWindow,
@@ -62,6 +64,7 @@ describe("window rollover", () => {
     expect(w.draftsUsed).toBe(0);
     expect(w.tokensUsed).toBe(0);
     expect(w.tokensReserved).toBe(0);
+    expect(w.activeReservations).toEqual([]);
     expect(w.settledReservationIds).toEqual([]);
   });
   it("keeps an existing window before reset", () => {
@@ -71,9 +74,10 @@ describe("window rollover", () => {
       draftsUsed: 4,
       tokensUsed: 9,
       tokensReserved: 0,
+      activeReservations: [],
       settledReservationIds: [],
     };
-    expect(rollWindow(w, MON + 3 * 24 * 60 * 60 * 1000)).toBe(w); // mid-week: unchanged
+    expect(rollWindow(w, MON + 3 * 24 * 60 * 60 * 1000)).toEqual(w); // mid-week: unchanged
   });
   it("rolls to a fresh zeroed window at exactly the reset instant", () => {
     const w: WindowState = {
@@ -87,11 +91,32 @@ describe("window rollover", () => {
     expect(rolled.draftsUsed).toBe(0);
     expect(rolled.tokensUsed).toBe(0);
     expect(rolled.tokensReserved).toBe(0);
+    expect(rolled.activeReservations).toEqual([]);
     expect(rolled.settledReservationIds).toEqual([]);
   });
   it("creates a window from null/undefined", () => {
     expect(rollWindow(null, MON).windowStart).toBe(MON);
     expect(rollWindow(undefined, MON).windowStart).toBe(MON);
+  });
+  it("expires abandoned reservations inside the current window", () => {
+    const state: WindowState = {
+      windowStart: MON,
+      resetsAt: MON + WEEK_MS,
+      draftsUsed: 3,
+      tokensUsed: 10,
+      tokensReserved: 300,
+      activeReservations: [
+        { id: "expired", estimatedTokens: 100, expiresAt: MON + RESERVATION_TTL_MS },
+        { id: "active", estimatedTokens: 200, expiresAt: MON + RESERVATION_TTL_MS + 10_000 },
+      ],
+      settledReservationIds: [],
+    };
+    const pruned = pruneExpiredReservations(state, MON + RESERVATION_TTL_MS + 1);
+    expect(pruned.draftsUsed).toBe(2);
+    expect(pruned.tokensReserved).toBe(200);
+    expect(pruned.activeReservations).toEqual([
+      { id: "active", estimatedTokens: 200, expiresAt: MON + RESERVATION_TTL_MS + 10_000 },
+    ]);
   });
 });
 
@@ -292,6 +317,7 @@ describe("reservation quota helpers", () => {
       draftsUsed: 1,
       tokensUsed: 30,
       tokensReserved: 60,
+      activeReservations: [{ id: "r1", estimatedTokens: 60, expiresAt: WEEK_MS }],
     };
     expect(reservedTokens(state)).toBe(60);
     expect(wouldExceedQuota(state, limits, 1, 11)).toBe(true);

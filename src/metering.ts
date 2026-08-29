@@ -2,7 +2,7 @@
 // trivially unit-testable — no storage, no network, no Clerk. The Durable Object
 // (src/quota-do.ts) and the request handler (src/index.ts) call into these.
 //
-// PRIVACY: this module handles only counters, timestamps, random settlement IDs,
+// PRIVACY: this module handles only counters, timestamps, random reservation IDs,
 // and limits. It never sees prompt or draft content.
 
 import {
@@ -19,6 +19,14 @@ import {
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const WEEK_MS = 7 * DAY_MS;
 export const RATE_WINDOW_MS = 60_000;
+export const RESERVATION_TTL_MS = 15 * 60_000;
+export const MAX_SETTLED_RESERVATION_IDS = 128;
+
+export interface ReservationRecord {
+  id: string;
+  estimatedTokens: number;
+  expiresAt: number;
+}
 
 /** Per-account weekly window state. Stored in the Durable Object. No content. */
 export interface WindowState {
@@ -27,7 +35,8 @@ export interface WindowState {
   draftsUsed: number;
   tokensUsed: number;
   tokensReserved?: number; // in-flight estimated tokens reserved until settlement/release
-  settledReservationIds?: string[]; // random UUIDs used only to dedupe settlement retries
+  activeReservations?: ReservationRecord[];
+  settledReservationIds?: string[]; // bounded random UUIDs used only to dedupe settlement retries
 }
 
 /** Per-account overrides read from Clerk `privateMetadata.quota` (56c writes these). */
@@ -145,6 +154,7 @@ export function freshWindow(now: number): WindowState {
     draftsUsed: 0,
     tokensUsed: 0,
     tokensReserved: 0,
+    activeReservations: [],
     settledReservationIds: [],
   };
 }
@@ -152,14 +162,7 @@ export function freshWindow(now: number): WindowState {
 /** Return the current window, rolling to a fresh one if `now` is at/after reset. */
 export function rollWindow(state: WindowState | undefined | null, now: number): WindowState {
   if (!state || now >= state.resetsAt) return freshWindow(now);
-  if (state.tokensReserved === undefined || state.settledReservationIds === undefined) {
-    return {
-      ...state,
-      tokensReserved: state.tokensReserved ?? 0,
-      settledReservationIds: state.settledReservationIds ?? [],
-    };
-  }
-  return state;
+  return pruneExpiredReservations(normalizeWindow(state), now);
 }
 
 /** Drop rate-limit timestamps older than the sliding window. */
@@ -201,6 +204,22 @@ export function reservedTokens(state: WindowState): number {
   return state.tokensReserved ?? 0;
 }
 
+export function activeReservations(state: WindowState): ReservationRecord[] {
+  return state.activeReservations ?? [];
+}
+
+export function pruneExpiredReservations(state: WindowState, now: number): WindowState {
+  const active = activeReservations(state);
+  const kept = active.filter((r) => r.expiresAt > now);
+  if (kept.length === active.length) return state;
+  return {
+    ...state,
+    draftsUsed: Math.max(0, state.draftsUsed - (active.length - kept.length)),
+    tokensReserved: kept.reduce((sum, r) => sum + r.estimatedTokens, 0),
+    activeReservations: kept,
+  };
+}
+
 export function wouldExceedQuota(
   state: WindowState,
   limits: ResolvedLimits,
@@ -211,6 +230,16 @@ export function wouldExceedQuota(
     state.draftsUsed + draftDelta > limits.weeklyDraftLimit ||
     state.tokensUsed + reservedTokens(state) + tokensReservedDelta > limits.weeklyTokenLimit
   );
+}
+
+function normalizeWindow(state: WindowState): WindowState {
+  const active = state.activeReservations ?? [];
+  return {
+    ...state,
+    tokensReserved: active.reduce((sum, r) => sum + r.estimatedTokens, 0),
+    activeReservations: active,
+    settledReservationIds: state.settledReservationIds ?? [],
+  };
 }
 
 /** Estimated USD cost of one draft, from the model's cost-table row. */
