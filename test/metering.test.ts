@@ -123,9 +123,12 @@ describe("numFrom / parseEnforcement", () => {
 
 describe("parseQuotaOverride", () => {
   it("reads valid numeric overrides and ignores junk", () => {
-    expect(parseQuotaOverride({ weeklyDraftLimit: 250, extraDrafts: 10 })).toEqual({
+    expect(
+      parseQuotaOverride({ weeklyDraftLimit: 250, extraDrafts: 10, extraDraftsWindowStart: MON }),
+    ).toEqual({
       weeklyDraftLimit: 250,
       extraDrafts: 10,
+      extraDraftsWindowStart: MON,
     });
     expect(parseQuotaOverride({ weeklyTokenLimit: 5_000_000 })).toEqual({
       weeklyTokenLimit: 5_000_000,
@@ -134,7 +137,9 @@ describe("parseQuotaOverride", () => {
   it("returns {} for non-objects and negative/invalid values", () => {
     expect(parseQuotaOverride(null)).toEqual({});
     expect(parseQuotaOverride("nope")).toEqual({});
-    expect(parseQuotaOverride({ weeklyDraftLimit: -1, extraDrafts: "5" })).toEqual({});
+    expect(
+      parseQuotaOverride({ weeklyDraftLimit: -1, extraDrafts: "5", extraDraftsWindowStart: -1 }),
+    ).toEqual({});
   });
 });
 
@@ -166,15 +171,36 @@ describe("resolveLimits", () => {
     expect(l.rateLimitPerMin).toBe(DEFAULT_RATE_LIMIT_PER_MIN);
     expect(l.maxTokensPerRequest).toBe(DEFAULT_MAX_TOKENS_PER_REQUEST);
   });
-  it("adds purchased extras to the draft limit and exposes extraPurchased", () => {
-    const l = resolveLimits({ WEEKLY_DRAFT_LIMIT: "100" }, { extraDrafts: 25 });
+  it("adds purchased extras only for their matching weekly window", () => {
+    const l = resolveLimits(
+      { WEEKLY_DRAFT_LIMIT: "100" },
+      { extraDrafts: 25, extraDraftsWindowStart: MON },
+      MON,
+    );
     expect(l.weeklyDraftLimit).toBe(125);
     expect(l.extraPurchased).toBe(25);
+  });
+  it("ignores purchased extras without a matching weekly window", () => {
+    expect(resolveLimits({ WEEKLY_DRAFT_LIMIT: "100" }, { extraDrafts: 25 }, MON)).toMatchObject({
+      weeklyDraftLimit: 100,
+      extraPurchased: 0,
+    });
+    expect(
+      resolveLimits(
+        { WEEKLY_DRAFT_LIMIT: "100" },
+        { extraDrafts: 25, extraDraftsWindowStart: MON },
+        MON + WEEK_MS,
+      ),
+    ).toMatchObject({
+      weeklyDraftLimit: 100,
+      extraPurchased: 0,
+    });
   });
   it("per-account weeklyDraftLimit override replaces the base, then extras add", () => {
     const l = resolveLimits(
       { WEEKLY_DRAFT_LIMIT: "100" },
-      { weeklyDraftLimit: 500, extraDrafts: 10 },
+      { weeklyDraftLimit: 500, extraDrafts: 10, extraDraftsWindowStart: MON },
+      MON,
     );
     expect(l.weeklyDraftLimit).toBe(510);
   });

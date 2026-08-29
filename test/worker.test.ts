@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { env as testEnv } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { TRIAL_MS } from "../src/config";
+import { mondayStartUtc, WEEK_MS, type WindowState } from "../src/metering";
 
 // Mock @clerk/backend so JWT verification and user lookups are controllable.
 const mocks = vi.hoisted(() => ({
@@ -51,6 +52,64 @@ function userWith(privateMetadata: Record<string, unknown>) {
     primaryEmailAddressId: "ema_1",
     emailAddresses: [{ id: "ema_1", emailAddress: "marcus@example.com" }],
     privateMetadata,
+  };
+}
+
+function internalUrl(input: RequestInfo | URL): URL {
+  if (typeof input === "string" || input instanceof URL) return new URL(input);
+  return new URL(input.url);
+}
+
+function internalBody(init: RequestInit | undefined): { reservationWindowStart?: number } {
+  if (typeof init?.body !== "string") return {};
+  return JSON.parse(init.body) as { reservationWindowStart?: number };
+}
+
+function quotaNamespaceWithSettleFailure(now: number): {
+  namespace: DurableObjectNamespace;
+  settleCalls: () => number;
+} {
+  const windowStart = mondayStartUtc(now);
+  let window: WindowState = {
+    windowStart,
+    resetsAt: windowStart + WEEK_MS,
+    draftsUsed: 0,
+    tokensUsed: 0,
+  };
+  let settleCalls = 0;
+  const stub = {
+    fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = internalUrl(input).pathname;
+      const body = internalBody(init);
+      if (path === "/check") {
+        return Promise.resolve(Response.json({ allowed: true, retryAfterSeconds: 0, window }));
+      }
+      if (path === "/reserve") {
+        window = { ...window, draftsUsed: window.draftsUsed + 1 };
+        return Promise.resolve(Response.json({ reserved: true, blockedByQuota: false, window }));
+      }
+      if (path === "/settle") {
+        settleCalls += 1;
+        return Promise.reject(new Error("settle failed"));
+      }
+      if (path === "/release") {
+        if (body.reservationWindowStart === window.windowStart) {
+          window = { ...window, draftsUsed: Math.max(0, window.draftsUsed - 1) };
+        }
+        return Promise.resolve(Response.json({ window }));
+      }
+      if (path === "/peek") {
+        return Promise.resolve(Response.json({ window }));
+      }
+      return Promise.resolve(new Response("not found", { status: 404 }));
+    }),
+  };
+  return {
+    namespace: {
+      idFromName: vi.fn(() => ({}) as DurableObjectId),
+      get: vi.fn(() => stub as unknown as DurableObjectStub),
+    } as unknown as DurableObjectNamespace,
+    settleCalls: () => settleCalls,
   };
 }
 
@@ -255,6 +314,20 @@ describe("routing", () => {
     const res = await worker.fetch(req("/v1/draft", { method: "GET" }), env);
     expect(res.status).toBe(405);
   });
+  it("keeps /admin/margin invisible for wrong methods when ADMIN_TOKEN is unset", async () => {
+    const res = await worker.fetch(req("/admin/margin", { method: "POST" }), {
+      ...env,
+      ADMIN_TOKEN: undefined,
+    });
+    expect(res.status).toBe(404);
+  });
+  it("405s /admin/margin wrong methods only when ADMIN_TOKEN is configured", async () => {
+    const res = await worker.fetch(req("/admin/margin", { method: "POST" }), {
+      ...env,
+      ADMIN_TOKEN: "correct-token",
+    });
+    expect(res.status).toBe(405);
+  });
   it("404s an unknown path", async () => {
     const res = await worker.fetch(req("/nope"), env);
     expect(res.status).toBe(404);
@@ -306,7 +379,7 @@ describe("56b draft metering", () => {
     mocks.getUser.mockResolvedValue(
       userWith({
         trialStartedAt: new Date(Date.now() - 1000).toISOString(),
-        quota: { extraDrafts: 5 },
+        quota: { extraDrafts: 5, extraDraftsWindowStart: mondayStartUtc(Date.now()) },
       }),
     );
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
@@ -316,6 +389,22 @@ describe("56b draft metering", () => {
     expect(q.limit).toBe(105);
     expect(q.extraPurchased).toBe(5);
     expect(q.remaining).toBe(104);
+  });
+
+  it("ignores stale purchased extras from a previous weekly window", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-extra-stale" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        quota: { extraDrafts: 5, extraDraftsWindowStart: mondayStartUtc(Date.now()) - WEEK_MS },
+      }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    const res = await worker.fetch(draftReq("u-extra-stale"), env);
+    const q = ((await res.json()) as any).quota;
+    expect(q.limit).toBe(100);
+    expect(q.extraPurchased).toBe(0);
   });
 
   it("rate limits with a 429 + Retry-After once the per-minute cap is hit", async () => {
@@ -350,6 +439,42 @@ describe("56b draft metering", () => {
     expect(res.status).toBe(413);
     expect(((await res.json()) as any).error.type).toBe("request_too_large");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("releases a reserved draft when Anthropic fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-upstream-fail-release" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ error: { type: "overloaded_error" } }), { status: 529 }),
+        ),
+    );
+
+    const failed = await worker.fetch(draftReq("u-upstream-fail-release"), env);
+    expect(failed.status).toBe(503);
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const q = ((await me.json()) as any).quota;
+    expect(q.used).toBe(0);
+  });
+
+  it("preserves a completed draft response when quota settlement fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-settle-fail" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const quota = quotaNamespaceWithSettleFailure(Date.now());
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const res = await worker.fetch(draftReq("u-settle-fail"), flakyQuotaEnv);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.text).toBe("ok");
+    expect(body.quota.used).toBe(1);
+    expect(body.quota.tokensUsed).toBe(5);
+    expect(quota.settleCalls()).toBe(2);
   });
 
   it("hard enforcement blocks an over-quota draft with 429 quota_exceeded", async () => {

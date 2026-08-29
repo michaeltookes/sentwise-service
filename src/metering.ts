@@ -32,7 +32,8 @@ export interface WindowState {
 export interface QuotaOverride {
   weeklyDraftLimit?: number;
   weeklyTokenLimit?: number;
-  extraDrafts?: number; // purchased overage added to the draft limit for this window
+  extraDrafts?: number; // purchased overage added only when extraDraftsWindowStart matches
+  extraDraftsWindowStart?: number; // ms epoch of the Monday window this purchase belongs to
 }
 
 /** Resolved effective limits for one request (env defaults + per-account overrides). */
@@ -97,12 +98,20 @@ export function parseQuotaOverride(raw: unknown): QuotaOverride {
   if (typeof r.extraDrafts === "number" && r.extraDrafts >= 0) {
     out.extraDrafts = Math.floor(r.extraDrafts);
   }
+  if (typeof r.extraDraftsWindowStart === "number" && r.extraDraftsWindowStart >= 0) {
+    out.extraDraftsWindowStart = Math.floor(r.extraDraftsWindowStart);
+  }
   return out;
 }
 
 /** Combine env defaults with per-account overrides into the effective limits. */
-export function resolveLimits(env: LimitEnv, override: QuotaOverride): ResolvedLimits {
-  const extraPurchased = override.extraDrafts ?? 0;
+export function resolveLimits(
+  env: LimitEnv,
+  override: QuotaOverride,
+  windowStart?: number,
+): ResolvedLimits {
+  const extraPurchased =
+    override.extraDraftsWindowStart === windowStart ? (override.extraDrafts ?? 0) : 0;
   const baseDraftLimit =
     override.weeklyDraftLimit ?? numFrom(env.WEEKLY_DRAFT_LIMIT, DEFAULT_WEEKLY_DRAFT_LIMIT);
   return {

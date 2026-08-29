@@ -146,7 +146,9 @@ lazy reset (the next request at/after `resetsAt` starts a fresh, zeroed window).
 limit for the current window).
 
 **Per-request pipeline** (`POST /v1/draft`): authenticate → trial → parse → **rate-limit** →
-**token safety cap** → **weekly quota** → forward to Anthropic → settle usage → respond.
+**token safety cap** → **atomic weekly quota reservation** → forward to Anthropic → settle usage →
+respond. If Anthropic fails after reservation, the reserved draft is released; if settlement fails
+after Anthropic succeeds, the completed draft is still returned.
 
 **Enforcement modes** (`ENFORCEMENT_MODE`):
 
@@ -173,9 +175,10 @@ limit for the current window).
 | `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).       |
 
 **Per-account overrides.** `privateMetadata.quota` on the Clerk user —
-`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts? }` — overrides the vars for that account.
-`extraDrafts` is added to the weekly draft limit for the current window (56c writes purchased extras
-here). These are read on the same `getUser` as the trial, so metering adds no extra Clerk round-trip.
+`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart? }` — overrides the
+vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart` equals the current
+weekly window's Monday 00:00 UTC epoch-ms `windowStart`; stale or unscoped credits are ignored. These
+are read on the same `getUser` as the trial, so metering adds no extra Clerk round-trip.
 
 **Privacy.** The Durable Object stores only integers and timestamps; it never sees prompt or draft
 content. See the [Privacy design](#privacy-design--content-stateless-by-construction) section.

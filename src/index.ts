@@ -2,8 +2,14 @@ import { authenticate, requireActiveTrial, resolveAccount } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
 import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, type Env } from "./config";
-import { buildQuota, estimateRequestTokens, isOverQuota, resolveLimits } from "./metering";
-import { quotaCheck, quotaPeek, quotaSettle } from "./quota-client";
+import {
+  buildQuota,
+  estimateRequestTokens,
+  mondayStartUtc,
+  resolveLimits,
+  type WindowState,
+} from "./metering";
+import { quotaCheck, quotaPeek, quotaRelease, quotaReserve, quotaSettle } from "./quota-client";
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
 
@@ -40,8 +46,8 @@ export default {
       if (pathname === "/v1/me" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
         const account = await resolveAccount(userId, env, { initialize: false });
-        const limits = resolveLimits(env, account.quotaOverride);
         const { window } = await quotaPeek(env, userId, { now: Date.now() });
+        const limits = resolveLimits(env, account.quotaOverride, window.windowStart);
         // quotaOverride is internal — build the response explicitly, never spread it.
         return Response.json({
           userId: account.userId,
@@ -62,12 +68,13 @@ export default {
           throw new ApiError(400, "invalid_request", "Request body must be valid JSON.");
         }
         const draft = parseDraftRequest(body);
-        const limits = resolveLimits(env, account.quotaOverride);
         const model = draft.model ?? DEFAULT_MODEL;
+        const now = Date.now();
+        const limits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
 
         // 1) Rate limit + read the current window (records this request's timestamp).
         const check = await quotaCheck(env, userId, {
-          now: Date.now(),
+          now,
           rateLimitPerMin: limits.rateLimitPerMin,
         });
         if (!check.allowed) {
@@ -90,12 +97,17 @@ export default {
           throw new ApiError(413, "request_too_large", "The request is too large to draft.");
         }
 
-        // 3) Weekly quota. Hard mode blocks; soft mode meters and continues.
-        if (isOverQuota(check.window, limits) && limits.enforcement === "hard") {
-          const resetsAt = buildQuota(check.window, limits).resetsAt;
+        // 3) Weekly quota admission + draft reservation. Hard mode blocks atomically;
+        // soft mode reserves and continues so successful drafts are metered once.
+        const reservation = await quotaReserve(env, userId, { now, limits });
+        if (!reservation.reserved && reservation.blockedByQuota) {
+          const resetsAt = buildQuota(reservation.window, limits).resetsAt;
           throw new ApiError(429, "quota_exceeded", "You've used your weekly allowance.", {
             resetsAt,
           });
+        }
+        if (!reservation.reserved) {
+          throw new Error("quota_reservation_failed");
         }
 
         // 4) Forward to Anthropic, recording an aggregate metric either way.
@@ -105,6 +117,10 @@ export default {
           result = await forwardToAnthropic(draft, env);
         } catch (err) {
           const outcome = err instanceof ApiError ? err.type : "internal_error";
+          await quotaRelease(env, userId, {
+            now: Date.now(),
+            reservationWindowStart: reservation.window.windowStart,
+          }).catch(() => undefined);
           await recordUsage(env, {
             userId,
             model,
@@ -117,12 +133,9 @@ export default {
         }
         const latencyMs = Date.now() - t0;
 
-        // 5) Settle real usage into the window, then report the updated quota.
-        const { window } = await quotaSettle(env, userId, {
-          now: Date.now(),
-          draftsDelta: 1,
-          tokensDelta: result.usage.inputTokens + result.usage.outputTokens,
-        });
+        // 5) Settle real usage into the reserved window, then report the updated quota.
+        const tokensDelta = result.usage.inputTokens + result.usage.outputTokens;
+        const window = await settleReservedUsage(env, userId, reservation.window, tokensDelta);
         await recordUsage(env, {
           userId,
           model,
@@ -140,7 +153,7 @@ export default {
         pathname === "/v1/draft" ||
         pathname === "/v1/me" ||
         pathname === "/healthz" ||
-        pathname === "/admin/margin"
+        (pathname === "/admin/margin" && !!env.ADMIN_TOKEN)
       ) {
         return jsonError(405, "method_not_allowed", "Method not allowed.");
       }
@@ -154,3 +167,25 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+async function settleReservedUsage(
+  env: Env,
+  userId: string,
+  reservedWindow: WindowState,
+  tokensDelta: number,
+): Promise<WindowState> {
+  const body = {
+    now: Date.now(),
+    reservationWindowStart: reservedWindow.windowStart,
+    tokensDelta,
+  };
+  try {
+    return (await quotaSettle(env, userId, body)).window;
+  } catch {
+    try {
+      return (await quotaSettle(env, userId, { ...body, now: Date.now() })).window;
+    } catch {
+      return { ...reservedWindow, tokensUsed: reservedWindow.tokensUsed + tokensDelta };
+    }
+  }
+}

@@ -2,7 +2,7 @@
 // Object (56b). Keeps the DO-plumbing out of src/index.ts.
 
 import type { Env } from "./config";
-import type { WindowState } from "./metering";
+import type { ResolvedLimits, WindowState } from "./metering";
 
 export interface CheckResult {
   allowed: boolean;
@@ -10,6 +10,11 @@ export interface CheckResult {
   window: WindowState;
 }
 export interface WindowResult {
+  window: WindowState;
+}
+export interface ReserveResult {
+  reserved: boolean;
+  blockedByQuota: boolean;
   window: WindowState;
 }
 
@@ -33,13 +38,36 @@ export function quotaCheck(
   return call<CheckResult>(env, userId, "/check", body);
 }
 
-/** Increment usage after a successful draft; returns the updated window. */
+/** Atomically admit a draft against the weekly quota and reserve one draft slot. */
+export function quotaReserve(
+  env: Env,
+  userId: string,
+  body: { now: number; limits: ResolvedLimits },
+): Promise<ReserveResult> {
+  return call<ReserveResult>(env, userId, "/reserve", body);
+}
+
+/** Settle token usage after a successful reserved draft; returns the updated window. */
 export function quotaSettle(
   env: Env,
   userId: string,
-  body: { now: number; draftsDelta: number; tokensDelta: number },
+  body: {
+    now: number;
+    reservationWindowStart?: number;
+    draftsDelta?: number;
+    tokensDelta: number;
+  },
 ): Promise<WindowResult> {
   return call<WindowResult>(env, userId, "/settle", body);
+}
+
+/** Roll back a reserved draft slot after an upstream failure. */
+export function quotaRelease(
+  env: Env,
+  userId: string,
+  body: { now: number; reservationWindowStart: number },
+): Promise<WindowResult> {
+  return call<WindowResult>(env, userId, "/release", body);
 }
 
 /** Read (and roll) the window without rate-limiting or incrementing — for /v1/me. */

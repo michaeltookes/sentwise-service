@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
-import { WEEK_MS, type WindowState } from "../src/metering";
+import { WEEK_MS, type ResolvedLimits, type WindowState } from "../src/metering";
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 
@@ -12,6 +12,20 @@ interface CheckResult {
 interface WindowResult {
   window: WindowState;
 }
+interface ReserveResult {
+  reserved: boolean;
+  blockedByQuota: boolean;
+  window: WindowState;
+}
+
+const hardLimits: ResolvedLimits = {
+  weeklyDraftLimit: 1,
+  weeklyTokenLimit: 2_000_000,
+  rateLimitPerMin: 10,
+  maxTokensPerRequest: 55_000,
+  enforcement: "hard",
+  extraPurchased: 0,
+};
 
 async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> {
   const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(userId));
@@ -48,6 +62,50 @@ describe("AccountQuota Durable Object", () => {
     });
     expect(b.window.draftsUsed).toBe(2);
     expect(b.window.tokensUsed).toBe(750);
+  });
+
+  it("reserve atomically admits one hard-quota draft and blocks the next", async () => {
+    const first = await callDO<ReserveResult>("do-reserve-hard", "/reserve", {
+      now: MON,
+      limits: hardLimits,
+    });
+    expect(first.reserved).toBe(true);
+    expect(first.blockedByQuota).toBe(false);
+    expect(first.window.draftsUsed).toBe(1);
+
+    const second = await callDO<ReserveResult>("do-reserve-hard", "/reserve", {
+      now: MON + 1,
+      limits: hardLimits,
+    });
+    expect(second.reserved).toBe(false);
+    expect(second.blockedByQuota).toBe(true);
+    expect(second.window.draftsUsed).toBe(1);
+  });
+
+  it("release rolls back only the reserved draft in the same window", async () => {
+    const reserved = await callDO<ReserveResult>("do-release", "/reserve", {
+      now: MON,
+      limits: hardLimits,
+    });
+    const released = await callDO<WindowResult>("do-release", "/release", {
+      now: MON + 1,
+      reservationWindowStart: reserved.window.windowStart,
+    });
+    expect(released.window.draftsUsed).toBe(0);
+  });
+
+  it("settle applies token usage to the reserved window without adding another draft", async () => {
+    const reserved = await callDO<ReserveResult>("do-settle-reserved", "/reserve", {
+      now: MON,
+      limits: hardLimits,
+    });
+    const settled = await callDO<WindowResult>("do-settle-reserved", "/settle", {
+      now: MON + 1000,
+      reservationWindowStart: reserved.window.windowStart,
+      tokensDelta: 500,
+    });
+    expect(settled.window.draftsUsed).toBe(1);
+    expect(settled.window.tokensUsed).toBe(500);
   });
 
   it("rolls the window to a fresh, zeroed one at the next Monday", async () => {
