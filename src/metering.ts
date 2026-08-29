@@ -70,7 +70,7 @@ export interface LimitEnv {
 /** Coerce a wrangler var (string or number) to a finite number, else fall back. */
 export function numFrom(v: string | number | undefined, fallback: number): number {
   if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
+  if (typeof v === "string" && v.trim() !== "") {
     const n = Number(v);
     if (Number.isFinite(n)) return n;
   }

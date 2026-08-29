@@ -110,6 +110,8 @@ describe("numFrom / parseEnforcement", () => {
     expect(numFrom(7, 1)).toBe(7);
     expect(numFrom(undefined, 5)).toBe(5);
     expect(numFrom("nope", 5)).toBe(5);
+    expect(numFrom("", 5)).toBe(5); // empty var must fall back, not become 0
+    expect(numFrom("  ", 5)).toBe(5);
   });
   it("parses enforcement mode with a soft default", () => {
     expect(parseEnforcement("hard")).toBe("hard");
