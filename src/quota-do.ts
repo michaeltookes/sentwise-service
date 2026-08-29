@@ -7,6 +7,7 @@
 //   "window" -> WindowState  (weekly usage, in-flight token reservations, reset timestamps)
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
+//   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
 //   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
@@ -67,11 +68,21 @@ interface PendingSettlement {
   createdAt: number;
   nextAttemptAt: number;
 }
+interface SettledSettlementMarker {
+  settledAt: number;
+}
+interface StorageReader {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+}
 
 const LEGACY_PENDING_SETTLEMENTS_KEY = "pending_settlements";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
+const SETTLED_SETTLEMENT_KEY_PREFIX = "settled_settlement:";
+const SETTLED_MARKER_PRUNE_AT_KEY = "settled_settlement_prune_at";
 const SETTLEMENT_RETRY_BASE_DELAY_MS = 60_000;
 const SETTLEMENT_RETRY_MAX_DELAY_MS = 15 * 60_000;
+const SETTLEMENT_MARKER_RETENTION_MS = RESERVATION_TTL_MS + SETTLEMENT_RETRY_MAX_DELAY_MS;
+const SETTLEMENT_MARKER_PRUNE_INTERVAL_MS = SETTLEMENT_RETRY_MAX_DELAY_MS;
 
 export class AccountQuota {
   private readonly storage: DurableObjectStorage;
@@ -167,6 +178,7 @@ export class AccountQuota {
 
   private async handleSettle(body: SettleBody): Promise<Response> {
     const window = await this.applySettlement(body);
+    await this.maybePruneSettledSettlementMarkers(body.now).catch(() => undefined);
     return Response.json({ window });
   }
 
@@ -187,31 +199,41 @@ export class AccountQuota {
   }
 
   private async applySettlement(body: SettleBody): Promise<WindowState> {
-    const { window, appliesToStoredReservation } = await this.loadMutationWindow(
-      body.now,
-      body.reservationWindowStart,
-    );
-    if (appliesToStoredReservation) {
-      const settledIds = window.settledReservationIds ?? [];
-      if (!body.reservationId || !settledIds.includes(body.reservationId)) {
-        const active = activeReservations(window);
-        const reservation = active.find((r) => r.id === body.reservationId);
-        const estimatedTokens =
-          reservation?.estimatedTokens ?? nonNegativeInt(body.estimatedTokens);
-        const draftsDelta = body.draftsDelta ?? (body.reservationId && !reservation ? 1 : 0);
-        window.draftsUsed = Math.max(0, window.draftsUsed + draftsDelta);
-        window.tokensReserved = Math.max(0, reservedTokens(window) - estimatedTokens);
-        window.tokensUsed = Math.max(0, window.tokensUsed + body.tokensDelta);
-        if (body.reservationId) {
-          window.activeReservations = active.filter((r) => r.id !== body.reservationId);
-        }
-        if (body.reservationId) {
-          window.settledReservationIds = appendSettledReservationId(settledIds, body.reservationId);
+    return this.storage.transaction(async (txn) => {
+      const { window, appliesToStoredReservation } = await this.loadMutationWindowFrom(
+        txn,
+        body.now,
+        body.reservationWindowStart,
+      );
+      if (appliesToStoredReservation) {
+        const settledIds = window.settledReservationIds ?? [];
+        const reservationId = normalizedId(body.reservationId);
+        const marker = reservationId
+          ? await txn.get<SettledSettlementMarker>(settledSettlementKey(reservationId))
+          : undefined;
+        const alreadySettled =
+          reservationId !== undefined &&
+          (settledIds.includes(reservationId) || isSettledSettlementMarker(marker));
+
+        if (!alreadySettled) {
+          const active = activeReservations(window);
+          const reservation = active.find((r) => r.id === reservationId);
+          const estimatedTokens =
+            reservation?.estimatedTokens ?? nonNegativeInt(body.estimatedTokens);
+          const draftsDelta = body.draftsDelta ?? (reservationId && !reservation ? 1 : 0);
+          window.draftsUsed = Math.max(0, window.draftsUsed + draftsDelta);
+          window.tokensReserved = Math.max(0, reservedTokens(window) - estimatedTokens);
+          window.tokensUsed = Math.max(0, window.tokensUsed + body.tokensDelta);
+          if (reservationId) {
+            window.activeReservations = active.filter((r) => r.id !== reservationId);
+            window.settledReservationIds = appendSettledReservationId(settledIds, reservationId);
+            await txn.put(settledSettlementKey(reservationId), { settledAt: body.now });
+          }
         }
       }
-    }
-    await this.storage.put("window", window);
-    return window;
+      await txn.put("window", window);
+      return window;
+    });
   }
 
   private async handleRelease(body: ReleaseBody): Promise<Response> {
@@ -246,7 +268,15 @@ export class AccountQuota {
     now: number,
     reservationWindowStart: number | undefined,
   ): Promise<{ window: WindowState; appliesToStoredReservation: boolean }> {
-    const stored = await this.storage.get<WindowState>("window");
+    return this.loadMutationWindowFrom(this.storage, now, reservationWindowStart);
+  }
+
+  private async loadMutationWindowFrom(
+    storage: StorageReader,
+    now: number,
+    reservationWindowStart: number | undefined,
+  ): Promise<{ window: WindowState; appliesToStoredReservation: boolean }> {
+    const stored = await storage.get<WindowState>("window");
     if (reservationWindowStart === undefined) {
       return { window: rollWindow(stored, now), appliesToStoredReservation: true };
     }
@@ -326,7 +356,6 @@ export class AccountQuota {
           estimatedTokens: item.estimatedTokens,
           tokensDelta: item.tokensDelta,
         });
-        await this.storage.delete(pendingSettlementKey(item.reservationId));
       } catch {
         const attempts = item.attempts + 1;
         await this.storage.put(pendingSettlementKey(item.reservationId), {
@@ -334,15 +363,50 @@ export class AccountQuota {
           attempts,
           nextAttemptAt: now + settlementRetryDelayMs(attempts),
         });
+        continue;
       }
+
+      await this.storage.delete(pendingSettlementKey(item.reservationId)).catch(() => undefined);
     }
 
+    await this.maybePruneSettledSettlementMarkers(now).catch(() => undefined);
     await this.schedulePendingSettlementAlarm();
+  }
+
+  private async maybePruneSettledSettlementMarkers(now: number): Promise<void> {
+    const nextPruneAt = await this.storage.get<number>(SETTLED_MARKER_PRUNE_AT_KEY);
+    if (typeof nextPruneAt === "number" && nextPruneAt > now) return;
+
+    const pendingIds = new Set(
+      (await this.loadPendingSettlements()).map((item) => item.reservationId),
+    );
+    const markers = await this.storage.list<SettledSettlementMarker>({
+      prefix: SETTLED_SETTLEMENT_KEY_PREFIX,
+    });
+    const expiredKeys: string[] = [];
+    for (const [key, marker] of markers) {
+      const reservationId = key.slice(SETTLED_SETTLEMENT_KEY_PREFIX.length);
+      if (
+        (!isSettledSettlementMarker(marker) ||
+          marker.settledAt + SETTLEMENT_MARKER_RETENTION_MS <= now) &&
+        !pendingIds.has(reservationId)
+      ) {
+        expiredKeys.push(key);
+      }
+    }
+    if (expiredKeys.length > 0) {
+      await this.storage.delete(expiredKeys);
+    }
+    await this.storage.put(SETTLED_MARKER_PRUNE_AT_KEY, now + SETTLEMENT_MARKER_PRUNE_INTERVAL_MS);
   }
 }
 
 function nonNegativeInt(v: number | undefined): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+}
+
+function normalizedId(v: string | undefined): string | undefined {
+  return typeof v === "string" && v !== "" ? v : undefined;
 }
 
 function appendSettledReservationId(ids: string[], id: string): string[] {
@@ -365,6 +429,16 @@ function isPendingSettlement(v: unknown): v is PendingSettlement {
 
 function pendingSettlementKey(reservationId: string): string {
   return `${PENDING_SETTLEMENT_KEY_PREFIX}${reservationId}`;
+}
+
+function settledSettlementKey(reservationId: string): string {
+  return `${SETTLED_SETTLEMENT_KEY_PREFIX}${reservationId}`;
+}
+
+function isSettledSettlementMarker(v: unknown): v is SettledSettlementMarker {
+  if (typeof v !== "object" || v === null) return false;
+  const marker = v as Record<string, unknown>;
+  return typeof marker.settledAt === "number";
 }
 
 function settlementRetryDelayMs(attempts: number): number {

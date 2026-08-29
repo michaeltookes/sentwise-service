@@ -330,6 +330,16 @@ describe("AccountQuota Durable Object", () => {
     }
     expect(last.window.settledReservationIds).toHaveLength(MAX_SETTLED_RESERVATION_IDS);
     expect(last.window.settledReservationIds?.[0]).toBe("settled-5");
+
+    const retryOldSettlement = await callDO<WindowResult>(uid, "/settle", {
+      now: MON + 10_000,
+      reservationId: "settled-0",
+      reservationWindowStart: MON,
+      estimatedTokens: 1,
+      tokensDelta: 1,
+    });
+    expect(retryOldSettlement.window.draftsUsed).toBe(MAX_SETTLED_RESERVATION_IDS + 5);
+    expect(retryOldSettlement.window.tokensUsed).toBe(MAX_SETTLED_RESERVATION_IDS + 5);
   });
 
   it("expires abandoned reservations before admitting more hard quota capacity", async () => {
