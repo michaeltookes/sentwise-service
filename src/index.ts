@@ -9,7 +9,14 @@ import {
   resolveLimits,
   type WindowState,
 } from "./metering";
-import { quotaCheck, quotaPeek, quotaRelease, quotaReserve, quotaSettle } from "./quota-client";
+import {
+  quotaCheck,
+  quotaDeferSettlement,
+  quotaPeek,
+  quotaRelease,
+  quotaReserve,
+  quotaSettle,
+} from "./quota-client";
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
 
@@ -31,7 +38,7 @@ export { AccountQuota } from "./quota-do";
  * Engine. See src/config.ts.
  */
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const { pathname } = url;
 
@@ -152,6 +159,7 @@ export default {
           reservation.window,
           reservation.estimatedTokens,
           tokensDelta,
+          ctx,
         );
         await recordUsage(env, {
           userId,
@@ -204,6 +212,7 @@ async function settleReservedUsage(
   reservedWindow: WindowState,
   estimatedTokens: number,
   tokensDelta: number,
+  ctx?: ExecutionContext,
 ): Promise<WindowState> {
   const body = {
     now: Date.now(),
@@ -218,13 +227,30 @@ async function settleReservedUsage(
     try {
       return (await quotaSettle(env, userId, { ...body, now: Date.now() })).window;
     } catch {
-      return {
-        ...reservedWindow,
-        tokensUsed: reservedWindow.tokensUsed + tokensDelta,
-        tokensReserved: Math.max(0, (reservedWindow.tokensReserved ?? 0) - estimatedTokens),
-      };
+      try {
+        await quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
+      } catch {
+        ctx?.waitUntil(
+          quotaDeferSettlement(env, userId, { ...body, now: Date.now() }).catch(() => undefined),
+        );
+      }
+      return optimisticSettledWindow(reservedWindow, reservationId, estimatedTokens, tokensDelta);
     }
   }
+}
+
+function optimisticSettledWindow(
+  reservedWindow: WindowState,
+  reservationId: string,
+  estimatedTokens: number,
+  tokensDelta: number,
+): WindowState {
+  return {
+    ...reservedWindow,
+    tokensUsed: reservedWindow.tokensUsed + tokensDelta,
+    tokensReserved: Math.max(0, (reservedWindow.tokensReserved ?? 0) - estimatedTokens),
+    activeReservations: reservedWindow.activeReservations?.filter((r) => r.id !== reservationId),
+  };
 }
 
 async function releaseReservedUsage(

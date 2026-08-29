@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import {
   MAX_SETTLED_RESERVATION_IDS,
   RESERVATION_TTL_MS,
@@ -205,6 +205,58 @@ describe("AccountQuota Durable Object", () => {
     expect(first.window.tokensUsed).toBe(500);
     expect(second.window.tokensUsed).toBe(500);
     expect(second.window.tokensReserved).toBe(0);
+  });
+
+  it("deferred settlement is retried by a Durable Object alarm", async () => {
+    const uid = "do-settle-deferred";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const callStub = async <T>(op: string, body: unknown): Promise<T> => {
+      const res = await stub.fetch(`https://account-quota.internal${op}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return res.json<T>();
+    };
+
+    const reserved = await callStub<ReserveResult>("/reserve", {
+      now: MON,
+      reservationId: "settle-deferred-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    const deferred = await callStub<WindowResult & { queued: boolean }>("/defer-settlement", {
+      now: MON + 1000,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+    expect(deferred.queued).toBe(true);
+    expect(deferred.window.tokensUsed).toBe(0);
+
+    const queued = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get("pending_settlements"),
+    );
+    expect(queued).toEqual([
+      expect.objectContaining({
+        reservationId: "settle-deferred-1",
+        tokensDelta: 500,
+      }),
+    ]);
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+    const settled = await callStub<WindowResult>("/peek", { now: MON + 2000 });
+    expect(settled.window.draftsUsed).toBe(1);
+    expect(settled.window.tokensUsed).toBe(500);
+    expect(settled.window.tokensReserved).toBe(0);
+    expect(settled.window.activeReservations).toEqual([]);
+    expect(settled.window.settledReservationIds).toEqual(["settle-deferred-1"]);
+    const cleared = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get("pending_settlements"),
+    );
+    expect(cleared).toBeUndefined();
   });
 
   it("settle keeps only a bounded dedupe id history", async () => {

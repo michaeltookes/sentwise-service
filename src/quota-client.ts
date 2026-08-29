@@ -19,6 +19,14 @@ export interface ReserveResult {
   estimatedTokens: number;
   window: WindowState;
 }
+export interface SettleBody {
+  now: number;
+  reservationId?: string;
+  reservationWindowStart?: number;
+  estimatedTokens?: number;
+  draftsDelta?: number;
+  tokensDelta: number;
+}
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
   const id = env.ACCOUNT_QUOTA.idFromName(userId);
@@ -50,19 +58,17 @@ export function quotaReserve(
 }
 
 /** Settle token usage after a successful reserved draft; returns the updated window. */
-export function quotaSettle(
+export function quotaSettle(env: Env, userId: string, body: SettleBody): Promise<WindowResult> {
+  return call<WindowResult>(env, userId, "/settle", body);
+}
+
+/** Persist a settlement for Durable Object alarm replay after immediate retries fail. */
+export function quotaDeferSettlement(
   env: Env,
   userId: string,
-  body: {
-    now: number;
-    reservationId?: string;
-    reservationWindowStart?: number;
-    estimatedTokens?: number;
-    draftsDelta?: number;
-    tokensDelta: number;
-  },
+  body: SettleBody,
 ): Promise<WindowResult> {
-  return call<WindowResult>(env, userId, "/settle", body);
+  return call<WindowResult>(env, userId, "/defer-settlement", body);
 }
 
 /** Roll back a reserved draft slot after an upstream failure. */

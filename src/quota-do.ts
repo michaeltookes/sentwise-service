@@ -6,12 +6,14 @@
 // Storage keys:
 //   "window" -> WindowState  (weekly usage, in-flight token reservations, reset timestamps)
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
+//   "pending_settlements" -> PendingSettlement[] (alarm-retried settlement metadata)
 //
-// The Worker calls three ops over the DO's internal fetch (see quota-client.ts):
+// The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
 //   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
 //   POST /reserve { now, reservationId, estimatedTokens, limits } -> { reserved, ... }
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
-//   POST /release { now, reservationWindowStart, estimatedTokens } -> { window }
+//   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
+//   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /peek    { now } -> { window }   (read + roll only; no rate-limit, no increment)
 
 import type { Env } from "./config";
@@ -56,6 +58,20 @@ interface ReleaseBody {
 interface PeekBody {
   now: number;
 }
+interface PendingSettlement {
+  reservationId: string;
+  reservationWindowStart: number;
+  estimatedTokens: number;
+  tokensDelta: number;
+  attempts: number;
+  createdAt: number;
+  nextAttemptAt: number;
+}
+
+const PENDING_SETTLEMENTS_KEY = "pending_settlements";
+const MAX_PENDING_SETTLEMENTS = 128;
+const SETTLEMENT_RETRY_BASE_DELAY_MS = 60_000;
+const SETTLEMENT_RETRY_MAX_DELAY_MS = 15 * 60_000;
 
 export class AccountQuota {
   private readonly storage: DurableObjectStorage;
@@ -73,6 +89,8 @@ export class AccountQuota {
         return this.handleReserve(await request.json<ReserveBody>());
       case "/settle":
         return this.handleSettle(await request.json<SettleBody>());
+      case "/defer-settlement":
+        return this.handleDeferSettlement(await request.json<SettleBody>());
       case "/release":
         return this.handleRelease(await request.json<ReleaseBody>());
       case "/peek":
@@ -80,6 +98,10 @@ export class AccountQuota {
       default:
         return new Response("not found", { status: 404 });
     }
+  }
+
+  async alarm(): Promise<void> {
+    await this.processPendingSettlements(Date.now());
   }
 
   private async loadWindow(now: number): Promise<WindowState> {
@@ -144,6 +166,28 @@ export class AccountQuota {
   }
 
   private async handleSettle(body: SettleBody): Promise<Response> {
+    const window = await this.applySettlement(body);
+    return Response.json({ window });
+  }
+
+  private async handleDeferSettlement(body: SettleBody): Promise<Response> {
+    if (!body.reservationId || body.reservationWindowStart === undefined) {
+      return new Response("reservation id and window required", { status: 400 });
+    }
+    const pending = upsertPendingSettlement(await this.loadPendingSettlements(), {
+      reservationId: body.reservationId,
+      reservationWindowStart: nonNegativeInt(body.reservationWindowStart),
+      estimatedTokens: nonNegativeInt(body.estimatedTokens),
+      tokensDelta: nonNegativeInt(body.tokensDelta),
+      attempts: 0,
+      createdAt: body.now,
+      nextAttemptAt: Math.max(Date.now() + 1, body.now),
+    });
+    await this.savePendingSettlements(pending);
+    return Response.json({ window: await this.loadWindow(body.now), queued: true });
+  }
+
+  private async applySettlement(body: SettleBody): Promise<WindowState> {
     const { window, appliesToStoredReservation } = await this.loadMutationWindow(
       body.now,
       body.reservationWindowStart,
@@ -168,7 +212,7 @@ export class AccountQuota {
       }
     }
     await this.storage.put("window", window);
-    return Response.json({ window });
+    return window;
   }
 
   private async handleRelease(body: ReleaseBody): Promise<Response> {
@@ -215,6 +259,52 @@ export class AccountQuota {
     }
     return { window: rollWindow(stored, now), appliesToStoredReservation: false };
   }
+
+  private async loadPendingSettlements(): Promise<PendingSettlement[]> {
+    const pending = await this.storage.get<PendingSettlement[]>(PENDING_SETTLEMENTS_KEY);
+    return Array.isArray(pending) ? pending.filter(isPendingSettlement) : [];
+  }
+
+  private async savePendingSettlements(pending: PendingSettlement[]): Promise<void> {
+    if (pending.length === 0) {
+      await this.storage.delete(PENDING_SETTLEMENTS_KEY);
+      await this.storage.deleteAlarm();
+      return;
+    }
+    await this.storage.put(PENDING_SETTLEMENTS_KEY, pending);
+    await this.storage.setAlarm(new Date(Math.min(...pending.map((p) => p.nextAttemptAt))));
+  }
+
+  private async processPendingSettlements(now: number): Promise<void> {
+    const pending = await this.loadPendingSettlements();
+    const remaining: PendingSettlement[] = [];
+
+    for (const item of pending) {
+      if (item.nextAttemptAt > now) {
+        remaining.push(item);
+        continue;
+      }
+
+      try {
+        await this.applySettlement({
+          now,
+          reservationId: item.reservationId,
+          reservationWindowStart: item.reservationWindowStart,
+          estimatedTokens: item.estimatedTokens,
+          tokensDelta: item.tokensDelta,
+        });
+      } catch {
+        const attempts = item.attempts + 1;
+        remaining.push({
+          ...item,
+          attempts,
+          nextAttemptAt: now + settlementRetryDelayMs(attempts),
+        });
+      }
+    }
+
+    await this.savePendingSettlements(remaining);
+  }
 }
 
 function nonNegativeInt(v: number | undefined): number {
@@ -223,4 +313,43 @@ function nonNegativeInt(v: number | undefined): number {
 
 function appendSettledReservationId(ids: string[], id: string): string[] {
   return [...ids, id].slice(-MAX_SETTLED_RESERVATION_IDS);
+}
+
+function isPendingSettlement(v: unknown): v is PendingSettlement {
+  if (typeof v !== "object" || v === null) return false;
+  const p = v as Record<string, unknown>;
+  return (
+    typeof p.reservationId === "string" &&
+    typeof p.reservationWindowStart === "number" &&
+    typeof p.estimatedTokens === "number" &&
+    typeof p.tokensDelta === "number" &&
+    typeof p.attempts === "number" &&
+    typeof p.createdAt === "number" &&
+    typeof p.nextAttemptAt === "number"
+  );
+}
+
+function upsertPendingSettlement(
+  pending: PendingSettlement[],
+  item: PendingSettlement,
+): PendingSettlement[] {
+  const existing = pending.find((p) => p.reservationId === item.reservationId);
+  const next = existing
+    ? {
+        ...item,
+        attempts: existing.attempts,
+        createdAt: existing.createdAt,
+        nextAttemptAt: Math.min(existing.nextAttemptAt, item.nextAttemptAt),
+      }
+    : item;
+  return [...pending.filter((p) => p.reservationId !== item.reservationId), next].slice(
+    -MAX_PENDING_SETTLEMENTS,
+  );
+}
+
+function settlementRetryDelayMs(attempts: number): number {
+  return Math.min(
+    SETTLEMENT_RETRY_MAX_DELAY_MS,
+    SETTLEMENT_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempts - 1),
+  );
 }

@@ -148,9 +148,10 @@ limit for the current window).
 
 **Per-request pipeline** (`POST /v1/draft`): authenticate → trial → parse → **rate-limit** →
 **token safety cap** → **atomic weekly quota reservation** → forward to Anthropic → settle usage →
-respond. If Anthropic fails after reservation, the reserved draft is released; if settlement fails
-after Anthropic succeeds, the completed draft is still returned. Abandoned reservations expire after
-15 minutes so leaked capacity is reclaimed before the weekly reset.
+respond. If Anthropic fails after reservation, the reserved draft is released; if immediate settlement
+fails after Anthropic succeeds, the completed draft is still returned and the settlement is queued in
+the account Durable Object for alarm retry. Abandoned reservations expire after 15 minutes so leaked
+capacity is reclaimed before the weekly reset.
 
 **Enforcement modes** (`ENFORCEMENT_MODE`):
 
@@ -169,13 +170,13 @@ after Anthropic succeeds, the completed draft is still returned. Abandoned reser
 
 **Config vars** (in `wrangler.jsonc` `vars`; placeholder defaults, final numbers land with 56c):
 
-| Var                      | Default   | Meaning                                                      |
-| ------------------------ | --------- | ------------------------------------------------------------ |
-| `WEEKLY_DRAFT_LIMIT`     | `100`     | Drafts per account per week.                                 |
-| `WEEKLY_TOKEN_LIMIT`     | `2000000` | Input+output tokens per account per week.                    |
-| `RATE_LIMIT_PER_MIN`     | `10`      | Requests per 60s per account (abuse guard).                  |
-| `MAX_TOKENS_PER_REQUEST` | `55000`   | Per-request safety cap; bound as `UTF-8 bytes + max_tokens`. |
-| `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).            |
+| Var                      | Default   | Meaning                                                                |
+| ------------------------ | --------- | ---------------------------------------------------------------------- |
+| `WEEKLY_DRAFT_LIMIT`     | `100`     | Drafts per account per week.                                           |
+| `WEEKLY_TOKEN_LIMIT`     | `2000000` | Input+output tokens per account per week.                              |
+| `RATE_LIMIT_PER_MIN`     | `10`      | Requests per 60s per account (abuse guard).                            |
+| `MAX_TOKENS_PER_REQUEST` | `55000`   | Per-request safety cap; bound as `UTF-8 bytes + framing + max_tokens`. |
+| `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).                      |
 
 **Per-account overrides.** `privateMetadata.quota` on the Clerk user —
 `{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart? }` — overrides the

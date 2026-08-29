@@ -65,6 +65,7 @@ function internalBody(init: RequestInit | undefined): {
   reservationId?: string;
   reservationWindowStart?: number;
   estimatedTokens?: number;
+  tokensDelta?: number;
 } {
   if (typeof init?.body !== "string") return {};
   return JSON.parse(init.body) as {
@@ -72,12 +73,15 @@ function internalBody(init: RequestInit | undefined): {
     reservationId?: string;
     reservationWindowStart?: number;
     estimatedTokens?: number;
+    tokensDelta?: number;
   };
 }
 
 function quotaNamespaceWithSettleFailure(now: number): {
   namespace: DurableObjectNamespace;
   settleCalls: () => number;
+  deferCalls: () => number;
+  deferredSettlements: () => Array<ReturnType<typeof internalBody>>;
 } {
   const windowStart = mondayStartUtc(now);
   let window: WindowState = {
@@ -87,6 +91,8 @@ function quotaNamespaceWithSettleFailure(now: number): {
     tokensUsed: 0,
   };
   let settleCalls = 0;
+  let deferCalls = 0;
+  const deferredSettlements: Array<ReturnType<typeof internalBody>> = [];
   const stub = {
     fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const path = internalUrl(input).pathname;
@@ -123,6 +129,11 @@ function quotaNamespaceWithSettleFailure(now: number): {
         settleCalls += 1;
         return Promise.reject(new Error("settle failed"));
       }
+      if (path === "/defer-settlement") {
+        deferCalls += 1;
+        deferredSettlements.push(body);
+        return Promise.resolve(Response.json({ window, queued: true }));
+      }
       if (path === "/release") {
         if (body.reservationWindowStart === window.windowStart) {
           const reservation = (window.activeReservations ?? []).find(
@@ -153,6 +164,8 @@ function quotaNamespaceWithSettleFailure(now: number): {
       get: vi.fn(() => stub as unknown as DurableObjectStub),
     } as unknown as DurableObjectNamespace,
     settleCalls: () => settleCalls,
+    deferCalls: () => deferCalls,
+    deferredSettlements: () => deferredSettlements,
   };
 }
 
@@ -617,6 +630,13 @@ describe("56b draft metering", () => {
     expect(body.quota.tokensUsed).toBe(5);
     expect(body.quota.remaining).toBe(99);
     expect(quota.settleCalls()).toBe(2);
+    expect(quota.deferCalls()).toBe(1);
+    expect(quota.deferredSettlements()[0]).toMatchObject({
+      reservationWindowStart: expect.any(Number),
+      estimatedTokens: expect.any(Number),
+      tokensDelta: 5,
+    });
+    expect(typeof quota.deferredSettlements()[0].reservationId).toBe("string");
   });
 
   it("hard enforcement blocks an over-quota draft with 429 quota_exceeded", async () => {
