@@ -2,6 +2,7 @@ import { verifyToken, createClerkClient } from "@clerk/backend";
 import type { Env } from "./config";
 import { ApiError } from "./errors";
 import { computeTrial, type TrialState } from "./trial";
+import { parseQuotaOverride, type QuotaOverride } from "./metering";
 
 export interface AuthedUser {
   userId: string;
@@ -11,6 +12,9 @@ export interface AccountInfo {
   userId: string;
   email: string | null;
   trial: TrialState;
+  // 56b: per-account limit overrides from privateMetadata.quota, read on the SAME
+  // Clerk getUser as the trial (no extra Clerk round-trip). Not exposed on /v1/me.
+  quotaOverride: QuotaOverride;
 }
 
 /**
@@ -94,13 +98,19 @@ export async function resolveAccount(
   }
 
   const email = primaryEmail(user);
+  const quotaOverride = parseQuotaOverride(meta.quota);
 
   if (!startedAt) {
     // /v1/me before the trial has started (no draft yet): report a not-yet-started trial.
-    return { userId, email, trial: { startedAt: "", endsAt: "", active: false } };
+    return {
+      userId,
+      email,
+      trial: { startedAt: "", endsAt: "", active: false },
+      quotaOverride,
+    };
   }
 
-  return { userId, email, trial: computeTrial(startedAt) };
+  return { userId, email, trial: computeTrial(startedAt), quotaOverride };
 }
 
 /** Enforce the trial: throw 402 when expired. Returns the resolved account. */

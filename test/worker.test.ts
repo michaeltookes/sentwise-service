@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { env as testEnv } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { TRIAL_MS } from "../src/config";
 
@@ -20,6 +21,7 @@ vi.mock("@clerk/backend", () => ({
 import worker from "../src/index";
 
 const env: Env = {
+  ...testEnv,
   CLERK_SECRET_KEY: "sk_test",
   ANTHROPIC_API_KEY: "sk-ant-test",
   CLERK_PUBLISHABLE_KEY: "pk_test",
@@ -108,7 +110,12 @@ describe("POST /v1/draft trial handling", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ text: "hi", usage: { inputTokens: 3, outputTokens: 2 } });
+    const drafted = (await res.json()) as any;
+    expect(drafted.text).toBe("hi");
+    expect(drafted.usage).toEqual({ inputTokens: 3, outputTokens: 2 });
+    // 56b: the draft response now also carries the quota snapshot.
+    expect(drafted.quota.unit).toBe("drafts");
+    expect(drafted.quota.used).toBe(1);
     // Trial initialized in privateMetadata
     expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
     const arg = mocks.updateUserMetadata.mock.calls[0][1];
