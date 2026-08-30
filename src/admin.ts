@@ -24,13 +24,14 @@ export function isoForSql(ms: number): string {
 /** Aggregate query for one time window. `_sample_interval` reweights AE sampling. */
 export function aggregateSql(dataset: string, sinceIso: string): string {
   const where = `timestamp >= toDateTime('${sinceIso}') AND blob3 = 'ok'`;
-  const activeAccountsSql =
-    `(SELECT SUM(1 / greatest(inclusion_probability, 0.000001)) FROM (` +
-    `SELECT index1, ` +
-    `if(min(_sample_interval) <= 1, 1.0, ` +
-    `1 - exp(SUM(log(1 - (1 / toFloat64(_sample_interval)))))) AS inclusion_probability ` +
-    `FROM ${dataset} WHERE ${where} GROUP BY index1` +
-    `)) AS active_accounts`;
+  // active_accounts is a plain COUNT(DISTINCT index1). A sampling-reweighted
+  // variant (scalar subquery over per-account inclusion probability) was tried
+  // and rejected live by the Analytics Engine SQL API on 2026-08-29 with
+  // `422 unsupported expression type: (SELECT ...)` — AE's ClickHouse subset
+  // does not allow scalar subqueries in the SELECT list. COUNT(DISTINCT) can
+  // undercount only once AE starts sampling (high write volumes), which is
+  // acceptable for a maintainer dashboard; revisit if sampling ever kicks in.
+  const activeAccountsSql = `COUNT(DISTINCT index1) AS active_accounts`;
   return (
     `SELECT ` +
     `SUM(_sample_interval) AS drafts, ` +
