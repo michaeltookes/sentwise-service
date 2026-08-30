@@ -1,4 +1,10 @@
-import { authenticate, requireActiveTrial, resolveAccount } from "./auth";
+import {
+  authenticate,
+  ClerkDeletionOutcomeUnknownError,
+  deleteClerkUser,
+  requireActiveTrial,
+  resolveAccount,
+} from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
 import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, type Env } from "./config";
@@ -10,8 +16,12 @@ import {
   type WindowState,
 } from "./metering";
 import {
+  quotaBeginAccountDeletion,
+  quotaCancelAccountDeletion,
   quotaCheck,
+  quotaDeferRelease,
   quotaDeferSettlement,
+  quotaFinishAccountDeletion,
   quotaPeek,
   quotaRelease,
   quotaReserve,
@@ -27,10 +37,11 @@ export { AccountQuota } from "./quota-do";
  * Sentwise managed-inference Worker (backlog 56a + 56b).
  *
  * Routes:
- *   GET  /healthz       -> liveness, no auth
- *   GET  /v1/me         -> { userId, email, trial, quota } for the account display
- *   POST /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
- *   GET  /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
+ *   GET    /healthz       -> liveness, no auth
+ *   GET    /v1/me         -> { userId, email, trial, subscription, quota } for account display
+ *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
+ *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
+ *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
  * only state is counters, timestamps, and random reservation IDs — trial in Clerk,
@@ -61,8 +72,24 @@ export default {
           userId: account.userId,
           email: account.email,
           trial: account.trial,
+          subscription: account.subscription,
           quota: buildQuota(window, limits),
         });
+      }
+
+      if (pathname === "/v1/me" && request.method === "DELETE") {
+        const { userId } = await authenticate(request, env);
+        const deletionAttemptId = crypto.randomUUID();
+        await quotaBeginAccountDeletion(env, userId, deletionAttemptId);
+        try {
+          await deleteClerkUser(userId, env);
+        } catch (err) {
+          if (err instanceof ClerkDeletionOutcomeUnknownError) throw err;
+          await cancelAccountDeletionBarrier(env, userId, deletionAttemptId, ctx);
+          throw err;
+        }
+        await finishAccountDeletion(env, userId, deletionAttemptId, ctx);
+        return new Response(null, { status: 204 });
       }
 
       if (pathname === "/v1/draft" && request.method === "POST") {
@@ -137,6 +164,7 @@ export default {
             reservation.reservationId,
             reservation.window,
             reservation.estimatedTokens,
+            ctx,
           );
           await recordUsage(env, {
             userId,
@@ -150,8 +178,18 @@ export default {
         }
         const latencyMs = Date.now() - t0;
 
-        // 5) Settle real usage into the reserved window, then report the updated quota.
+        // 5) Record provider usage, then settle it into the reserved window.
+        // Settlement may be delayed by account deletion, but the provider cost
+        // already happened and should still feed aggregate margin metrics.
         const tokensDelta = result.usage.inputTokens + result.usage.outputTokens;
+        await recordUsage(env, {
+          userId,
+          model,
+          inputTokens: result.usage.inputTokens,
+          outputTokens: result.usage.outputTokens,
+          latencyMs,
+          outcome: "ok",
+        });
         const window = await settleReservedUsage(
           env,
           userId,
@@ -161,14 +199,6 @@ export default {
           tokensDelta,
           ctx,
         );
-        await recordUsage(env, {
-          userId,
-          model,
-          inputTokens: result.usage.inputTokens,
-          outputTokens: result.usage.outputTokens,
-          latencyMs,
-          outcome: "ok",
-        });
 
         return Response.json({ ...result, quota: buildQuota(window, limits) });
       }
@@ -223,19 +253,50 @@ async function settleReservedUsage(
   };
   try {
     return (await quotaSettle(env, userId, body)).window;
-  } catch {
+  } catch (err) {
+    if (isAccountDeletionInProgressError(err)) {
+      await deferSettlementBlockedByDeletion(env, userId, body, ctx);
+      throw err;
+    }
+    if (isAccountDeletionError(err)) throw err;
     try {
       return (await quotaSettle(env, userId, { ...body, now: Date.now() })).window;
-    } catch {
+    } catch (retryErr) {
+      if (isAccountDeletionInProgressError(retryErr)) {
+        await deferSettlementBlockedByDeletion(env, userId, body, ctx);
+        throw retryErr;
+      }
+      if (isAccountDeletionError(retryErr)) throw retryErr;
       try {
         await quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
-      } catch {
+      } catch (deferErr) {
+        if (isAccountDeletionError(deferErr)) throw deferErr;
         ctx?.waitUntil(
           quotaDeferSettlement(env, userId, { ...body, now: Date.now() }).catch(() => undefined),
         );
       }
       return optimisticSettledWindow(reservedWindow, reservationId, estimatedTokens, tokensDelta);
     }
+  }
+}
+
+async function deferSettlementBlockedByDeletion(
+  env: Env,
+  userId: string,
+  body: {
+    reservationId: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+    tokensDelta: number;
+  },
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const defer = () => quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
+  try {
+    await defer();
+  } catch (err) {
+    if (isAccountDeletionError(err)) return;
+    ctx?.waitUntil(defer().catch(() => undefined));
   }
 }
 
@@ -259,6 +320,7 @@ async function releaseReservedUsage(
   reservationId: string,
   reservedWindow: WindowState,
   estimatedTokens: number,
+  ctx?: ExecutionContext,
 ): Promise<void> {
   const body = {
     now: Date.now(),
@@ -268,12 +330,102 @@ async function releaseReservedUsage(
   };
   try {
     await quotaRelease(env, userId, body);
-  } catch {
+  } catch (err) {
+    if (isAccountDeletionInProgressError(err)) {
+      await deferReleaseBlockedByDeletion(env, userId, body, ctx);
+      return;
+    }
+    if (isAccountDeletionError(err)) return;
     try {
       await quotaRelease(env, userId, { ...body, now: Date.now() });
-    } catch {
+    } catch (retryErr) {
+      if (isAccountDeletionInProgressError(retryErr)) {
+        await deferReleaseBlockedByDeletion(env, userId, body, ctx);
+        return;
+      }
+      if (isAccountDeletionError(retryErr)) return;
       // The reservation also has a DO-side TTL, so a repeated release outage
       // cannot hold quota capacity until the weekly reset.
     }
   }
+}
+
+async function deferReleaseBlockedByDeletion(
+  env: Env,
+  userId: string,
+  body: {
+    reservationId: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+  },
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const defer = () => quotaDeferRelease(env, userId, { ...body, now: Date.now() });
+  try {
+    await defer();
+  } catch (err) {
+    if (isAccountDeletionError(err)) return;
+    ctx?.waitUntil(defer().catch(() => undefined));
+  }
+}
+
+async function cancelAccountDeletionBarrier(
+  env: Env,
+  userId: string,
+  attemptId: string,
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const cancel = async () => {
+    const result = await quotaCancelAccountDeletion(env, userId, attemptId);
+    if (!result.cancelled && result.barrierActive) {
+      throw new Error("account deletion barrier is still active");
+    }
+    return result;
+  };
+  try {
+    await retryQuotaSideEffect(cancel);
+  } catch {
+    ctx?.waitUntil(retryQuotaSideEffect(cancel).catch(() => undefined));
+    throw new ApiError(
+      503,
+      "account_deletion_recovery_failed",
+      "Could not restore account deletion state. Please try again.",
+    );
+  }
+}
+
+async function finishAccountDeletion(
+  env: Env,
+  userId: string,
+  attemptId: string,
+  ctx?: ExecutionContext,
+): Promise<void> {
+  try {
+    await retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId, attemptId));
+  } catch {
+    ctx?.waitUntil(
+      retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId, attemptId)).catch(
+        () => undefined,
+      ),
+    );
+  }
+}
+
+async function retryQuotaSideEffect<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch {
+    return operation();
+  }
+}
+
+function isAccountDeletionError(err: unknown): err is ApiError {
+  return (
+    err instanceof ApiError &&
+    (err.type === "account_deleted" || err.type === "account_deletion_in_progress")
+  );
+}
+
+function isAccountDeletionInProgressError(err: unknown): err is ApiError {
+  return err instanceof ApiError && err.type === "account_deletion_in_progress";
 }

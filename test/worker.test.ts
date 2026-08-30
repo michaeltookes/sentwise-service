@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { env as testEnv } from "cloudflare:test";
+import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
-import { TRIAL_MS } from "../src/config";
+import { CLERK_DELETE_TIMEOUT_MS, TRIAL_MS } from "../src/config";
 import { mondayStartUtc, RESERVATION_TTL_MS, WEEK_MS, type WindowState } from "../src/metering";
 
 // Mock @clerk/backend so JWT verification and user lookups are controllable.
@@ -9,17 +9,23 @@ const mocks = vi.hoisted(() => ({
   verifyToken: vi.fn(),
   getUser: vi.fn(),
   updateUserMetadata: vi.fn(),
+  deleteUser: vi.fn(),
 }));
 
 vi.mock("@clerk/backend", () => ({
   verifyToken: mocks.verifyToken,
   createClerkClient: () => ({
-    users: { getUser: mocks.getUser, updateUserMetadata: mocks.updateUserMetadata },
+    users: {
+      getUser: mocks.getUser,
+      updateUserMetadata: mocks.updateUserMetadata,
+      deleteUser: mocks.deleteUser,
+    },
   }),
 }));
 
 // Import AFTER the mock is registered.
 import worker from "../src/index";
+import { clerkUserExists } from "../src/auth";
 
 const env: Env = {
   ...testEnv,
@@ -27,6 +33,24 @@ const env: Env = {
   ANTHROPIC_API_KEY: "sk-ant-test",
   CLERK_PUBLISHABLE_KEY: "pk_test",
 };
+
+const ACCOUNT_DELETION_KEY = "account_deletion";
+
+function usageAnalytics() {
+  const writeDataPoint = vi.fn();
+  return {
+    dataset: { writeDataPoint } as unknown as AnalyticsEngineDataset,
+    writeDataPoint,
+  };
+}
+
+async function clearAccountDeletionState(userId: string): Promise<void> {
+  const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.delete(ACCOUNT_DELETION_KEY);
+    await state.storage.deleteAlarm();
+  });
+}
 
 function req(path: string, init?: RequestInit): Request {
   return new Request(`https://sentwise-inference.test${path}`, init);
@@ -46,6 +70,35 @@ function anthropicOk(text = "drafted") {
   );
 }
 
+function clerkDeleteResponse(status = 200) {
+  return new Response(JSON.stringify({ deleted: status >= 200 && status < 300 }), { status });
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string" || input instanceof URL) return String(input);
+  return input.url;
+}
+
+function isClerkDelete(input: RequestInfo | URL, init?: RequestInit): boolean {
+  return (
+    requestUrl(input).startsWith("https://api.clerk.com/v1/users/") && init?.method === "DELETE"
+  );
+}
+
+function isClerkUserLookup(input: RequestInfo | URL, init?: RequestInit): boolean {
+  return requestUrl(input).startsWith("https://api.clerk.com/v1/users/") && !init?.method;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function userWith(privateMetadata: Record<string, unknown>) {
   return {
     id: "user_123",
@@ -62,6 +115,7 @@ function internalUrl(input: RequestInfo | URL): URL {
 
 function internalBody(init: RequestInit | undefined): {
   now?: number;
+  attemptId?: string;
   reservationId?: string;
   reservationWindowStart?: number;
   estimatedTokens?: number;
@@ -70,6 +124,7 @@ function internalBody(init: RequestInit | undefined): {
   if (typeof init?.body !== "string") return {};
   return JSON.parse(init.body) as {
     now?: number;
+    attemptId?: string;
     reservationId?: string;
     reservationWindowStart?: number;
     estimatedTokens?: number;
@@ -169,11 +224,111 @@ function quotaNamespaceWithSettleFailure(now: number): {
   };
 }
 
+function quotaNamespaceWithDeletionFailures(options: {
+  cancelFailures?: number;
+  finishFailures?: number;
+  cancelMismatch?: boolean;
+}): {
+  namespace: DurableObjectNamespace;
+  cancelCalls: () => number;
+  finishCalls: () => number;
+} {
+  let deleting = false;
+  let deleted = false;
+  const attemptIds = new Set<string>();
+  let cancelCalls = 0;
+  let finishCalls = 0;
+  const windowStart = mondayStartUtc(Date.now());
+  const window: WindowState = {
+    windowStart,
+    resetsAt: windowStart + WEEK_MS,
+    draftsUsed: 1,
+    tokensUsed: 5,
+  };
+  const stub = {
+    fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = internalUrl(input).pathname;
+      const body = internalBody(init);
+      if (path === "/begin-delete") {
+        deleting = true;
+        attemptIds.add(body.attemptId ?? "");
+        return Promise.resolve(
+          Response.json({
+            deleting: true,
+            alreadyDeleted: false,
+            attemptId: body.attemptId,
+          }),
+        );
+      }
+      if (path === "/cancel-delete") {
+        cancelCalls += 1;
+        if (cancelCalls <= (options.cancelFailures ?? 0)) {
+          return Promise.reject(new Error("cancel failed"));
+        }
+        const wasDeleting =
+          deleting && attemptIds.has(body.attemptId ?? "") && !options.cancelMismatch;
+        if (!options.cancelMismatch) {
+          attemptIds.delete(body.attemptId ?? "");
+          deleting = attemptIds.size > 0;
+        }
+        return Promise.resolve(
+          Response.json({ cancelled: wasDeleting, barrierActive: deleting || deleted }),
+        );
+      }
+      if (path === "/finish-delete") {
+        finishCalls += 1;
+        if (finishCalls <= (options.finishFailures ?? 0)) {
+          return Promise.reject(new Error("finish failed"));
+        }
+        deleting = false;
+        deleted = true;
+        attemptIds.clear();
+        return Promise.resolve(Response.json({ deleted: true, cleanupPending: false }));
+      }
+      if (path === "/peek") {
+        if (deleted) {
+          return Promise.resolve(
+            Response.json(
+              { error: { type: "account_deleted", message: "This account has been deleted." } },
+              { status: 410 },
+            ),
+          );
+        }
+        if (deleting) {
+          return Promise.resolve(
+            Response.json(
+              {
+                error: {
+                  type: "account_deletion_in_progress",
+                  message: "Account deletion is in progress.",
+                },
+              },
+              { status: 409 },
+            ),
+          );
+        }
+        return Promise.resolve(Response.json({ window }));
+      }
+      return Promise.resolve(new Response("not found", { status: 404 }));
+    }),
+  };
+  return {
+    namespace: {
+      idFromName: vi.fn(() => ({}) as DurableObjectId),
+      get: vi.fn(() => stub as unknown as DurableObjectStub),
+    } as unknown as DurableObjectNamespace,
+    cancelCalls: () => cancelCalls,
+    finishCalls: () => finishCalls,
+  };
+}
+
 beforeEach(() => {
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   mocks.verifyToken.mockReset();
   mocks.getUser.mockReset();
   mocks.updateUserMetadata.mockReset();
+  mocks.deleteUser.mockReset();
 });
 
 describe("GET /healthz", () => {
@@ -204,6 +359,49 @@ describe("auth", () => {
     );
     expect(res.status).toBe(401);
     expect(((await res.json()) as any).error.type).toBe("session_invalid");
+  });
+
+  it("bounds Clerk user existence lookups with an abort signal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-05T00:00:00.000Z"));
+    try {
+      const lookupStarted = deferred<void>();
+      let aborted = false;
+      const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        lookupStarted.resolve();
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            aborted = true;
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+            },
+            { once: true },
+          );
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const lookup = clerkUserExists("user_lookup_timeout", env);
+      const rejected = expect(lookup).rejects.toMatchObject({ name: "AbortError" });
+      await lookupStarted.promise;
+      await vi.advanceTimersByTimeAsync(CLERK_DELETE_TIMEOUT_MS);
+
+      await rejected;
+      expect(aborted).toBe(true);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://api.clerk.com/v1/users/user_lookup_timeout",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -362,6 +560,387 @@ describe("GET /v1/me", () => {
     const body = (await res.json()) as any;
     expect(body.trial.active).toBe(true);
     expect(body.trial.startedAt).toBe(started);
+  });
+
+  // 73 — subscription field (placeholder derived from the trial until 56c).
+  it("derives a not-started subscription before the trial begins", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({})); // no trial yet
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const body = (await res.json()) as any;
+    expect(body.subscription).toEqual({
+      plan: "trial",
+      status: "trialing",
+      renewsAt: null,
+      manageBillingUrl: null,
+    });
+  });
+
+  it("derives a trialing subscription with renewsAt from an active trial", async () => {
+    const started = new Date(Date.now() - 1000).toISOString();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ trialStartedAt: started }));
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const body = (await res.json()) as any;
+    expect(body.subscription.plan).toBe("trial");
+    expect(body.subscription.status).toBe("trialing");
+    expect(body.subscription.renewsAt).toBe(body.trial.endsAt);
+    expect(body.subscription.manageBillingUrl).toBeNull();
+  });
+
+  it("uses a valid privateMetadata.subscription override verbatim", async () => {
+    const override = {
+      plan: "individual",
+      status: "active",
+      renewsAt: "2026-12-01T00:00:00.000Z",
+      manageBillingUrl: "https://billing.example.com/p/abc",
+    };
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: override,
+      }),
+    );
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const body = (await res.json()) as any;
+    expect(body.subscription).toEqual(override);
+  });
+});
+
+describe("DELETE /v1/me (73 — account deletion)", () => {
+  it("deletes the Clerk user and tombstones the usage DO, returning 204", async () => {
+    // Seed some usage first so the wipe is observable.
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const drafted = await worker.fetch(draftReq("u-del"), env);
+    expect(drafted.status).toBe(200);
+    expect(((await drafted.json()) as any).quota.used).toBe(1);
+
+    fetchMock.mockResolvedValue(clerkDeleteResponse());
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(204);
+    expect(await del.text()).toBe("");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "https://api.clerk.com/v1/users/u-del",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+
+    // Stale authenticated calls after deletion cannot recreate a fresh quota window.
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(410);
+    expect(((await me.json()) as any).error.type).toBe("account_deleted");
+  });
+
+  it("is idempotent — a Clerk user already gone still returns 204", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-gone" });
+    const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse(404));
+    vi.stubGlobal("fetch", fetchMock);
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(204);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("retries quota finalization after Clerk deletion succeeds", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-finalize-retry" });
+    const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const quota = quotaNamespaceWithDeletionFailures({ finishFailures: 1 });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+    expect(del.status).toBe(204);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.clerk.com/v1/users/u-del-finalize-retry",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(quota.finishCalls()).toBe(2);
+  });
+
+  it("preserves usage and cancels the deletion barrier when Clerk deletion fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-fail" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const drafted = await worker.fetch(draftReq("u-del-fail"), env);
+    expect(drafted.status).toBe(200);
+    expect(((await drafted.json()) as any).quota.used).toBe(1);
+
+    fetchMock.mockResolvedValue(clerkDeleteResponse(500));
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(502);
+    const body = (await del.json()) as any;
+    expect(body.error.type).toBe("account_deletion_failed");
+    expect(body.error.message).not.toContain("secret-ish");
+    expect(body.error.message).not.toContain("clerk exploded");
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(200);
+    expect(((await me.json()) as any).quota.used).toBe(1);
+  });
+
+  it("retries deletion barrier cancellation when Clerk deletion fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-retry" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(clerkDeleteResponse(500)));
+    const quota = quotaNamespaceWithDeletionFailures({ cancelFailures: 1 });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+    expect(del.status).toBe(502);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_failed");
+    expect(quota.cancelCalls()).toBe(2);
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), flakyQuotaEnv);
+    expect(me.status).toBe(200);
+    expect(((await me.json()) as any).quota.used).toBe(1);
+  });
+
+  it("surfaces deletion barrier cancellation failure instead of swallowing it", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-fail" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(clerkDeleteResponse(500)));
+    const quota = quotaNamespaceWithDeletionFailures({ cancelFailures: 2 });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+    expect(del.status).toBe(503);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_recovery_failed");
+    expect(quota.cancelCalls()).toBe(2);
+  });
+
+  it("surfaces deletion barrier cancellation mismatch when the DO leaves the barrier active", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-mismatch" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(clerkDeleteResponse(500)));
+    const quota = quotaNamespaceWithDeletionFailures({ cancelMismatch: true });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+
+    expect(del.status).toBe(503);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_recovery_failed");
+    expect(quota.cancelCalls()).toBe(2);
+  });
+
+  it("keeps the deletion barrier when Clerk deletion times out", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-05T00:00:00.000Z"));
+    try {
+      const deleteStarted = deferred<void>();
+      mocks.verifyToken.mockResolvedValue({ sub: "u-del-timeout" });
+      mocks.getUser.mockResolvedValue(activeTrial());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+          deleteStarted.resolve();
+          return new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal?.aborted) {
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+              return;
+            }
+            signal?.addEventListener(
+              "abort",
+              () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              { once: true },
+            );
+          });
+        }),
+      );
+
+      const deletion = worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+      await deleteStarted.promise;
+      await vi.advanceTimersByTimeAsync(CLERK_DELETE_TIMEOUT_MS);
+      const res = await deletion;
+
+      expect(res.status).toBe(503);
+      expect(((await res.json()) as any).error.type).toBe("account_deletion_status_unknown");
+      const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+      expect(me.status).toBe(409);
+      expect(((await me.json()) as any).error.type).toBe("account_deletion_in_progress");
+      await clearAccountDeletionState("u-del-timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the deletion barrier when Clerk delete has a transport failure", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-transport-fail" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("network failed"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+
+    expect(del.status).toBe(503);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_status_unknown");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.clerk.com/v1/users/u-del-transport-fail",
+      expect.objectContaining({ method: "DELETE", signal: expect.any(AbortSignal) }),
+    );
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(409);
+    expect(((await me.json()) as any).error.type).toBe("account_deletion_in_progress");
+    await clearAccountDeletionState("u-del-transport-fail");
+  });
+
+  it("blocks an authenticated draft from settling after deletion starts", async () => {
+    const started = deferred<void>();
+    const upstream = deferred<Response>();
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isClerkDelete(input, init)) return Promise.resolve(clerkDeleteResponse());
+      if (isClerkUserLookup(input, init)) return Promise.resolve(clerkDeleteResponse());
+      started.resolve();
+      return upstream.promise;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(activeTrial());
+
+    const draft = worker.fetch(draftReq("u-del-race"), env);
+    await started.promise;
+
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(204);
+
+    upstream.resolve(anthropicOk("late"));
+    const completedDraft = await draft;
+    expect(completedDraft.status).toBe(410);
+    expect(((await completedDraft.json()) as any).error.type).toBe("account_deleted");
+    const calls = fetchMock.mock.calls;
+    expect(calls.filter(([input, init]) => isClerkDelete(input, init))).toHaveLength(1);
+    expect(
+      calls.filter(
+        ([input, init]) =>
+          requestUrl(input).startsWith("https://api.anthropic.com/") && init?.method === "POST",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("defers a settlement blocked by a deletion that is later canceled", async () => {
+    const started = deferred<void>();
+    const upstream = deferred<Response>();
+    const clerkDelete = deferred<Response>();
+    const deleteStarted = deferred<void>();
+    const analytics = usageAnalytics();
+    const analyticsEnv: Env = { ...env, USAGE_ANALYTICS: analytics.dataset };
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isClerkDelete(input, init)) {
+        deleteStarted.resolve();
+        return clerkDelete.promise;
+      }
+      if (isClerkUserLookup(input, init)) return Promise.resolve(clerkDeleteResponse());
+      started.resolve();
+      return upstream.promise;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(activeTrial());
+
+    const draft = worker.fetch(draftReq("u-del-settle-cancel"), analyticsEnv);
+    await started.promise;
+    const deletion = worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      analyticsEnv,
+    );
+    await deleteStarted.promise;
+
+    upstream.resolve(anthropicOk("late"));
+    const completedDraft = await draft;
+    expect(completedDraft.status).toBe(409);
+    expect(((await completedDraft.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(analytics.writeDataPoint).toHaveBeenCalledOnce();
+    const dataPoint = analytics.writeDataPoint.mock.calls[0][0] as {
+      blobs: string[];
+      doubles: number[];
+    };
+    expect(dataPoint.blobs[2]).toBe("ok");
+    expect(dataPoint.doubles[0]).toBe(3);
+    expect(dataPoint.doubles[1]).toBe(2);
+
+    clerkDelete.resolve(clerkDeleteResponse(500));
+    const failedDeletion = await deletion;
+    expect(failedDeletion.status).toBe(502);
+
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-settle-cancel"));
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), analyticsEnv);
+    const quota = ((await me.json()) as any).quota;
+    expect(quota.used).toBe(1);
+    expect(quota.tokensUsed).toBe(5);
+  });
+
+  it("defers a release blocked by a deletion that is later canceled", async () => {
+    const started = deferred<void>();
+    const upstream = deferred<Response>();
+    const clerkDelete = deferred<Response>();
+    const deleteStarted = deferred<void>();
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isClerkDelete(input, init)) {
+        deleteStarted.resolve();
+        return clerkDelete.promise;
+      }
+      if (isClerkUserLookup(input, init)) return Promise.resolve(clerkDeleteResponse());
+      started.resolve();
+      return upstream.promise;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(activeTrial());
+
+    const draft = worker.fetch(draftReq("u-del-release-cancel"), env);
+    await started.promise;
+    const deletion = worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    await deleteStarted.promise;
+
+    upstream.resolve(
+      new Response(JSON.stringify({ error: { type: "overloaded_error" } }), { status: 529 }),
+    );
+    const failedDraft = await draft;
+    expect(failedDraft.status).toBe(503);
+    expect(((await failedDraft.json()) as any).error.type).toBe("overloaded");
+
+    clerkDelete.resolve(clerkDeleteResponse(500));
+    const failedDeletion = await deletion;
+    expect(failedDeletion.status).toBe(502);
+
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-release-cancel"));
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const quota = ((await me.json()) as any).quota;
+    expect(quota.used).toBe(0);
+    expect(quota.tokensUsed).toBe(0);
+  });
+
+  it("rejects an unauthenticated delete with 401 and never touches Clerk", async () => {
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE" }), env);
+    expect(del.status).toBe(401);
+    expect(((await del.json()) as any).error.type).toBe("unauthenticated");
+    expect(mocks.deleteUser).not.toHaveBeenCalled();
+  });
+
+  it("405s a wrong method on /v1/me (e.g. POST) while GET and DELETE work", async () => {
+    const res = await worker.fetch(req("/v1/me", { method: "POST", headers: bearer() }), env);
+    expect(res.status).toBe(405);
+    expect(((await res.json()) as any).error.type).toBe("method_not_allowed");
   });
 });
 

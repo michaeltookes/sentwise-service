@@ -1,8 +1,9 @@
 import { verifyToken, createClerkClient } from "@clerk/backend";
-import type { Env } from "./config";
+import { CLERK_DELETE_TIMEOUT_MS, type Env } from "./config";
 import { ApiError } from "./errors";
 import { computeTrial, type TrialState } from "./trial";
 import { parseQuotaOverride, type QuotaOverride } from "./metering";
+import { deriveSubscription, type Subscription } from "./subscription";
 
 export interface AuthedUser {
   userId: string;
@@ -12,9 +13,23 @@ export interface AccountInfo {
   userId: string;
   email: string | null;
   trial: TrialState;
+  // 73: the account's subscription. Placeholder derived from the trial until 56c
+  // writes privateMetadata.subscription; built explicitly, safe to expose on /v1/me.
+  subscription: Subscription;
   // 56b: per-account limit overrides from privateMetadata.quota, read on the SAME
   // Clerk getUser as the trial (no extra Clerk round-trip). Not exposed on /v1/me.
   quotaOverride: QuotaOverride;
+}
+
+export class ClerkDeletionOutcomeUnknownError extends ApiError {
+  constructor() {
+    super(
+      503,
+      "account_deletion_status_unknown",
+      "Account deletion is still being confirmed. Please try again.",
+    );
+    this.name = "ClerkDeletionOutcomeUnknownError";
+  }
 }
 
 /**
@@ -100,17 +115,39 @@ export async function resolveAccount(
   const email = primaryEmail(user);
   const quotaOverride = parseQuotaOverride(meta.quota);
 
-  if (!startedAt) {
-    // /v1/me before the trial has started (no draft yet): report a not-yet-started trial.
-    return {
-      userId,
-      email,
-      trial: { startedAt: "", endsAt: "", active: false },
-      quotaOverride,
-    };
-  }
+  // Report a not-yet-started trial when there's no stamp yet (viewing before the
+  // first draft); otherwise compute it. Subscription is derived on the SAME
+  // getUser — no extra Clerk round-trip (73).
+  const trial: TrialState = startedAt
+    ? computeTrial(startedAt)
+    : { startedAt: "", endsAt: "", active: false };
+  const subscription = deriveSubscription(trial, meta.subscription);
 
-  return { userId, email, trial: computeTrial(startedAt), quotaOverride };
+  return { userId, email, trial, subscription, quotaOverride };
+}
+
+/** Return whether Clerk still has this user; 404 means already deleted. */
+export async function clerkUserExists(userId: string, env: Env): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CLERK_DELETE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+      headers: {
+        Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (res.ok) return true;
+    if (res.status === 404) return false;
+    throw new ApiError(
+      502,
+      "account_lookup_failed",
+      "Could not confirm your account deletion status. Please try again.",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /** Enforce the trial: throw 402 when expired. Returns the resolved account. */
@@ -123,6 +160,42 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
     });
   }
   return account;
+}
+
+/**
+ * Delete the Clerk user (73, account deletion). Idempotent: a user that is
+ * already gone (Clerk 404) resolves successfully so DELETE /v1/me stays 204 on
+ * retry. Definitive non-404 Clerk responses become a user-safe 502; rejected
+ * requests are treated as unknown outcomes because Clerk may have committed the
+ * delete before the transport failed.
+ *
+ * The caller wraps this with the AccountQuota deletion barrier so in-flight
+ * requests cannot mutate quota state while Clerk deletion is in progress.
+ */
+export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CLERK_DELETE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (res.ok || res.status === 404) return;
+    throw new ApiError(
+      502,
+      "account_deletion_failed",
+      "Could not delete your account. Please try again.",
+    );
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ClerkDeletionOutcomeUnknownError();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 interface ClerkUserLike {

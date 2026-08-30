@@ -1,11 +1,38 @@
-import { describe, it, expect } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { Env } from "../src/config";
 import {
   RESERVATION_TTL_MS,
   WEEK_MS,
   type ResolvedLimits,
   type WindowState,
 } from "../src/metering";
+import { AccountQuota } from "../src/quota-do";
+
+const clerkMocks = vi.hoisted(() => ({
+  verifyToken: vi.fn(),
+  getUser: vi.fn(),
+  updateUserMetadata: vi.fn(),
+  deleteUser: vi.fn(),
+  clerkUserExists: vi.fn(),
+  deleteClerkUser: vi.fn(),
+}));
+
+vi.mock("@clerk/backend", () => ({
+  verifyToken: clerkMocks.verifyToken,
+  createClerkClient: () => ({
+    users: {
+      getUser: clerkMocks.getUser,
+      updateUserMetadata: clerkMocks.updateUserMetadata,
+      deleteUser: clerkMocks.deleteUser,
+    },
+  }),
+}));
+
+vi.mock("../src/auth", () => ({
+  clerkUserExists: clerkMocks.clerkUserExists,
+  deleteClerkUser: clerkMocks.deleteClerkUser,
+}));
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 const OLD_BOUNDED_ARRAY_SIZE = 128;
@@ -26,11 +53,34 @@ interface ReserveResult {
   window: WindowState;
 }
 interface PendingSettlementRecord {
+  kind?: string;
   reservationId: string;
   tokensDelta: number;
 }
+interface TestStorage {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put(key: string, value: unknown): Promise<void>;
+  list<T = unknown>(): Promise<Map<string, T>>;
+  delete(keyOrKeys: string | string[]): Promise<void>;
+  setAlarm(scheduledTime: number | Date): Promise<void>;
+  deleteAlarm(): Promise<void>;
+  transaction<T>(closure: (txn: TestStorage) => Promise<T>): Promise<T>;
+}
 
+const ACCOUNT_DELETION_KEY = "account_deletion";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
+
+beforeEach(() => {
+  clerkMocks.verifyToken.mockReset();
+  clerkMocks.getUser.mockReset();
+  clerkMocks.getUser.mockRejectedValue(new Error("clerk unavailable"));
+  clerkMocks.updateUserMetadata.mockReset();
+  clerkMocks.deleteUser.mockReset();
+  clerkMocks.clerkUserExists.mockReset();
+  clerkMocks.clerkUserExists.mockRejectedValue(new Error("clerk unavailable"));
+  clerkMocks.deleteClerkUser.mockReset();
+  clerkMocks.deleteClerkUser.mockRejectedValue(new Error("clerk unavailable"));
+});
 
 const hardLimits: ResolvedLimits = {
   weeklyDraftLimit: 1,
@@ -41,13 +91,17 @@ const hardLimits: ResolvedLimits = {
   extraPurchased: 0,
 };
 
-async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> {
+async function callDOResponse(userId: string, op: string, body: unknown): Promise<Response> {
   const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(userId));
-  const res = await stub.fetch(`https://account-quota.internal${op}`, {
+  return stub.fetch(`https://account-quota.internal${op}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> {
+  const res = await callDOResponse(userId, op, body);
   return res.json<T>();
 }
 
@@ -58,6 +112,39 @@ async function pendingSettlements(stub: DurableObjectStub): Promise<PendingSettl
     });
     return [...pending.values()];
   });
+}
+
+async function storedKeys(stub: DurableObjectStub): Promise<string[]> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    return [...(await state.storage.list()).keys()].sort();
+  });
+}
+
+async function alarmTime(stub: DurableObjectStub): Promise<number | null> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    return state.storage.getAlarm();
+  });
+}
+
+function fakeStorage(values: Map<string, unknown>): TestStorage {
+  return {
+    get: <T = unknown>(key: string) => Promise.resolve(values.get(key) as T | undefined),
+    put: (key: string, value: unknown) => {
+      values.set(key, value);
+      return Promise.resolve();
+    },
+    list: <T = unknown>() => Promise.resolve(new Map(values) as Map<string, T>),
+    delete: (keyOrKeys: string | string[]) => {
+      for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+        values.delete(key);
+      }
+      return Promise.resolve();
+    },
+    setAlarm: (_scheduledTime: number | Date) => Promise.resolve(),
+    deleteAlarm: () => Promise.resolve(),
+    transaction: async <T>(closure: (txn: ReturnType<typeof fakeStorage>) => Promise<T>) =>
+      closure(fakeStorage(values)),
+  };
 }
 
 describe("AccountQuota Durable Object", () => {
@@ -139,6 +226,782 @@ describe("AccountQuota Durable Object", () => {
     expect(second.reserved).toBe(false);
     expect(second.blockedByQuota).toBe(true);
     expect(second.window.tokensReserved).toBe(80);
+  });
+
+  it("blocks quota operations during deletion without wiping preserved counters", async () => {
+    const uid = "do-delete-barrier";
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+
+    const begin = await callDO<{ deleting: boolean; alreadyDeleted: boolean }>(
+      uid,
+      "/begin-delete",
+      { now: MON + 1, attemptId: "delete-barrier-attempt" },
+    );
+    expect(begin).toMatchObject({
+      deleting: true,
+      alreadyDeleted: false,
+      attemptId: "delete-barrier-attempt",
+    });
+    expect((begin as { expiresAt?: unknown }).expiresAt).toEqual(expect.any(Number));
+
+    const blockedOps = [
+      ["/check", { now: MON + 2, rateLimitPerMin: 10 }],
+      [
+        "/reserve",
+        {
+          now: MON + 2,
+          reservationId: "delete-barrier-2",
+          estimatedTokens: 1,
+          limits: hardLimits,
+        },
+      ],
+      [
+        "/settle",
+        {
+          now: MON + 2,
+          reservationId: reserved.reservationId,
+          reservationWindowStart: reserved.window.windowStart,
+          estimatedTokens: reserved.estimatedTokens,
+          tokensDelta: 10,
+        },
+      ],
+      [
+        "/release",
+        {
+          now: MON + 2,
+          reservationId: reserved.reservationId,
+          reservationWindowStart: reserved.window.windowStart,
+          estimatedTokens: reserved.estimatedTokens,
+        },
+      ],
+      ["/peek", { now: MON + 2 }],
+    ] as const;
+
+    for (const [op, body] of blockedOps) {
+      const res = await callDOResponse(uid, op, body);
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as any).error.type).toBe("account_deletion_in_progress");
+    }
+
+    const cancel = await callDO<{ cancelled: boolean }>(uid, "/cancel-delete", {
+      now: MON + 3,
+      attemptId: "delete-barrier-attempt",
+    });
+    expect(cancel.cancelled).toBe(true);
+
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 3 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensUsed).toBe(0);
+    expect(peek.window.activeReservations).toEqual([
+      { id: "delete-barrier-1", estimatedTokens: 250, expiresAt: MON + RESERVATION_TTL_MS },
+    ]);
+  });
+
+  it("queues settlements blocked by deletion and replays them after cancellation", async () => {
+    const uid = "do-delete-blocked-settlement-replay";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const baseNow = Date.now() - 10;
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: baseNow,
+      reservationId: "delete-blocked-settlement-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO(uid, "/begin-delete", {
+      now: baseNow + 1,
+      attemptId: "delete-blocked-settlement-attempt",
+    });
+
+    const deferred = await callDOResponse(uid, "/defer-settlement", {
+      now: baseNow + 2,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+
+    expect(deferred.status).toBe(409);
+    expect(((await deferred.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await pendingSettlements(stub)).toHaveLength(1);
+
+    await callDO(uid, "/cancel-delete", {
+      now: baseNow + 3,
+      attemptId: "delete-blocked-settlement-attempt",
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(await pendingSettlements(stub)).toEqual([]);
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: baseNow + 4 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensUsed).toBe(500);
+    expect(peek.window.tokensReserved).toBe(0);
+  });
+
+  it("queues releases blocked by deletion and replays them after cancellation", async () => {
+    const uid = "do-delete-blocked-release-replay";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const baseNow = Date.now() - 10;
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: baseNow,
+      reservationId: "delete-blocked-release-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO(uid, "/begin-delete", {
+      now: baseNow + 1,
+      attemptId: "delete-blocked-release-attempt",
+    });
+
+    const deferred = await callDOResponse(uid, "/defer-release", {
+      now: baseNow + 2,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+    });
+
+    expect(deferred.status).toBe(409);
+    expect(((await deferred.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await pendingSettlements(stub)).toEqual([
+      expect.objectContaining({
+        kind: "release",
+        reservationId: reserved.reservationId,
+        tokensDelta: 0,
+      }),
+    ]);
+
+    await callDO(uid, "/cancel-delete", {
+      now: baseNow + 3,
+      attemptId: "delete-blocked-release-attempt",
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(await pendingSettlements(stub)).toEqual([]);
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: baseNow + 4 });
+    expect(peek.window.draftsUsed).toBe(0);
+    expect(peek.window.tokensUsed).toBe(0);
+    expect(peek.window.tokensReserved).toBe(0);
+    expect(peek.window.activeReservations).toEqual([]);
+  });
+
+  it("begin-delete schedules a stale-barrier recovery alarm", async () => {
+    const uid = "do-delete-begin-alarm";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+
+    const begin = await callDO<{ deleting: boolean; alreadyDeleted: boolean }>(
+      uid,
+      "/begin-delete",
+      { now: Date.now(), attemptId: "delete-begin-alarm-attempt" },
+    );
+
+    expect(begin.deleting).toBe(true);
+    expect(begin.alreadyDeleted).toBe(false);
+    expect(await alarmTime(stub)).not.toBeNull();
+  });
+
+  it("final deletion wipes usage data but keeps a tombstone for stale tokens", async () => {
+    const uid = "do-delete-finish";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-finish-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO<WindowResult & { queued: boolean }>(uid, "/defer-settlement", {
+      now: MON + 1,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+
+    await callDO(uid, "/begin-delete", { now: MON + 2, attemptId: "delete-finish-attempt" });
+    const finish = await callDO<{ deleted: boolean }>(uid, "/finish-delete", {
+      now: MON + 3,
+      attemptId: "delete-finish-attempt",
+    });
+    expect(finish.deleted).toBe(true);
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    expect(await pendingSettlements(stub)).toEqual([]);
+
+    const peek = await callDOResponse(uid, "/peek", { now: MON + WEEK_MS });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
+
+    const check = await callDOResponse(uid, "/check", {
+      now: MON + WEEK_MS,
+      rateLimitPerMin: 10,
+    });
+    expect(check.status).toBe(410);
+    expect(((await check.json()) as any).error.type).toBe("account_deleted");
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
+  it("persists the deletion tombstone before scheduling cleanup retry", async () => {
+    const calls: string[] = [];
+    const values = new Map<string, unknown>();
+    const storage = {
+      get: (key: string) => Promise.resolve(values.get(key)),
+      put: (key: string, value: unknown) => {
+        const status =
+          key === ACCOUNT_DELETION_KEY && typeof value === "object" && value !== null
+            ? (value as { status?: unknown }).status
+            : key;
+        calls.push(`put:${String(status)}`);
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      list: () => {
+        calls.push("list");
+        return Promise.resolve(new Map(values));
+      },
+      delete: (keyOrKeys: string | string[]) => {
+        calls.push(`delete:${Array.isArray(keyOrKeys) ? keyOrKeys.length : keyOrKeys}`);
+        for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+          values.delete(key);
+        }
+        return Promise.resolve();
+      },
+      setAlarm: () => {
+        calls.push("setAlarm");
+        return Promise.resolve();
+      },
+      deleteAlarm: () => {
+        calls.push("deleteAlarm");
+        return Promise.resolve();
+      },
+    };
+    const quota = new AccountQuota({ storage } as unknown as DurableObjectState, {} as Env);
+
+    const finish = await quota.fetch(
+      new Request("https://account-quota.internal/finish-delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ now: MON + 1, attemptId: "finish-order-attempt" }),
+      }),
+    );
+
+    expect(finish.status).toBe(200);
+    expect(calls.slice(0, 2)).toEqual(["put:deleted", "setAlarm"]);
+  });
+
+  it("final deletion wipes account data in bounded storage batches", async () => {
+    const uid = "do-delete-finish-many-keys";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("window", {
+        windowStart: MON,
+        resetsAt: MON + WEEK_MS,
+        draftsUsed: 1,
+        tokensUsed: 5,
+      });
+      for (let i = 0; i < OLD_BOUNDED_ARRAY_SIZE + 5; i++) {
+        await state.storage.put(`settled_settlement:delete-batch-${i}`, {
+          settledAt: MON + i,
+        });
+      }
+    });
+
+    await callDO(uid, "/begin-delete", { now: MON + 1, attemptId: "delete-batch-attempt" });
+    const finish = await callDO<{ deleted: boolean; cleanupPending: boolean }>(
+      uid,
+      "/finish-delete",
+      {
+        now: MON + 2,
+        attemptId: "delete-batch-attempt",
+      },
+    );
+
+    expect(finish).toEqual({ deleted: true, cleanupPending: false });
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
+  it("alarm retries final deletion cleanup from a persisted tombstone", async () => {
+    const uid = "do-delete-finish-alarm";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-finish-alarm-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, { status: "deleted", updatedAt: MON + 2 });
+    });
+    expect(await storedKeys(stub)).toContain("window");
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    expect(await pendingSettlements(stub)).toEqual([]);
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 3 });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
+  });
+
+  it("cancel-delete only removes the matching deletion attempt", async () => {
+    const uid = "do-delete-concurrent-cancel";
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-concurrent-cancel-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO(uid, "/begin-delete", { now: MON + 1, attemptId: "attempt-a" });
+    await callDO(uid, "/begin-delete", { now: MON + 2, attemptId: "attempt-b" });
+
+    const cancelA = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: MON + 3,
+        attemptId: "attempt-a",
+      },
+    );
+    expect(cancelA).toEqual({ cancelled: true, barrierActive: true });
+
+    const blocked = await callDOResponse(uid, "/peek", { now: MON + 4 });
+    expect(blocked.status).toBe(409);
+    expect(((await blocked.json()) as any).error.type).toBe("account_deletion_in_progress");
+
+    const cancelB = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: MON + 5,
+        attemptId: "attempt-b",
+      },
+    );
+    expect(cancelB).toEqual({ cancelled: true, barrierActive: false });
+
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 6 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensReserved).toBe(250);
+  });
+
+  it("does not cancel a legacy deletion barrier with a new failed attempt", async () => {
+    const uid = "do-delete-legacy-barrier";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-legacy-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+      });
+    });
+
+    await callDO(uid, "/begin-delete", { now: MON + 1, attemptId: "new-attempt" });
+    const cancel = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: MON + 2,
+        attemptId: "new-attempt",
+      },
+    );
+    expect(cancel).toEqual({ cancelled: true, barrierActive: true });
+
+    const blocked = await callDOResponse(uid, "/peek", { now: MON + 3 });
+    expect(blocked.status).toBe(409);
+    expect(((await blocked.json()) as any).error.type).toBe("account_deletion_in_progress");
+  });
+
+  it("rearms pending settlement alarms after an idempotent cancel retry", async () => {
+    const uid = "do-delete-cancel-rearm-pending";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const baseNow = Date.now() + 60_000;
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: baseNow,
+      reservationId: "delete-cancel-rearm-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO<WindowResult & { queued: boolean }>(uid, "/defer-settlement", {
+      now: baseNow + 1,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.deleteAlarm();
+    });
+    expect(await pendingSettlements(stub)).toHaveLength(1);
+    expect(await alarmTime(stub)).toBeNull();
+
+    const cancel = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: baseNow + 2,
+        attemptId: "already-cancelled-attempt",
+      },
+    );
+
+    expect(cancel).toEqual({ cancelled: false, barrierActive: false });
+    expect(await alarmTime(stub)).not.toBeNull();
+  });
+
+  it("preserves a newer deletion alarm when cancel cleanup finds no pending settlements", async () => {
+    const uid = "do-delete-cancel-preserve-new-barrier-alarm";
+    const calls: string[] = [];
+    const values = new Map<string, unknown>([
+      [
+        ACCOUNT_DELETION_KEY,
+        {
+          status: "deleting",
+          updatedAt: MON,
+          attemptIds: ["old-attempt"],
+          attempts: [{ id: "old-attempt", expiresAt: MON + 60_000 }],
+        },
+      ],
+    ]);
+    let cancelTransactionComplete = false;
+    let newerBarrierInstalled = false;
+    const storage: TestStorage = {
+      get: <T = unknown>(key: string) => Promise.resolve(values.get(key) as T | undefined),
+      put: (key: string, value: unknown) => {
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      list: <T = unknown>() => {
+        if (cancelTransactionComplete && !newerBarrierInstalled) {
+          newerBarrierInstalled = true;
+          values.set(ACCOUNT_DELETION_KEY, {
+            status: "deleting",
+            updatedAt: MON + 1,
+            attemptIds: ["new-attempt"],
+            attempts: [{ id: "new-attempt", expiresAt: MON + 60_001 }],
+          });
+        }
+        return Promise.resolve(new Map(values) as Map<string, T>);
+      },
+      delete: (keyOrKeys: string | string[]) => {
+        for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+          values.delete(key);
+        }
+        return Promise.resolve();
+      },
+      setAlarm: () => Promise.resolve(),
+      deleteAlarm: () => {
+        calls.push("deleteAlarm");
+        return Promise.resolve();
+      },
+      transaction: async <T>(closure: (txn: TestStorage) => Promise<T>) => {
+        const result = await closure(storage);
+        cancelTransactionComplete = true;
+        return result;
+      },
+    };
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+
+    const cancel = await quota.fetch(
+      new Request("https://account-quota.internal/cancel-delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ now: MON + 2, attemptId: "old-attempt" }),
+      }),
+    );
+
+    expect(cancel.status).toBe(200);
+    expect(await cancel.json()).toEqual({ cancelled: true, barrierActive: false });
+    expect(newerBarrierInstalled).toBe(true);
+    expect(values.get(ACCOUNT_DELETION_KEY)).toMatchObject({
+      status: "deleting",
+      attemptIds: ["new-attempt"],
+    });
+    expect(calls).not.toContain("deleteAlarm");
+  });
+
+  it("alarm preserves an unexpired in-progress deletion barrier without wiping counters", async () => {
+    const uid = "do-delete-stale-barrier";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const expiresAt = Date.now() + 60_000;
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-stale-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: Date.now(),
+        attemptIds: ["stale-attempt"],
+        attempts: [{ id: "stale-attempt", expiresAt }],
+      });
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 1 });
+    expect(peek.status).toBe(409);
+    expect(((await peek.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
+    expect(clerkMocks.clerkUserExists).not.toHaveBeenCalled();
+    expect(await alarmTime(stub)).not.toBeNull();
+  });
+
+  it("alarm keeps an expired deletion barrier when recovery deletion fails", async () => {
+    const uid = "do-delete-expired-barrier-active-user";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockRejectedValue(new Error("delete failed"));
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
+    const blocked = await callDOResponse(uid, "/peek", { now: MON + 2 });
+    expect(blocked.status).toBe(409);
+    expect(((await blocked.json()) as any).error.type).toBe("account_deletion_in_progress");
+  });
+
+  it("stale barrier recovery preserves fresh attempts added during Clerk lookup", async () => {
+    const uid = "do-delete-expired-reread-attempts";
+    const values = new Map<string, unknown>([
+      [
+        ACCOUNT_DELETION_KEY,
+        {
+          status: "deleting",
+          updatedAt: MON,
+          attemptIds: ["expired-attempt"],
+          attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+        },
+      ],
+      [
+        "window",
+        {
+          windowStart: MON,
+          resetsAt: MON + WEEK_MS,
+          draftsUsed: 1,
+          tokensUsed: 0,
+        },
+      ],
+    ]);
+    const storage = fakeStorage(values);
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    clerkMocks.clerkUserExists.mockImplementation(() => {
+      values.set(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: Date.now(),
+        attemptIds: ["expired-attempt", "fresh-attempt"],
+        attempts: [
+          { id: "expired-attempt", expiresAt: MON + 1 },
+          { id: "fresh-attempt", expiresAt: Date.now() + 60_000 },
+        ],
+      });
+      return Promise.resolve(true);
+    });
+    clerkMocks.deleteClerkUser.mockRejectedValue(new Error("delete failed"));
+
+    const peek = await quota.fetch(
+      new Request("https://account-quota.internal/peek", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ now: Date.now() }),
+      }),
+    );
+
+    expect(peek.status).toBe(409);
+    const marker = values.get(ACCOUNT_DELETION_KEY) as { attemptIds?: string[] };
+    expect(marker.attemptIds).toEqual(["expired-attempt", "fresh-attempt"]);
+  });
+
+  it("quota requests keep an expired deletion barrier after the first positive Clerk lookup", async () => {
+    const uid = "do-delete-expired-barrier-request";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-request-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockRejectedValue(new Error("delete failed"));
+
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(peek.status).toBe(409);
+    expect(((await peek.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
+    const marker = await runInDurableObject(stub, async (_instance, state) => {
+      return state.storage.get<{
+        attempts?: Array<{ expiresAt?: number; liveVerifiedAt?: number }>;
+      }>(ACCOUNT_DELETION_KEY);
+    });
+    expect(marker?.attempts?.[0]?.expiresAt).toEqual(expect.any(Number));
+    expect(marker?.attempts?.[0]?.expiresAt).toBeGreaterThan(MON + 1);
+    expect(marker?.attempts?.[0]).not.toHaveProperty("liveVerifiedAt");
+  });
+
+  it("alarm retries deletion for an expired barrier when Clerk still has the user", async () => {
+    const uid = "do-delete-expired-barrier-retry-delete";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-retry-delete-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockResolvedValue(undefined);
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
+  });
+
+  it("quota requests retry deletion for an expired barrier when Clerk still has the user", async () => {
+    const uid = "do-delete-expired-barrier-request-retry-delete";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-request-retry-delete-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockResolvedValue(undefined);
+
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
+  });
+
+  it("keeps the deletion barrier when Clerk existence lookup fails", async () => {
+    const uid = "do-delete-expired-barrier-lookup-fail";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-lookup-fail-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockRejectedValue(new Error("timeout"));
+
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(peek.status).toBe(409);
+    expect(((await peek.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
+    expect(await alarmTime(stub)).not.toBeNull();
+  });
+
+  it("alarm finalizes an expired deletion barrier when Clerk user is gone", async () => {
+    const uid = "do-delete-expired-barrier-gone-user";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-barrier-gone-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockResolvedValue(false);
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
   });
 
   it("release rolls back only the reserved draft in the same window", async () => {
@@ -240,15 +1103,17 @@ describe("AccountQuota Durable Object", () => {
       estimatedTokens: 250,
       limits: hardLimits,
     });
-    const deferred = await callStub<WindowResult & { queued: boolean }>("/defer-settlement", {
-      now: MON + 1000,
-      reservationId: reserved.reservationId,
-      reservationWindowStart: reserved.window.windowStart,
-      estimatedTokens: reserved.estimatedTokens,
-      tokensDelta: 500,
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(`${PENDING_SETTLEMENT_KEY_PREFIX}${reserved.reservationId}`, {
+        reservationId: reserved.reservationId,
+        reservationWindowStart: reserved.window.windowStart,
+        estimatedTokens: reserved.estimatedTokens,
+        tokensDelta: 500,
+        attempts: 0,
+        createdAt: MON + 1000,
+        nextAttemptAt: 1,
+      });
     });
-    expect(deferred.queued).toBe(true);
-    expect(deferred.window.tokensUsed).toBe(0);
 
     const queued = await pendingSettlements(stub);
     expect(queued).toEqual([
