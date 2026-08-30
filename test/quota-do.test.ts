@@ -629,7 +629,7 @@ describe("AccountQuota Durable Object", () => {
     expect(await alarmTime(stub)).not.toBeNull();
   });
 
-  it("alarm cancels an expired deletion barrier when Clerk still has the user", async () => {
+  it("alarm cancels a confirmed-live expired deletion barrier when Clerk still has the user", async () => {
     const uid = "do-delete-expired-barrier-active-user";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
     await callDO<ReserveResult>(uid, "/reserve", {
@@ -643,7 +643,7 @@ describe("AccountQuota Durable Object", () => {
         status: "deleting",
         updatedAt: MON,
         attemptIds: ["expired-attempt"],
-        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1, liveVerifiedAt: MON + 1 }],
       });
     });
     clerkMocks.getUser.mockResolvedValue({ id: uid });
@@ -709,10 +709,10 @@ describe("AccountQuota Durable Object", () => {
 
     expect(peek.status).toBe(409);
     const marker = values.get(ACCOUNT_DELETION_KEY) as { attemptIds?: string[] };
-    expect(marker.attemptIds).toEqual(["fresh-attempt"]);
+    expect(marker.attemptIds).toEqual(["expired-attempt", "fresh-attempt"]);
   });
 
-  it("quota requests recover an expired deletion barrier when Clerk still has the user", async () => {
+  it("quota requests keep an expired deletion barrier after the first positive Clerk lookup", async () => {
     const uid = "do-delete-expired-barrier-request";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
     await callDO<ReserveResult>(uid, "/reserve", {
@@ -731,11 +731,18 @@ describe("AccountQuota Durable Object", () => {
     });
     clerkMocks.getUser.mockResolvedValue({ id: uid });
 
-    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 2 });
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
 
     expect(clerkMocks.getUser).toHaveBeenCalledWith(uid);
-    expect(peek.window.draftsUsed).toBe(1);
-    expect(await storedKeys(stub)).not.toContain(ACCOUNT_DELETION_KEY);
+    expect(peek.status).toBe(409);
+    expect(((await peek.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
+    const marker = await runInDurableObject(stub, async (_instance, state) => {
+      return state.storage.get<{ attempts?: Array<{ liveVerifiedAt?: number }> }>(
+        ACCOUNT_DELETION_KEY,
+      );
+    });
+    expect(marker?.attempts?.[0]?.liveVerifiedAt).toEqual(expect.any(Number));
   });
 
   it("alarm finalizes an expired deletion barrier when Clerk user is gone", async () => {

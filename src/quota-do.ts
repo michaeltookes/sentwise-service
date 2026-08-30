@@ -84,6 +84,7 @@ interface SettledSettlementMarker {
 interface AccountDeletionAttempt {
   id: string;
   expiresAt: number;
+  liveVerifiedAt?: number;
 }
 interface AccountDeletionMarker {
   status: "deleting" | "deleted";
@@ -399,6 +400,7 @@ export class AccountQuota {
       const existingAttempt = attempts.find((attempt) => attempt.id === attemptId);
       if (existingAttempt) {
         existingAttempt.expiresAt = expiresAt;
+        delete existingAttempt.liveVerifiedAt;
       } else {
         attempts.push({ id: attemptId, expiresAt });
       }
@@ -569,9 +571,17 @@ export class AccountQuota {
       const current = await this.loadAccountDeletionMarkerFrom(txn);
       if (current?.status !== "deleting") return current;
 
-      const remainingAttempts = activeDeletionAttempts(current).filter(
-        (attempt) => attempt.expiresAt > now,
-      );
+      const remainingAttempts = activeDeletionAttempts(current).flatMap((attempt) => {
+        if (attempt.expiresAt > now) return [attempt];
+        if (isDeletionAttemptConfirmedLive(attempt, now)) return [];
+        return [
+          {
+            ...attempt,
+            expiresAt: now + ACCOUNT_DELETION_BARRIER_TIMEOUT_MS,
+            liveVerifiedAt: now,
+          },
+        ];
+      });
       if (remainingAttempts.length === 0) {
         await txn.delete(ACCOUNT_DELETION_KEY);
         await scheduleAccountDeletionAlarmOn(txn, now + 1);
@@ -798,6 +808,14 @@ function isAccountDeletionAttempt(v: unknown): v is AccountDeletionAttempt {
     typeof attempt.expiresAt === "number" &&
     Number.isFinite(attempt.expiresAt) &&
     attempt.expiresAt > 0
+  );
+}
+
+function isDeletionAttemptConfirmedLive(attempt: AccountDeletionAttempt, now: number): boolean {
+  return (
+    typeof attempt.liveVerifiedAt === "number" &&
+    Number.isFinite(attempt.liveVerifiedAt) &&
+    attempt.liveVerifiedAt + ACCOUNT_DELETION_BARRIER_TIMEOUT_MS <= now
   );
 }
 
