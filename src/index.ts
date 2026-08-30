@@ -1,4 +1,10 @@
-import { authenticate, deleteClerkUser, requireActiveTrial, resolveAccount } from "./auth";
+import {
+  authenticate,
+  ClerkDeletionOutcomeUnknownError,
+  deleteClerkUser,
+  requireActiveTrial,
+  resolveAccount,
+} from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
 import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, type Env } from "./config";
@@ -77,6 +83,7 @@ export default {
         try {
           await deleteClerkUser(userId, env);
         } catch (err) {
+          if (err instanceof ClerkDeletionOutcomeUnknownError) throw err;
           await cancelAccountDeletionBarrier(env, userId, deletionAttemptId, ctx);
           throw err;
         }

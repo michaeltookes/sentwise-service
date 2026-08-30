@@ -21,6 +21,17 @@ export interface AccountInfo {
   quotaOverride: QuotaOverride;
 }
 
+export class ClerkDeletionOutcomeUnknownError extends ApiError {
+  constructor() {
+    super(
+      503,
+      "account_deletion_status_unknown",
+      "Account deletion is still being confirmed. Please try again.",
+    );
+    this.name = "ClerkDeletionOutcomeUnknownError";
+  }
+}
+
 /**
  * Verify the Clerk session JWT from `Authorization: Bearer <token>`.
  * Throws ApiError(401) on missing/invalid tokens. Returns the Clerk user id.
@@ -153,6 +164,7 @@ export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
   try {
     await withTimeout(clerk.users.deleteUser(userId), CLERK_DELETE_TIMEOUT_MS);
   } catch (err) {
+    if (err instanceof ClerkDeletionOutcomeUnknownError) throw err;
     if (isClerkNotFound(err)) return; // already deleted — idempotent success
     throw new ApiError(
       502,
@@ -167,7 +179,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_resolve, reject) => {
-      timeout = setTimeout(() => reject(new Error("clerk_delete_timeout")), timeoutMs);
+      timeout = setTimeout(() => reject(new ClerkDeletionOutcomeUnknownError()), timeoutMs);
     }),
   ]).finally(() => {
     if (timeout !== undefined) clearTimeout(timeout);

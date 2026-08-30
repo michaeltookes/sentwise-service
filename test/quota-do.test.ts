@@ -49,6 +49,15 @@ interface PendingSettlementRecord {
   reservationId: string;
   tokensDelta: number;
 }
+interface TestStorage {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put(key: string, value: unknown): Promise<void>;
+  list<T = unknown>(): Promise<Map<string, T>>;
+  delete(keyOrKeys: string | string[]): Promise<void>;
+  setAlarm(scheduledTime: number | Date): Promise<void>;
+  deleteAlarm(): Promise<void>;
+  transaction<T>(closure: (txn: TestStorage) => Promise<T>): Promise<T>;
+}
 
 const ACCOUNT_DELETION_KEY = "account_deletion";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
@@ -103,6 +112,27 @@ async function alarmTime(stub: DurableObjectStub): Promise<number | null> {
   return runInDurableObject(stub, async (_instance, state) => {
     return state.storage.getAlarm();
   });
+}
+
+function fakeStorage(values: Map<string, unknown>): TestStorage {
+  return {
+    get: <T = unknown>(key: string) => Promise.resolve(values.get(key) as T | undefined),
+    put: (key: string, value: unknown) => {
+      values.set(key, value);
+      return Promise.resolve();
+    },
+    list: <T = unknown>() => Promise.resolve(new Map(values) as Map<string, T>),
+    delete: (keyOrKeys: string | string[]) => {
+      for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+        values.delete(key);
+      }
+      return Promise.resolve();
+    },
+    setAlarm: (_scheduledTime: number | Date) => Promise.resolve(),
+    deleteAlarm: () => Promise.resolve(),
+    transaction: async <T>(closure: (txn: ReturnType<typeof fakeStorage>) => Promise<T>) =>
+      closure(fakeStorage(values)),
+  };
 }
 
 describe("AccountQuota Durable Object", () => {
@@ -627,6 +657,59 @@ describe("AccountQuota Durable Object", () => {
     const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 2 });
     expect(peek.window.draftsUsed).toBe(1);
     expect(peek.window.tokensReserved).toBe(250);
+  });
+
+  it("stale barrier recovery preserves fresh attempts added during Clerk lookup", async () => {
+    const uid = "do-delete-expired-reread-attempts";
+    const values = new Map<string, unknown>([
+      [
+        ACCOUNT_DELETION_KEY,
+        {
+          status: "deleting",
+          updatedAt: MON,
+          attemptIds: ["expired-attempt"],
+          attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+        },
+      ],
+      [
+        "window",
+        {
+          windowStart: MON,
+          resetsAt: MON + WEEK_MS,
+          draftsUsed: 1,
+          tokensUsed: 0,
+        },
+      ],
+    ]);
+    const storage = fakeStorage(values);
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    clerkMocks.getUser.mockImplementation(() => {
+      values.set(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: Date.now(),
+        attemptIds: ["expired-attempt", "fresh-attempt"],
+        attempts: [
+          { id: "expired-attempt", expiresAt: MON + 1 },
+          { id: "fresh-attempt", expiresAt: Date.now() + 60_000 },
+        ],
+      });
+      return Promise.resolve({ id: uid });
+    });
+
+    const peek = await quota.fetch(
+      new Request("https://account-quota.internal/peek", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ now: Date.now() }),
+      }),
+    );
+
+    expect(peek.status).toBe(409);
+    const marker = values.get(ACCOUNT_DELETION_KEY) as { attemptIds?: string[] };
+    expect(marker.attemptIds).toEqual(["fresh-attempt"]);
   });
 
   it("quota requests recover an expired deletion barrier when Clerk still has the user", async () => {

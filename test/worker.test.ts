@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
-import { TRIAL_MS } from "../src/config";
+import { CLERK_DELETE_TIMEOUT_MS, TRIAL_MS } from "../src/config";
 import { mondayStartUtc, RESERVATION_TTL_MS, WEEK_MS, type WindowState } from "../src/metering";
 
 // Mock @clerk/backend so JWT verification and user lookups are controllable.
@@ -644,6 +644,33 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(del.status).toBe(503);
     expect(((await del.json()) as any).error.type).toBe("account_deletion_recovery_failed");
     expect(quota.cancelCalls()).toBe(2);
+  });
+
+  it("keeps the deletion barrier when Clerk deletion times out", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-05T00:00:00.000Z"));
+    try {
+      const deleteStarted = deferred<void>();
+      mocks.verifyToken.mockResolvedValue({ sub: "u-del-timeout" });
+      mocks.getUser.mockResolvedValue(activeTrial());
+      mocks.deleteUser.mockImplementation(() => {
+        deleteStarted.resolve();
+        return new Promise(() => undefined);
+      });
+
+      const deletion = worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+      await deleteStarted.promise;
+      await vi.advanceTimersByTimeAsync(CLERK_DELETE_TIMEOUT_MS);
+      const res = await deletion;
+
+      expect(res.status).toBe(503);
+      expect(((await res.json()) as any).error.type).toBe("account_deletion_status_unknown");
+      const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+      expect(me.status).toBe(409);
+      expect(((await me.json()) as any).error.type).toBe("account_deletion_in_progress");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("blocks an authenticated draft from settling after deletion starts", async () => {

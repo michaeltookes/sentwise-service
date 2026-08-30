@@ -565,24 +565,29 @@ export class AccountQuota {
       return tombstone;
     }
 
-    const remainingAttempts = attempts.filter((attempt) => attempt.expiresAt > now);
-    if (remainingAttempts.length === 0) {
-      await this.storage.delete(ACCOUNT_DELETION_KEY);
-      await this.schedulePendingSettlementAlarm();
-      return undefined;
-    }
+    return this.storage.transaction(async (txn) => {
+      const current = await this.loadAccountDeletionMarkerFrom(txn);
+      if (current?.status !== "deleting") return current;
 
-    const nextMarker: AccountDeletionMarker = {
-      status: "deleting",
-      updatedAt: now,
-      attemptIds: remainingAttempts.map((attempt) => attempt.id),
-      attempts: remainingAttempts,
-    };
-    await this.storage.put(ACCOUNT_DELETION_KEY, nextMarker);
-    await this.scheduleAccountDeletionAlarm(earliestDeletionAttemptExpiry(remainingAttempts)).catch(
-      () => undefined,
-    );
-    return nextMarker;
+      const remainingAttempts = activeDeletionAttempts(current).filter(
+        (attempt) => attempt.expiresAt > now,
+      );
+      if (remainingAttempts.length === 0) {
+        await txn.delete(ACCOUNT_DELETION_KEY);
+        await scheduleAccountDeletionAlarmOn(txn, now + 1);
+        return undefined;
+      }
+
+      const nextMarker: AccountDeletionMarker = {
+        status: "deleting",
+        updatedAt: now,
+        attemptIds: remainingAttempts.map((attempt) => attempt.id),
+        attempts: remainingAttempts,
+      };
+      await txn.put(ACCOUNT_DELETION_KEY, nextMarker);
+      await scheduleAccountDeletionAlarmOn(txn, earliestDeletionAttemptExpiry(remainingAttempts));
+      return nextMarker;
+    });
   }
 
   private async loadAccountDeletionMarker(): Promise<AccountDeletionMarker | undefined> {
