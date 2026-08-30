@@ -71,6 +71,12 @@ async function storedKeys(stub: DurableObjectStub): Promise<string[]> {
   });
 }
 
+async function alarmTime(stub: DurableObjectStub): Promise<number | null> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    return state.storage.getAlarm();
+  });
+}
+
 describe("AccountQuota Durable Object", () => {
   it("check returns the current weekly window (Mon 00:00 UTC start)", async () => {
     const r = await callDO<CheckResult>("do-window", "/check", { now: MON, rateLimitPerMin: 10 });
@@ -400,6 +406,42 @@ describe("AccountQuota Durable Object", () => {
     const blocked = await callDOResponse(uid, "/peek", { now: MON + 3 });
     expect(blocked.status).toBe(409);
     expect(((await blocked.json()) as any).error.type).toBe("account_deletion_in_progress");
+  });
+
+  it("rearms pending settlement alarms after an idempotent cancel retry", async () => {
+    const uid = "do-delete-cancel-rearm-pending";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const baseNow = Date.now() + 60_000;
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: baseNow,
+      reservationId: "delete-cancel-rearm-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO<WindowResult & { queued: boolean }>(uid, "/defer-settlement", {
+      now: baseNow + 1,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.deleteAlarm();
+    });
+    expect(await pendingSettlements(stub)).toHaveLength(1);
+    expect(await alarmTime(stub)).toBeNull();
+
+    const cancel = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: baseNow + 2,
+        attemptId: "already-cancelled-attempt",
+      },
+    );
+
+    expect(cancel).toEqual({ cancelled: false, barrierActive: false });
+    expect(await alarmTime(stub)).not.toBeNull();
   });
 
   it("alarm preserves an in-progress deletion barrier without wiping counters", async () => {

@@ -420,7 +420,7 @@ export class AccountQuota {
       await txn.delete(ACCOUNT_DELETION_KEY);
       return { cancelled: true, barrierActive: false };
     });
-    if (result.cancelled && !result.barrierActive) {
+    if (!result.barrierActive) {
       await this.schedulePendingSettlementAlarm();
     }
     return Response.json(result);
