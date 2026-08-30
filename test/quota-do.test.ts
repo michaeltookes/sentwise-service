@@ -658,6 +658,80 @@ describe("AccountQuota Durable Object", () => {
     expect(await alarmTime(stub)).not.toBeNull();
   });
 
+  it("preserves a newer deletion alarm when cancel cleanup finds no pending settlements", async () => {
+    const uid = "do-delete-cancel-preserve-new-barrier-alarm";
+    const calls: string[] = [];
+    const values = new Map<string, unknown>([
+      [
+        ACCOUNT_DELETION_KEY,
+        {
+          status: "deleting",
+          updatedAt: MON,
+          attemptIds: ["old-attempt"],
+          attempts: [{ id: "old-attempt", expiresAt: MON + 60_000 }],
+        },
+      ],
+    ]);
+    let cancelTransactionComplete = false;
+    let newerBarrierInstalled = false;
+    const storage: TestStorage = {
+      get: <T = unknown>(key: string) => Promise.resolve(values.get(key) as T | undefined),
+      put: (key: string, value: unknown) => {
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      list: <T = unknown>() => {
+        if (cancelTransactionComplete && !newerBarrierInstalled) {
+          newerBarrierInstalled = true;
+          values.set(ACCOUNT_DELETION_KEY, {
+            status: "deleting",
+            updatedAt: MON + 1,
+            attemptIds: ["new-attempt"],
+            attempts: [{ id: "new-attempt", expiresAt: MON + 60_001 }],
+          });
+        }
+        return Promise.resolve(new Map(values) as Map<string, T>);
+      },
+      delete: (keyOrKeys: string | string[]) => {
+        for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+          values.delete(key);
+        }
+        return Promise.resolve();
+      },
+      setAlarm: () => Promise.resolve(),
+      deleteAlarm: () => {
+        calls.push("deleteAlarm");
+        return Promise.resolve();
+      },
+      transaction: async <T>(closure: (txn: TestStorage) => Promise<T>) => {
+        const result = await closure(storage);
+        cancelTransactionComplete = true;
+        return result;
+      },
+    };
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+
+    const cancel = await quota.fetch(
+      new Request("https://account-quota.internal/cancel-delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ now: MON + 2, attemptId: "old-attempt" }),
+      }),
+    );
+
+    expect(cancel.status).toBe(200);
+    expect(await cancel.json()).toEqual({ cancelled: true, barrierActive: false });
+    expect(newerBarrierInstalled).toBe(true);
+    expect(values.get(ACCOUNT_DELETION_KEY)).toMatchObject({
+      status: "deleting",
+      attemptIds: ["new-attempt"],
+    });
+    expect(calls).not.toContain("deleteAlarm");
+  });
+
   it("alarm preserves an unexpired in-progress deletion barrier without wiping counters", async () => {
     const uid = "do-delete-stale-barrier";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));

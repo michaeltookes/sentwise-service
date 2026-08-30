@@ -738,6 +738,7 @@ export class AccountQuota {
   private async schedulePendingSettlementAlarm(): Promise<void> {
     const pending = await this.loadPendingSettlements();
     if (pending.length === 0) {
+      if (await this.loadAccountDeletionMarker()) return;
       await this.storage.deleteAlarm();
       return;
     }
