@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { env as testEnv } from "cloudflare:test";
+import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { TRIAL_MS } from "../src/config";
 import { mondayStartUtc, RESERVATION_TTL_MS, WEEK_MS, type WindowState } from "../src/metering";
@@ -668,6 +668,47 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(completedDraft.status).toBe(410);
     expect(((await completedDraft.json()) as any).error.type).toBe("account_deleted");
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("defers a settlement blocked by a deletion that is later canceled", async () => {
+    const started = deferred<void>();
+    const upstream = deferred<Response>();
+    const fetchMock = vi.fn().mockImplementation(() => {
+      started.resolve();
+      return upstream.promise;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const clerkDelete = deferred<void>();
+    const deleteStarted = deferred<void>();
+    mocks.getUser.mockResolvedValue(activeTrial());
+    mocks.deleteUser.mockImplementation(() => {
+      deleteStarted.resolve();
+      return clerkDelete.promise;
+    });
+
+    const draft = worker.fetch(draftReq("u-del-settle-cancel"), env);
+    await started.promise;
+    const deletion = worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    await deleteStarted.promise;
+
+    upstream.resolve(anthropicOk("late"));
+    const completedDraft = await draft;
+    expect(completedDraft.status).toBe(409);
+    expect(((await completedDraft.json()) as any).error.type).toBe("account_deletion_in_progress");
+
+    clerkDelete.reject(Object.assign(new Error("clerk failed"), { status: 500 }));
+    const failedDeletion = await deletion;
+    expect(failedDeletion.status).toBe(502);
+
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-settle-cancel"));
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const quota = ((await me.json()) as any).quota;
+    expect(quota.used).toBe(1);
+    expect(quota.tokensUsed).toBe(5);
   });
 
   it("rejects an unauthenticated delete with 401 and never touches Clerk", async () => {

@@ -229,16 +229,6 @@ describe("AccountQuota Durable Object", () => {
         },
       ],
       [
-        "/defer-settlement",
-        {
-          now: MON + 2,
-          reservationId: reserved.reservationId,
-          reservationWindowStart: reserved.window.windowStart,
-          estimatedTokens: reserved.estimatedTokens,
-          tokensDelta: 10,
-        },
-      ],
-      [
         "/release",
         {
           now: MON + 2,
@@ -268,6 +258,48 @@ describe("AccountQuota Durable Object", () => {
     expect(peek.window.activeReservations).toEqual([
       { id: "delete-barrier-1", estimatedTokens: 250, expiresAt: MON + RESERVATION_TTL_MS },
     ]);
+  });
+
+  it("queues settlements blocked by deletion and replays them after cancellation", async () => {
+    const uid = "do-delete-blocked-settlement-replay";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const baseNow = Date.now() - 10;
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: baseNow,
+      reservationId: "delete-blocked-settlement-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO(uid, "/begin-delete", {
+      now: baseNow + 1,
+      attemptId: "delete-blocked-settlement-attempt",
+    });
+
+    const deferred = await callDOResponse(uid, "/defer-settlement", {
+      now: baseNow + 2,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+
+    expect(deferred.status).toBe(409);
+    expect(((await deferred.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await pendingSettlements(stub)).toHaveLength(1);
+
+    await callDO(uid, "/cancel-delete", {
+      now: baseNow + 3,
+      attemptId: "delete-blocked-settlement-attempt",
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(await pendingSettlements(stub)).toEqual([]);
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: baseNow + 4 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensUsed).toBe(500);
+    expect(peek.window.tokensReserved).toBe(0);
   });
 
   it("begin-delete schedules a stale-barrier recovery alarm", async () => {

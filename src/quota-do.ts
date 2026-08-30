@@ -134,6 +134,8 @@ export class AccountQuota {
         return this.handleCancelDelete(await request.json<DeletionBody>());
       case "/finish-delete":
         return this.handleFinishDelete(await request.json<DeletionBody>());
+      case "/defer-settlement":
+        return this.handleDeferSettlement(await request.json<SettleBody>());
       case "/wipe":
         return this.handleWipe();
     }
@@ -157,8 +159,6 @@ export class AccountQuota {
         return this.handleReserve(await request.json<ReserveBody>());
       case "/settle":
         return this.handleSettle(await request.json<SettleBody>());
-      case "/defer-settlement":
-        return this.handleDeferSettlement(await request.json<SettleBody>());
       case "/release":
         return this.handleRelease(await request.json<ReleaseBody>());
       case "/peek":
@@ -268,7 +268,9 @@ export class AccountQuota {
     }
     const result = await this.storage.transaction(async (txn) => {
       const deletion = await this.loadAccountDeletionMarkerFrom(txn);
-      if (deletion) return { queued: false, response: accountDeletionResponse(deletion) };
+      if (deletion?.status === "deleted") {
+        return { queued: false, deletion };
+      }
 
       await this.putPendingSettlement(txn, {
         reservationId: body.reservationId!,
@@ -279,15 +281,19 @@ export class AccountQuota {
         createdAt: body.now,
         nextAttemptAt: body.now,
       });
+      if (deletion?.status === "deleting") {
+        return { queued: true, deletion };
+      }
       return {
         queued: true,
-        response: Response.json({ window: await this.loadWindowFrom(txn, body.now), queued: true }),
+        window: await this.loadWindowFrom(txn, body.now),
       };
     });
     if (result.queued) {
       await this.schedulePendingSettlementAlarm();
     }
-    return result.response;
+    if (result.deletion) return accountDeletionResponse(result.deletion);
+    return Response.json({ window: result.window, queued: true });
   }
 
   private async applySettlement(body: SettleBody): Promise<WindowState> {

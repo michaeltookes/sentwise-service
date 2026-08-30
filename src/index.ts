@@ -243,10 +243,18 @@ async function settleReservedUsage(
   try {
     return (await quotaSettle(env, userId, body)).window;
   } catch (err) {
+    if (isAccountDeletionInProgressError(err)) {
+      await deferSettlementBlockedByDeletion(env, userId, body, ctx);
+      throw err;
+    }
     if (isAccountDeletionError(err)) throw err;
     try {
       return (await quotaSettle(env, userId, { ...body, now: Date.now() })).window;
     } catch (retryErr) {
+      if (isAccountDeletionInProgressError(retryErr)) {
+        await deferSettlementBlockedByDeletion(env, userId, body, ctx);
+        throw retryErr;
+      }
       if (isAccountDeletionError(retryErr)) throw retryErr;
       try {
         await quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
@@ -258,6 +266,26 @@ async function settleReservedUsage(
       }
       return optimisticSettledWindow(reservedWindow, reservationId, estimatedTokens, tokensDelta);
     }
+  }
+}
+
+async function deferSettlementBlockedByDeletion(
+  env: Env,
+  userId: string,
+  body: {
+    reservationId: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+    tokensDelta: number;
+  },
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const defer = () => quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
+  try {
+    await defer();
+  } catch (err) {
+    if (isAccountDeletionError(err)) return;
+    ctx?.waitUntil(defer().catch(() => undefined));
   }
 }
 
@@ -356,4 +384,8 @@ function isAccountDeletionError(err: unknown): err is ApiError {
     err instanceof ApiError &&
     (err.type === "account_deleted" || err.type === "account_deletion_in_progress")
   );
+}
+
+function isAccountDeletionInProgressError(err: unknown): err is ApiError {
+  return err instanceof ApiError && err.type === "account_deletion_in_progress";
 }
