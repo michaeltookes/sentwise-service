@@ -264,6 +264,65 @@ describe("AccountQuota Durable Object", () => {
     expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
   });
 
+  it("alarm retries final deletion cleanup from a persisted tombstone", async () => {
+    const uid = "do-delete-finish-alarm";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-finish-alarm-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO<WindowResult & { queued: boolean }>(uid, "/defer-settlement", {
+      now: MON + 1,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, { status: "deleted", updatedAt: MON + 2 });
+    });
+    expect(await storedKeys(stub)).toContain("window");
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    expect(await pendingSettlements(stub)).toEqual([]);
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 3 });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
+  });
+
+  it("alarm recovers a stale in-progress deletion barrier without wiping counters", async () => {
+    const uid = "do-delete-stale-barrier";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-stale-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        recoverAt: 1,
+      });
+    });
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 1 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensReserved).toBe(250);
+    expect(await storedKeys(stub)).not.toContain(ACCOUNT_DELETION_KEY);
+  });
+
   it("release rolls back only the reserved draft in the same window", async () => {
     const reserved = await callDO<ReserveResult>("do-release", "/reserve", {
       now: MON,

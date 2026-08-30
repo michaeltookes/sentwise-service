@@ -76,10 +76,10 @@ export default {
         try {
           await deleteClerkUser(userId, env);
         } catch (err) {
-          await quotaCancelAccountDeletion(env, userId).catch(() => undefined);
+          await cancelAccountDeletionBarrier(env, userId, ctx);
           throw err;
         }
-        await quotaFinishAccountDeletion(env, userId);
+        await finishAccountDeletion(env, userId, ctx);
         return new Response(null, { status: 204 });
       }
 
@@ -297,6 +297,47 @@ async function releaseReservedUsage(
       // The reservation also has a DO-side TTL, so a repeated release outage
       // cannot hold quota capacity until the weekly reset.
     }
+  }
+}
+
+async function cancelAccountDeletionBarrier(
+  env: Env,
+  userId: string,
+  ctx?: ExecutionContext,
+): Promise<void> {
+  try {
+    await retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId));
+  } catch {
+    ctx?.waitUntil(
+      retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId)).catch(() => undefined),
+    );
+    throw new ApiError(
+      503,
+      "account_deletion_recovery_failed",
+      "Could not restore account deletion state. Please try again.",
+    );
+  }
+}
+
+async function finishAccountDeletion(
+  env: Env,
+  userId: string,
+  ctx?: ExecutionContext,
+): Promise<void> {
+  try {
+    await retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId));
+  } catch {
+    ctx?.waitUntil(
+      retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId)).catch(() => undefined),
+    );
+  }
+}
+
+async function retryQuotaSideEffect<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch {
+    return operation();
   }
 }
 

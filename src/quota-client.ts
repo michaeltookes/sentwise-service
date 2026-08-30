@@ -37,6 +37,7 @@ export interface CancelAccountDeletionResult {
 }
 export interface FinishAccountDeletionResult {
   deleted: boolean;
+  cleanupPending?: boolean;
 }
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {

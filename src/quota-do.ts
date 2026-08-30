@@ -8,7 +8,7 @@
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)
-//   "account_deletion" -> deletion barrier/tombstone for stale authenticated requests
+//   "account_deletion" -> deletion barrier/tombstone plus retry metadata
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
 //   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
@@ -82,6 +82,7 @@ interface SettledSettlementMarker {
 interface AccountDeletionMarker {
   status: "deleting" | "deleted";
   updatedAt: number;
+  recoverAt?: number;
 }
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -99,6 +100,8 @@ const SETTLEMENT_RETRY_BASE_DELAY_MS = 60_000;
 const SETTLEMENT_RETRY_MAX_DELAY_MS = 15 * 60_000;
 const SETTLEMENT_MARKER_RETENTION_MS = RESERVATION_TTL_MS + SETTLEMENT_RETRY_MAX_DELAY_MS;
 const SETTLEMENT_MARKER_PRUNE_INTERVAL_MS = SETTLEMENT_RETRY_MAX_DELAY_MS;
+const ACCOUNT_DELETION_BARRIER_RECOVERY_MS = 15 * 60_000;
+const ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS = 60_000;
 
 export class AccountQuota {
   private readonly storage: DurableObjectStorage;
@@ -122,9 +125,19 @@ export class AccountQuota {
 
     const deletion = await this.loadAccountDeletionMarker();
     if (deletion) {
+      if (await this.recoverStaleDeletingMarker(deletion, Date.now())) {
+        return this.fetchWithoutDeletionPreflight(pathname, request);
+      }
       return accountDeletionResponse(deletion);
     }
 
+    return this.fetchWithoutDeletionPreflight(pathname, request);
+  }
+
+  private async fetchWithoutDeletionPreflight(
+    pathname: string,
+    request: Request,
+  ): Promise<Response> {
     switch (pathname) {
       case "/check":
         return this.handleCheck(await request.json<CheckBody>());
@@ -144,14 +157,13 @@ export class AccountQuota {
   }
 
   async alarm(): Promise<void> {
+    const now = Date.now();
     const deletion = await this.loadAccountDeletionMarker();
     if (deletion) {
-      if (deletion.status === "deleted") {
-        await this.storage.deleteAlarm();
-      }
+      await this.processAccountDeletionAlarm(deletion, now);
       return;
     }
-    await this.processPendingSettlements(Date.now());
+    await this.processPendingSettlements(now);
   }
 
   private async loadWindowFrom(storage: StorageReader, now: number): Promise<WindowState> {
@@ -357,7 +369,13 @@ export class AccountQuota {
     if (current?.status === "deleted") {
       return Response.json({ deleting: true, alreadyDeleted: true });
     }
-    await this.storage.put(ACCOUNT_DELETION_KEY, { status: "deleting", updatedAt: now });
+    const recoverAt = Date.now() + ACCOUNT_DELETION_BARRIER_RECOVERY_MS;
+    await this.scheduleAccountDeletionAlarm(recoverAt);
+    await this.storage.put(ACCOUNT_DELETION_KEY, {
+      status: "deleting",
+      updatedAt: now,
+      recoverAt,
+    });
     return Response.json({ deleting: true, alreadyDeleted: false });
   }
 
@@ -373,9 +391,17 @@ export class AccountQuota {
 
   private async handleFinishDelete(body: DeletionBody): Promise<Response> {
     const now = normalizedNow(body.now);
+    await this.scheduleAccountDeletionAlarm(now + 1);
     await this.storage.put(ACCOUNT_DELETION_KEY, { status: "deleted", updatedAt: now });
-    await this.deleteAccountDataExceptDeletionMarker();
-    return Response.json({ deleted: true });
+    try {
+      await this.deleteAccountDataExceptDeletionMarker(now);
+      return Response.json({ deleted: true, cleanupPending: false });
+    } catch {
+      await this.scheduleAccountDeletionAlarm(
+        Date.now() + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS,
+      ).catch(() => undefined);
+      return Response.json({ deleted: true, cleanupPending: true });
+    }
   }
 
   // Compatibility for existing internal callers: wipe now means final deletion,
@@ -385,7 +411,7 @@ export class AccountQuota {
     return Response.json({ wiped: true, deleted: true });
   }
 
-  private async deleteAccountDataExceptDeletionMarker(): Promise<void> {
+  private async deleteAccountDataExceptDeletionMarker(deletedAt: number): Promise<void> {
     const keys = [...(await this.storage.list()).keys()].filter(
       (key) => key !== ACCOUNT_DELETION_KEY,
     );
@@ -394,9 +420,45 @@ export class AccountQuota {
     }
     await this.storage.put(ACCOUNT_DELETION_KEY, {
       status: "deleted",
-      updatedAt: Date.now(),
+      updatedAt: deletedAt,
     });
     await this.storage.deleteAlarm();
+  }
+
+  private async processAccountDeletionAlarm(
+    marker: AccountDeletionMarker,
+    now: number,
+  ): Promise<void> {
+    if (marker.status === "deleted") {
+      try {
+        await this.deleteAccountDataExceptDeletionMarker(marker.updatedAt);
+      } catch {
+        await this.scheduleAccountDeletionAlarm(now + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS);
+      }
+      return;
+    }
+
+    if (await this.recoverStaleDeletingMarker(marker, now)) {
+      return;
+    }
+
+    await this.scheduleAccountDeletionAlarm(deletingRecoverAt(marker));
+  }
+
+  private async recoverStaleDeletingMarker(
+    marker: AccountDeletionMarker,
+    now: number,
+  ): Promise<boolean> {
+    if (marker.status !== "deleting" || deletingRecoverAt(marker) > now) {
+      return false;
+    }
+    await this.storage.delete(ACCOUNT_DELETION_KEY);
+    await this.schedulePendingSettlementAlarm();
+    return true;
+  }
+
+  private async scheduleAccountDeletionAlarm(when: number): Promise<void> {
+    await this.storage.setAlarm(new Date(Math.max(Date.now() + 1, when)));
   }
 
   private async loadAccountDeletionMarker(): Promise<AccountDeletionMarker | undefined> {
@@ -572,6 +634,10 @@ function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
     (marker.status === "deleting" || marker.status === "deleted") &&
     typeof marker.updatedAt === "number"
   );
+}
+
+function deletingRecoverAt(marker: AccountDeletionMarker): number {
+  return marker.recoverAt ?? marker.updatedAt + ACCOUNT_DELETION_BARRIER_RECOVERY_MS;
 }
 
 function accountDeletionResponse(marker: AccountDeletionMarker): Response {

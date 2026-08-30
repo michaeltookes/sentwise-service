@@ -184,6 +184,87 @@ function quotaNamespaceWithSettleFailure(now: number): {
   };
 }
 
+function quotaNamespaceWithDeletionFailures(options: {
+  cancelFailures?: number;
+  finishFailures?: number;
+}): {
+  namespace: DurableObjectNamespace;
+  cancelCalls: () => number;
+  finishCalls: () => number;
+} {
+  let deleting = false;
+  let deleted = false;
+  let cancelCalls = 0;
+  let finishCalls = 0;
+  const windowStart = mondayStartUtc(Date.now());
+  const window: WindowState = {
+    windowStart,
+    resetsAt: windowStart + WEEK_MS,
+    draftsUsed: 1,
+    tokensUsed: 5,
+  };
+  const stub = {
+    fetch: vi.fn((input: RequestInfo | URL) => {
+      const path = internalUrl(input).pathname;
+      if (path === "/begin-delete") {
+        deleting = true;
+        return Promise.resolve(Response.json({ deleting: true, alreadyDeleted: false }));
+      }
+      if (path === "/cancel-delete") {
+        cancelCalls += 1;
+        if (cancelCalls <= (options.cancelFailures ?? 0)) {
+          return Promise.reject(new Error("cancel failed"));
+        }
+        const wasDeleting = deleting;
+        deleting = false;
+        return Promise.resolve(Response.json({ cancelled: wasDeleting }));
+      }
+      if (path === "/finish-delete") {
+        finishCalls += 1;
+        if (finishCalls <= (options.finishFailures ?? 0)) {
+          return Promise.reject(new Error("finish failed"));
+        }
+        deleting = false;
+        deleted = true;
+        return Promise.resolve(Response.json({ deleted: true, cleanupPending: false }));
+      }
+      if (path === "/peek") {
+        if (deleted) {
+          return Promise.resolve(
+            Response.json(
+              { error: { type: "account_deleted", message: "This account has been deleted." } },
+              { status: 410 },
+            ),
+          );
+        }
+        if (deleting) {
+          return Promise.resolve(
+            Response.json(
+              {
+                error: {
+                  type: "account_deletion_in_progress",
+                  message: "Account deletion is in progress.",
+                },
+              },
+              { status: 409 },
+            ),
+          );
+        }
+        return Promise.resolve(Response.json({ window }));
+      }
+      return Promise.resolve(new Response("not found", { status: 404 }));
+    }),
+  };
+  return {
+    namespace: {
+      idFromName: vi.fn(() => ({}) as DurableObjectId),
+      get: vi.fn(() => stub as unknown as DurableObjectStub),
+    } as unknown as DurableObjectNamespace,
+    cancelCalls: () => cancelCalls,
+    finishCalls: () => finishCalls,
+  };
+}
+
 beforeEach(() => {
   vi.restoreAllMocks();
   mocks.verifyToken.mockReset();
@@ -457,6 +538,21 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(mocks.deleteUser).toHaveBeenCalledOnce();
   });
 
+  it("retries quota finalization after Clerk deletion succeeds", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-finalize-retry" });
+    mocks.deleteUser.mockResolvedValue(undefined);
+    const quota = quotaNamespaceWithDeletionFailures({ finishFailures: 1 });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+    expect(del.status).toBe(204);
+    expect(mocks.deleteUser).toHaveBeenCalledWith("u-del-finalize-retry");
+    expect(quota.finishCalls()).toBe(2);
+  });
+
   it("preserves usage and cancels the deletion barrier when Clerk deletion fails", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-fail" });
     mocks.getUser.mockResolvedValue(activeTrial());
@@ -478,6 +574,41 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
     expect(me.status).toBe(200);
     expect(((await me.json()) as any).quota.used).toBe(1);
+  });
+
+  it("retries deletion barrier cancellation when Clerk deletion fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-retry" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("clerk failed"), { status: 500 }));
+    const quota = quotaNamespaceWithDeletionFailures({ cancelFailures: 1 });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+    expect(del.status).toBe(502);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_failed");
+    expect(quota.cancelCalls()).toBe(2);
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), flakyQuotaEnv);
+    expect(me.status).toBe(200);
+    expect(((await me.json()) as any).quota.used).toBe(1);
+  });
+
+  it("surfaces deletion barrier cancellation failure instead of swallowing it", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-fail" });
+    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("clerk failed"), { status: 500 }));
+    const quota = quotaNamespaceWithDeletionFailures({ cancelFailures: 2 });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+    expect(del.status).toBe(503);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_recovery_failed");
+    expect(quota.cancelCalls()).toBe(2);
   });
 
   it("blocks an authenticated draft from settling after deletion starts", async () => {
