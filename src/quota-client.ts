@@ -89,3 +89,12 @@ export function quotaRelease(
 export function quotaPeek(env: Env, userId: string, body: { now: number }): Promise<WindowResult> {
   return call<WindowResult>(env, userId, "/peek", body);
 }
+
+/**
+ * Wipe all persisted state for the account (73, account deletion): usage
+ * counters, in-flight reservations, settlement markers, and the settlement
+ * alarm. Called by DELETE /v1/me before the Clerk user is deleted.
+ */
+export function quotaWipe(env: Env, userId: string): Promise<{ wiped: boolean }> {
+  return call<{ wiped: boolean }>(env, userId, "/wipe", {});
+}

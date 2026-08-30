@@ -16,6 +16,7 @@
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /peek    { now } -> { window }   (read + roll only; no rate-limit, no increment)
+//   POST /wipe    {} -> { wiped: true }   (73: delete ALL stored state + the alarm)
 
 import type { Env } from "./config";
 import {
@@ -105,6 +106,8 @@ export class AccountQuota {
         return this.handleRelease(await request.json<ReleaseBody>());
       case "/peek":
         return this.handlePeek(await request.json<PeekBody>());
+      case "/wipe":
+        return this.handleWipe();
       default:
         return new Response("not found", { status: 404 });
     }
@@ -260,6 +263,16 @@ export class AccountQuota {
     const window = await this.loadWindow(body.now);
     await this.storage.put("window", window);
     return Response.json({ window });
+  }
+
+  // 73: account deletion. Erase every persisted key (usage counters, in-flight
+  // reservations, settlement markers) and cancel the pending settlement alarm, so
+  // nothing survives for a deleted account. A subsequent request rolls a fresh,
+  // zeroed window. Nothing here was content to begin with (counters only).
+  private async handleWipe(): Promise<Response> {
+    await this.storage.deleteAll();
+    await this.storage.deleteAlarm();
+    return Response.json({ wiped: true });
   }
 
   private async loadMutationWindow(

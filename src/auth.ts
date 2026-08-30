@@ -3,6 +3,7 @@ import type { Env } from "./config";
 import { ApiError } from "./errors";
 import { computeTrial, type TrialState } from "./trial";
 import { parseQuotaOverride, type QuotaOverride } from "./metering";
+import { deriveSubscription, type Subscription } from "./subscription";
 
 export interface AuthedUser {
   userId: string;
@@ -12,6 +13,9 @@ export interface AccountInfo {
   userId: string;
   email: string | null;
   trial: TrialState;
+  // 73: the account's subscription. Placeholder derived from the trial until 56c
+  // writes privateMetadata.subscription; built explicitly, safe to expose on /v1/me.
+  subscription: Subscription;
   // 56b: per-account limit overrides from privateMetadata.quota, read on the SAME
   // Clerk getUser as the trial (no extra Clerk round-trip). Not exposed on /v1/me.
   quotaOverride: QuotaOverride;
@@ -100,17 +104,15 @@ export async function resolveAccount(
   const email = primaryEmail(user);
   const quotaOverride = parseQuotaOverride(meta.quota);
 
-  if (!startedAt) {
-    // /v1/me before the trial has started (no draft yet): report a not-yet-started trial.
-    return {
-      userId,
-      email,
-      trial: { startedAt: "", endsAt: "", active: false },
-      quotaOverride,
-    };
-  }
+  // Report a not-yet-started trial when there's no stamp yet (viewing before the
+  // first draft); otherwise compute it. Subscription is derived on the SAME
+  // getUser — no extra Clerk round-trip (73).
+  const trial: TrialState = startedAt
+    ? computeTrial(startedAt)
+    : { startedAt: "", endsAt: "", active: false };
+  const subscription = deriveSubscription(trial, meta.subscription);
 
-  return { userId, email, trial: computeTrial(startedAt), quotaOverride };
+  return { userId, email, trial, subscription, quotaOverride };
 }
 
 /** Enforce the trial: throw 402 when expired. Returns the resolved account. */
@@ -123,6 +125,36 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
     });
   }
   return account;
+}
+
+/**
+ * Delete the Clerk user (73, account deletion). Idempotent: a user that is
+ * already gone (Clerk 404) resolves successfully so DELETE /v1/me stays 204 on
+ * retry. Any other Clerk failure becomes a user-safe 502 — no upstream detail
+ * leaks, and (per the privacy guard) nothing is logged.
+ *
+ * The caller wipes the account's Durable Object BEFORE calling this, so a Clerk
+ * failure here leaves a retryable state and a DO failure never orphans a deleted
+ * Clerk user.
+ */
+export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
+  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  try {
+    await clerk.users.deleteUser(userId);
+  } catch (err) {
+    if (isClerkNotFound(err)) return; // already deleted — idempotent success
+    throw new ApiError(
+      502,
+      "account_deletion_failed",
+      "Could not delete your account. Please try again.",
+    );
+  }
+}
+
+/** True when a Clerk error reports the resource is gone (HTTP 404). */
+function isClerkNotFound(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  return (err as { status?: number }).status === 404;
 }
 
 interface ClerkUserLike {

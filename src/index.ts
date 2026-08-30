@@ -1,4 +1,4 @@
-import { authenticate, requireActiveTrial, resolveAccount } from "./auth";
+import { authenticate, deleteClerkUser, requireActiveTrial, resolveAccount } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
 import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, type Env } from "./config";
@@ -16,6 +16,7 @@ import {
   quotaRelease,
   quotaReserve,
   quotaSettle,
+  quotaWipe,
 } from "./quota-client";
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
@@ -27,10 +28,11 @@ export { AccountQuota } from "./quota-do";
  * Sentwise managed-inference Worker (backlog 56a + 56b).
  *
  * Routes:
- *   GET  /healthz       -> liveness, no auth
- *   GET  /v1/me         -> { userId, email, trial, quota } for the account display
- *   POST /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
- *   GET  /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
+ *   GET    /healthz       -> liveness, no auth
+ *   GET    /v1/me         -> { userId, email, trial, subscription, quota } for account display
+ *   DELETE /v1/me         -> delete the account (wipe usage DO, then delete the Clerk user) (73)
+ *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
+ *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
  * only state is counters, timestamps, and random reservation IDs — trial in Clerk,
@@ -61,8 +63,20 @@ export default {
           userId: account.userId,
           email: account.email,
           trial: account.trial,
+          subscription: account.subscription,
           quota: buildQuota(window, limits),
         });
+      }
+
+      if (pathname === "/v1/me" && request.method === "DELETE") {
+        const { userId } = await authenticate(request, env);
+        // 73: wipe the account's usage Durable Object FIRST, then delete the Clerk
+        // user. This order means a Clerk failure leaves a retryable state and a DO
+        // failure never orphans a deleted user. deleteClerkUser is idempotent, so a
+        // retry after the Clerk user is already gone still succeeds.
+        await quotaWipe(env, userId);
+        await deleteClerkUser(userId, env);
+        return new Response(null, { status: 204 });
       }
 
       if (pathname === "/v1/draft" && request.method === "POST") {
