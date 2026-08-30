@@ -15,6 +15,7 @@ const clerkMocks = vi.hoisted(() => ({
   updateUserMetadata: vi.fn(),
   deleteUser: vi.fn(),
   clerkUserExists: vi.fn(),
+  deleteClerkUser: vi.fn(),
 }));
 
 vi.mock("@clerk/backend", () => ({
@@ -30,6 +31,7 @@ vi.mock("@clerk/backend", () => ({
 
 vi.mock("../src/auth", () => ({
   clerkUserExists: clerkMocks.clerkUserExists,
+  deleteClerkUser: clerkMocks.deleteClerkUser,
 }));
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
@@ -76,6 +78,8 @@ beforeEach(() => {
   clerkMocks.deleteUser.mockReset();
   clerkMocks.clerkUserExists.mockReset();
   clerkMocks.clerkUserExists.mockRejectedValue(new Error("clerk unavailable"));
+  clerkMocks.deleteClerkUser.mockReset();
+  clerkMocks.deleteClerkUser.mockRejectedValue(new Error("clerk unavailable"));
 });
 
 const hardLimits: ResolvedLimits = {
@@ -684,7 +688,7 @@ describe("AccountQuota Durable Object", () => {
     expect(await alarmTime(stub)).not.toBeNull();
   });
 
-  it("alarm keeps an expired deletion barrier when Clerk still has the user", async () => {
+  it("alarm keeps an expired deletion barrier when recovery deletion fails", async () => {
     const uid = "do-delete-expired-barrier-active-user";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
     await callDO<ReserveResult>(uid, "/reserve", {
@@ -702,12 +706,14 @@ describe("AccountQuota Durable Object", () => {
       });
     });
     clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockRejectedValue(new Error("delete failed"));
 
     await runInDurableObject(stub, async (instance) => {
       await (instance as { alarm: () => Promise<void> }).alarm();
     });
 
     expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
     expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
     const blocked = await callDOResponse(uid, "/peek", { now: MON + 2 });
     expect(blocked.status).toBe(409);
@@ -753,6 +759,7 @@ describe("AccountQuota Durable Object", () => {
       });
       return Promise.resolve(true);
     });
+    clerkMocks.deleteClerkUser.mockRejectedValue(new Error("delete failed"));
 
     const peek = await quota.fetch(
       new Request("https://account-quota.internal/peek", {
@@ -785,10 +792,12 @@ describe("AccountQuota Durable Object", () => {
       });
     });
     clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockRejectedValue(new Error("delete failed"));
 
     const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
 
     expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
     expect(peek.status).toBe(409);
     expect(((await peek.json()) as any).error.type).toBe("account_deletion_in_progress");
     expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
@@ -800,6 +809,67 @@ describe("AccountQuota Durable Object", () => {
     expect(marker?.attempts?.[0]?.expiresAt).toEqual(expect.any(Number));
     expect(marker?.attempts?.[0]?.expiresAt).toBeGreaterThan(MON + 1);
     expect(marker?.attempts?.[0]).not.toHaveProperty("liveVerifiedAt");
+  });
+
+  it("alarm retries deletion for an expired barrier when Clerk still has the user", async () => {
+    const uid = "do-delete-expired-barrier-retry-delete";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-retry-delete-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockResolvedValue(undefined);
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
+  });
+
+  it("quota requests retry deletion for an expired barrier when Clerk still has the user", async () => {
+    const uid = "do-delete-expired-barrier-request-retry-delete";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-request-retry-delete-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.clerkUserExists.mockResolvedValue(true);
+    clerkMocks.deleteClerkUser.mockResolvedValue(undefined);
+
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+
+    expect(clerkMocks.clerkUserExists).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(clerkMocks.deleteClerkUser).toHaveBeenCalledWith(uid, expect.any(Object));
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
   });
 
   it("keeps the deletion barrier when Clerk existence lookup fails", async () => {

@@ -155,7 +155,9 @@ If the Clerk delete times out or fails at the transport layer, the outcome is un
 may still have committed the deletion. In that case the Worker returns
 **`503 account_deletion_status_unknown`** and deliberately leaves the Durable Object deletion barrier
 active. The Durable Object alarm continues checking Clerk; it finalizes deletion if Clerk confirms
-the user is gone, and a user with a still-valid session can retry `DELETE /v1/me`.
+the user is gone, retries the idempotent Clerk delete when the user still exists, and leaves the
+barrier active for another alarm pass if Clerk cannot be reached. A user with a still-valid session
+can also retry `DELETE /v1/me`.
 
 The call is **idempotent**: if the Clerk user is already gone it still returns `204`.
 

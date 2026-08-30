@@ -24,7 +24,7 @@
 //   POST /wipe    {} -> compatibility alias for /finish-delete
 
 import { ACCOUNT_DELETION_BARRIER_TIMEOUT_MS, type Env } from "./config";
-import { clerkUserExists } from "./auth";
+import { clerkUserExists, deleteClerkUser } from "./auth";
 import { jsonError } from "./errors";
 import {
   activeReservations,
@@ -607,20 +607,37 @@ export class AccountQuota {
       return marker;
     }
 
-    if (!userExists) {
-      const tombstone: AccountDeletionMarker = { status: "deleted", updatedAt: now };
-      await this.storage.put(ACCOUNT_DELETION_KEY, tombstone);
-      await this.scheduleAccountDeletionAlarm(now + 1).catch(() => undefined);
-      try {
-        await this.deleteAccountDataExceptDeletionMarker(now);
-      } catch {
-        await this.scheduleAccountDeletionAlarm(
-          now + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS,
-        ).catch(() => undefined);
-      }
-      return tombstone;
+    if (!userExists) return this.finishRecoveredAccountDeletion(now);
+
+    try {
+      await deleteClerkUser(this.userId, this.env);
+    } catch {
+      await this.scheduleAccountDeletionAlarm(
+        now + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS,
+      ).catch(() => undefined);
+      return this.renewExpiredDeletionBarrier(now);
     }
 
+    return this.finishRecoveredAccountDeletion(now);
+  }
+
+  private async finishRecoveredAccountDeletion(now: number): Promise<AccountDeletionMarker> {
+    const tombstone: AccountDeletionMarker = { status: "deleted", updatedAt: now };
+    await this.storage.put(ACCOUNT_DELETION_KEY, tombstone);
+    await this.scheduleAccountDeletionAlarm(now + 1).catch(() => undefined);
+    try {
+      await this.deleteAccountDataExceptDeletionMarker(now);
+    } catch {
+      await this.scheduleAccountDeletionAlarm(
+        now + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS,
+      ).catch(() => undefined);
+    }
+    return tombstone;
+  }
+
+  private async renewExpiredDeletionBarrier(
+    now: number,
+  ): Promise<AccountDeletionMarker | undefined> {
     return this.storage.transaction(async (txn) => {
       const current = await this.loadAccountDeletionMarkerFrom(txn);
       if (current?.status !== "deleting") return current;

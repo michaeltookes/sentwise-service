@@ -55,7 +55,8 @@ export const DEFAULT_MAX_TOKENS = 4096;
 
 // Bound the pre-Clerk deletion barrier. The Worker gives the Clerk delete call a
 // shorter timeout; the Durable Object alarm uses the longer barrier timeout to
-// re-check the Clerk outcome, finalizing only after Clerk confirms the user is gone.
+// re-check the Clerk outcome, retrying deletion for still-present users and
+// finalizing only after Clerk confirms the user is gone.
 export const CLERK_DELETE_TIMEOUT_MS = 10_000;
 export const ACCOUNT_DELETION_BARRIER_TIMEOUT_MS = 60_000;
 
