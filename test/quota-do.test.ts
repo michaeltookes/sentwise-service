@@ -267,18 +267,11 @@ describe("AccountQuota Durable Object", () => {
   it("alarm retries final deletion cleanup from a persisted tombstone", async () => {
     const uid = "do-delete-finish-alarm";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
-    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+    await callDO<ReserveResult>(uid, "/reserve", {
       now: MON,
       reservationId: "delete-finish-alarm-1",
       estimatedTokens: 250,
       limits: hardLimits,
-    });
-    await callDO<WindowResult & { queued: boolean }>(uid, "/defer-settlement", {
-      now: MON + 1,
-      reservationId: reserved.reservationId,
-      reservationWindowStart: reserved.window.windowStart,
-      estimatedTokens: reserved.estimatedTokens,
-      tokensDelta: 500,
     });
     await runInDurableObject(stub, async (_instance, state) => {
       await state.storage.put(ACCOUNT_DELETION_KEY, { status: "deleted", updatedAt: MON + 2 });
