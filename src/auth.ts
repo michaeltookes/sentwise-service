@@ -160,30 +160,40 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
  * requests cannot mutate quota state while Clerk deletion is in progress.
  */
 export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
-  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CLERK_DELETE_TIMEOUT_MS);
   try {
-    await withTimeout(clerk.users.deleteUser(userId), CLERK_DELETE_TIMEOUT_MS);
-  } catch (err) {
-    if (err instanceof ClerkDeletionOutcomeUnknownError) throw err;
-    if (isClerkNotFound(err)) return; // already deleted — idempotent success
+    const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (res.ok || res.status === 404) return;
     throw new ApiError(
       502,
       "account_deletion_failed",
       "Could not delete your account. Please try again.",
     );
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (isAbortError(err)) throw new ClerkDeletionOutcomeUnknownError();
+    throw new ApiError(
+      502,
+      "account_deletion_failed",
+      "Could not delete your account. Please try again.",
+    );
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  return Promise.race([
-    promise,
-    new Promise<never>((_resolve, reject) => {
-      timeout = setTimeout(() => reject(new ClerkDeletionOutcomeUnknownError()), timeoutMs);
-    }),
-  ]).finally(() => {
-    if (timeout !== undefined) clearTimeout(timeout);
-  });
+function isAbortError(err: unknown): boolean {
+  return (
+    typeof err === "object" && err !== null && (err as { name?: unknown }).name === "AbortError"
+  );
 }
 
 /** True when a Clerk error reports the resource is gone (HTTP 404). */

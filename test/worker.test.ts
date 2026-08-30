@@ -51,6 +51,21 @@ function anthropicOk(text = "drafted") {
   );
 }
 
+function clerkDeleteResponse(status = 200) {
+  return new Response(JSON.stringify({ deleted: status >= 200 && status < 300 }), { status });
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string" || input instanceof URL) return String(input);
+  return input.url;
+}
+
+function isClerkDelete(input: RequestInfo | URL, init?: RequestInit): boolean {
+  return (
+    requestUrl(input).startsWith("https://api.clerk.com/v1/users/") && init?.method === "DELETE"
+  );
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -531,16 +546,20 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     // Seed some usage first so the wipe is observable.
     mocks.verifyToken.mockResolvedValue({ sub: "u-del" });
     mocks.getUser.mockResolvedValue(activeTrial());
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
     const drafted = await worker.fetch(draftReq("u-del"), env);
     expect(drafted.status).toBe(200);
     expect(((await drafted.json()) as any).quota.used).toBe(1);
 
-    mocks.deleteUser.mockResolvedValue(undefined);
+    fetchMock.mockResolvedValue(clerkDeleteResponse());
     const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
     expect(del.status).toBe(204);
     expect(await del.text()).toBe("");
-    expect(mocks.deleteUser).toHaveBeenCalledWith("u-del");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "https://api.clerk.com/v1/users/u-del",
+      expect.objectContaining({ method: "DELETE" }),
+    );
 
     // Stale authenticated calls after deletion cannot recreate a fresh quota window.
     mocks.getUser.mockResolvedValue(activeTrial());
@@ -551,15 +570,17 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
 
   it("is idempotent — a Clerk user already gone still returns 204", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-gone" });
-    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("not found"), { status: 404 }));
+    const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse(404));
+    vi.stubGlobal("fetch", fetchMock);
     const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
     expect(del.status).toBe(204);
-    expect(mocks.deleteUser).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("retries quota finalization after Clerk deletion succeeds", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-finalize-retry" });
-    mocks.deleteUser.mockResolvedValue(undefined);
+    const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse());
+    vi.stubGlobal("fetch", fetchMock);
     const quota = quotaNamespaceWithDeletionFailures({ finishFailures: 1 });
     const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
 
@@ -568,21 +589,23 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
       flakyQuotaEnv,
     );
     expect(del.status).toBe(204);
-    expect(mocks.deleteUser).toHaveBeenCalledWith("u-del-finalize-retry");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.clerk.com/v1/users/u-del-finalize-retry",
+      expect.objectContaining({ method: "DELETE" }),
+    );
     expect(quota.finishCalls()).toBe(2);
   });
 
   it("preserves usage and cancels the deletion barrier when Clerk deletion fails", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-fail" });
     mocks.getUser.mockResolvedValue(activeTrial());
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
     const drafted = await worker.fetch(draftReq("u-del-fail"), env);
     expect(drafted.status).toBe(200);
     expect(((await drafted.json()) as any).quota.used).toBe(1);
 
-    mocks.deleteUser.mockRejectedValue(
-      Object.assign(new Error("clerk exploded: secret-ish detail"), { status: 500 }),
-    );
+    fetchMock.mockResolvedValue(clerkDeleteResponse(500));
     const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
     expect(del.status).toBe(502);
     const body = (await del.json()) as any;
@@ -598,7 +621,7 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
   it("retries deletion barrier cancellation when Clerk deletion fails", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-retry" });
     mocks.getUser.mockResolvedValue(activeTrial());
-    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("clerk failed"), { status: 500 }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(clerkDeleteResponse(500)));
     const quota = quotaNamespaceWithDeletionFailures({ cancelFailures: 1 });
     const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
 
@@ -617,7 +640,7 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
 
   it("surfaces deletion barrier cancellation failure instead of swallowing it", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-fail" });
-    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("clerk failed"), { status: 500 }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(clerkDeleteResponse(500)));
     const quota = quotaNamespaceWithDeletionFailures({ cancelFailures: 2 });
     const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
 
@@ -632,7 +655,7 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
 
   it("surfaces deletion barrier cancellation mismatch when the DO leaves the barrier active", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-mismatch" });
-    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("clerk failed"), { status: 500 }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(clerkDeleteResponse(500)));
     const quota = quotaNamespaceWithDeletionFailures({ cancelMismatch: true });
     const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
 
@@ -653,10 +676,24 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
       const deleteStarted = deferred<void>();
       mocks.verifyToken.mockResolvedValue({ sub: "u-del-timeout" });
       mocks.getUser.mockResolvedValue(activeTrial());
-      mocks.deleteUser.mockImplementation(() => {
-        deleteStarted.resolve();
-        return new Promise(() => undefined);
-      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+          deleteStarted.resolve();
+          return new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal?.aborted) {
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+              return;
+            }
+            signal?.addEventListener(
+              "abort",
+              () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              { once: true },
+            );
+          });
+        }),
+      );
 
       const deletion = worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
       await deleteStarted.promise;
@@ -676,13 +713,13 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
   it("blocks an authenticated draft from settling after deletion starts", async () => {
     const started = deferred<void>();
     const upstream = deferred<Response>();
-    const fetchMock = vi.fn().mockImplementation(() => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isClerkDelete(input, init)) return Promise.resolve(clerkDeleteResponse());
       started.resolve();
       return upstream.promise;
     });
     vi.stubGlobal("fetch", fetchMock);
     mocks.getUser.mockResolvedValue(activeTrial());
-    mocks.deleteUser.mockResolvedValue(undefined);
 
     const draft = worker.fetch(draftReq("u-del-race"), env);
     await started.promise;
@@ -694,24 +731,24 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     const completedDraft = await draft;
     expect(completedDraft.status).toBe(410);
     expect(((await completedDraft.json()) as any).error.type).toBe("account_deleted");
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("defers a settlement blocked by a deletion that is later canceled", async () => {
     const started = deferred<void>();
     const upstream = deferred<Response>();
-    const fetchMock = vi.fn().mockImplementation(() => {
+    const clerkDelete = deferred<Response>();
+    const deleteStarted = deferred<void>();
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isClerkDelete(input, init)) {
+        deleteStarted.resolve();
+        return clerkDelete.promise;
+      }
       started.resolve();
       return upstream.promise;
     });
     vi.stubGlobal("fetch", fetchMock);
-    const clerkDelete = deferred<void>();
-    const deleteStarted = deferred<void>();
     mocks.getUser.mockResolvedValue(activeTrial());
-    mocks.deleteUser.mockImplementation(() => {
-      deleteStarted.resolve();
-      return clerkDelete.promise;
-    });
 
     const draft = worker.fetch(draftReq("u-del-settle-cancel"), env);
     await started.promise;
@@ -723,7 +760,7 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(completedDraft.status).toBe(409);
     expect(((await completedDraft.json()) as any).error.type).toBe("account_deletion_in_progress");
 
-    clerkDelete.reject(Object.assign(new Error("clerk failed"), { status: 500 }));
+    clerkDelete.resolve(clerkDeleteResponse(500));
     const failedDeletion = await deletion;
     expect(failedDeletion.status).toBe(502);
 
