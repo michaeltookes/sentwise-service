@@ -133,9 +133,8 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
  * retry. Any other Clerk failure becomes a user-safe 502 — no upstream detail
  * leaks, and (per the privacy guard) nothing is logged.
  *
- * The caller wipes the account's Durable Object BEFORE calling this, so a Clerk
- * failure here leaves a retryable state and a DO failure never orphans a deleted
- * Clerk user.
+ * The caller wraps this with the AccountQuota deletion barrier so in-flight
+ * requests cannot mutate quota state while Clerk deletion is in progress.
  */
 export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });

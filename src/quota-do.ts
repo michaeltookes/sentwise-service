@@ -8,6 +8,7 @@
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)
+//   "account_deletion" -> deletion barrier/tombstone for stale authenticated requests
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
 //   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
@@ -16,9 +17,13 @@
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /peek    { now } -> { window }   (read + roll only; no rate-limit, no increment)
-//   POST /wipe    {} -> { wiped: true }   (73: delete ALL stored state + the alarm)
+//   POST /begin-delete  { now } -> block future quota reads/mutations without wiping counters
+//   POST /cancel-delete { now } -> remove an in-progress barrier after Clerk deletion fails
+//   POST /finish-delete { now } -> wipe counters and keep a deleted tombstone
+//   POST /wipe    {} -> compatibility alias for /finish-delete
 
 import type { Env } from "./config";
+import { jsonError } from "./errors";
 import {
   activeReservations,
   pruneStamps,
@@ -59,6 +64,9 @@ interface ReleaseBody {
 interface PeekBody {
   now: number;
 }
+interface DeletionBody {
+  now?: number;
+}
 interface PendingSettlement {
   reservationId: string;
   reservationWindowStart: number;
@@ -71,10 +79,18 @@ interface PendingSettlement {
 interface SettledSettlementMarker {
   settledAt: number;
 }
+interface AccountDeletionMarker {
+  status: "deleting" | "deleted";
+  updatedAt: number;
+}
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
 }
+interface StorageWriter extends StorageReader {
+  put<T = unknown>(key: string, value: T): Promise<void>;
+}
 
+const ACCOUNT_DELETION_KEY = "account_deletion";
 const LEGACY_PENDING_SETTLEMENTS_KEY = "pending_settlements";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
 const SETTLED_SETTLEMENT_KEY_PREFIX = "settled_settlement:";
@@ -94,6 +110,22 @@ export class AccountQuota {
   async fetch(request: Request): Promise<Response> {
     const { pathname } = new URL(request.url);
     switch (pathname) {
+      case "/begin-delete":
+        return this.handleBeginDelete(await request.json<DeletionBody>());
+      case "/cancel-delete":
+        return this.handleCancelDelete();
+      case "/finish-delete":
+        return this.handleFinishDelete(await request.json<DeletionBody>());
+      case "/wipe":
+        return this.handleWipe();
+    }
+
+    const deletion = await this.loadAccountDeletionMarker();
+    if (deletion) {
+      return accountDeletionResponse(deletion);
+    }
+
+    switch (pathname) {
       case "/check":
         return this.handleCheck(await request.json<CheckBody>());
       case "/reserve":
@@ -106,80 +138,102 @@ export class AccountQuota {
         return this.handleRelease(await request.json<ReleaseBody>());
       case "/peek":
         return this.handlePeek(await request.json<PeekBody>());
-      case "/wipe":
-        return this.handleWipe();
       default:
         return new Response("not found", { status: 404 });
     }
   }
 
   async alarm(): Promise<void> {
+    const deletion = await this.loadAccountDeletionMarker();
+    if (deletion) {
+      if (deletion.status === "deleted") {
+        await this.storage.deleteAlarm();
+      }
+      return;
+    }
     await this.processPendingSettlements(Date.now());
   }
 
-  private async loadWindow(now: number): Promise<WindowState> {
-    const stored = await this.storage.get<WindowState>("window");
+  private async loadWindowFrom(storage: StorageReader, now: number): Promise<WindowState> {
+    const stored = await storage.get<WindowState>("window");
     return rollWindow(stored, now);
   }
 
   private async handleCheck(body: CheckBody): Promise<Response> {
-    const window = await this.loadWindow(body.now);
+    return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return accountDeletionResponse(deletion);
 
-    let stamps = pruneStamps((await this.storage.get<number[]>("rate")) ?? [], body.now);
-    let allowed = true;
-    let retryAfterSeconds = 0;
-    if (stamps.length >= body.rateLimitPerMin) {
-      allowed = false;
-      const oldest = stamps[0];
-      retryAfterSeconds = Math.max(1, Math.ceil((oldest + RATE_WINDOW_MS - body.now) / 1000));
-    } else {
-      stamps = [...stamps, body.now];
-    }
+      const window = await this.loadWindowFrom(txn, body.now);
+      let stamps = pruneStamps((await txn.get<number[]>("rate")) ?? [], body.now);
+      let allowed = true;
+      let retryAfterSeconds = 0;
+      if (stamps.length >= body.rateLimitPerMin) {
+        allowed = false;
+        const oldest = stamps[0];
+        retryAfterSeconds = Math.max(1, Math.ceil((oldest + RATE_WINDOW_MS - body.now) / 1000));
+      } else {
+        stamps = [...stamps, body.now];
+      }
 
-    await this.storage.put("window", window);
-    await this.storage.put("rate", stamps);
-    return Response.json({ allowed, retryAfterSeconds, window });
+      await txn.put("window", window);
+      await txn.put("rate", stamps);
+      return Response.json({ allowed, retryAfterSeconds, window });
+    });
   }
 
   private async handleReserve(body: ReserveBody): Promise<Response> {
-    const window = await this.loadWindow(body.now);
-    const estimatedTokens = nonNegativeInt(body.estimatedTokens);
-    if (
-      body.limits.enforcement === "hard" &&
-      wouldExceedQuota(window, body.limits, 1, estimatedTokens)
-    ) {
-      await this.storage.put("window", window);
+    return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return accountDeletionResponse(deletion);
+
+      const window = await this.loadWindowFrom(txn, body.now);
+      const estimatedTokens = nonNegativeInt(body.estimatedTokens);
+      if (
+        body.limits.enforcement === "hard" &&
+        wouldExceedQuota(window, body.limits, 1, estimatedTokens)
+      ) {
+        await txn.put("window", window);
+        return Response.json({
+          reserved: false,
+          blockedByQuota: true,
+          reservationId: body.reservationId,
+          estimatedTokens,
+          window,
+        });
+      }
+
+      window.draftsUsed += 1;
+      window.tokensReserved = reservedTokens(window) + estimatedTokens;
+      window.activeReservations = [
+        ...activeReservations(window),
+        {
+          id: body.reservationId,
+          estimatedTokens,
+          expiresAt: body.now + RESERVATION_TTL_MS,
+        },
+      ];
+      await txn.put("window", window);
       return Response.json({
-        reserved: false,
-        blockedByQuota: true,
+        reserved: true,
+        blockedByQuota: false,
         reservationId: body.reservationId,
         estimatedTokens,
         window,
       });
-    }
-
-    window.draftsUsed += 1;
-    window.tokensReserved = reservedTokens(window) + estimatedTokens;
-    window.activeReservations = [
-      ...activeReservations(window),
-      {
-        id: body.reservationId,
-        estimatedTokens,
-        expiresAt: body.now + RESERVATION_TTL_MS,
-      },
-    ];
-    await this.storage.put("window", window);
-    return Response.json({
-      reserved: true,
-      blockedByQuota: false,
-      reservationId: body.reservationId,
-      estimatedTokens,
-      window,
     });
   }
 
   private async handleSettle(body: SettleBody): Promise<Response> {
-    const window = await this.applySettlement(body);
+    let window: WindowState;
+    try {
+      window = await this.applySettlement(body);
+    } catch (err) {
+      if (err instanceof AccountDeletionBlockedError) {
+        return accountDeletionResponse(err.marker);
+      }
+      throw err;
+    }
     await this.maybePruneSettledSettlementMarkers(body.now).catch(() => undefined);
     return Response.json({ window });
   }
@@ -188,20 +242,37 @@ export class AccountQuota {
     if (!body.reservationId || body.reservationWindowStart === undefined) {
       return new Response("reservation id and window required", { status: 400 });
     }
-    await this.upsertPendingSettlement({
-      reservationId: body.reservationId,
-      reservationWindowStart: nonNegativeInt(body.reservationWindowStart),
-      estimatedTokens: nonNegativeInt(body.estimatedTokens),
-      tokensDelta: nonNegativeInt(body.tokensDelta),
-      attempts: 0,
-      createdAt: body.now,
-      nextAttemptAt: body.now,
+    const result = await this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return { queued: false, response: accountDeletionResponse(deletion) };
+
+      await this.putPendingSettlement(txn, {
+        reservationId: body.reservationId!,
+        reservationWindowStart: nonNegativeInt(body.reservationWindowStart),
+        estimatedTokens: nonNegativeInt(body.estimatedTokens),
+        tokensDelta: nonNegativeInt(body.tokensDelta),
+        attempts: 0,
+        createdAt: body.now,
+        nextAttemptAt: body.now,
+      });
+      return {
+        queued: true,
+        response: Response.json({ window: await this.loadWindowFrom(txn, body.now), queued: true }),
+      };
     });
-    return Response.json({ window: await this.loadWindow(body.now), queued: true });
+    if (result.queued) {
+      await this.schedulePendingSettlementAlarm();
+    }
+    return result.response;
   }
 
   private async applySettlement(body: SettleBody): Promise<WindowState> {
     return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) {
+        throw new AccountDeletionBlockedError(deletion);
+      }
+
       const { window, appliesToStoredReservation } = await this.loadMutationWindowFrom(
         txn,
         body.now,
@@ -238,48 +309,105 @@ export class AccountQuota {
   }
 
   private async handleRelease(body: ReleaseBody): Promise<Response> {
-    const { window, appliesToStoredReservation } = await this.loadMutationWindow(
-      body.now,
-      body.reservationWindowStart,
-    );
-    if (appliesToStoredReservation) {
-      const active = activeReservations(window);
-      const reservation = active.find((r) => r.id === body.reservationId);
-      if (!body.reservationId || reservation) {
-        const estimatedTokens =
-          reservation?.estimatedTokens ?? nonNegativeInt(body.estimatedTokens);
-        window.draftsUsed = Math.max(0, window.draftsUsed - 1);
-        window.tokensReserved = Math.max(0, reservedTokens(window) - estimatedTokens);
-        if (body.reservationId) {
-          window.activeReservations = active.filter((r) => r.id !== body.reservationId);
+    return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return accountDeletionResponse(deletion);
+
+      const { window, appliesToStoredReservation } = await this.loadMutationWindowFrom(
+        txn,
+        body.now,
+        body.reservationWindowStart,
+      );
+      if (appliesToStoredReservation) {
+        const active = activeReservations(window);
+        const reservation = active.find((r) => r.id === body.reservationId);
+        if (!body.reservationId || reservation) {
+          const estimatedTokens =
+            reservation?.estimatedTokens ?? nonNegativeInt(body.estimatedTokens);
+          window.draftsUsed = Math.max(0, window.draftsUsed - 1);
+          window.tokensReserved = Math.max(0, reservedTokens(window) - estimatedTokens);
+          if (body.reservationId) {
+            window.activeReservations = active.filter((r) => r.id !== body.reservationId);
+          }
         }
       }
-    }
-    await this.storage.put("window", window);
-    return Response.json({ window });
+      await txn.put("window", window);
+      return Response.json({ window });
+    });
   }
 
   private async handlePeek(body: PeekBody): Promise<Response> {
-    const window = await this.loadWindow(body.now);
-    await this.storage.put("window", window);
-    return Response.json({ window });
+    return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return accountDeletionResponse(deletion);
+
+      const window = await this.loadWindowFrom(txn, body.now);
+      await txn.put("window", window);
+      return Response.json({ window });
+    });
   }
 
-  // 73: account deletion. Erase every persisted key (usage counters, in-flight
-  // reservations, settlement markers) and cancel the pending settlement alarm, so
-  // nothing survives for a deleted account. A subsequent request rolls a fresh,
-  // zeroed window. Nothing here was content to begin with (counters only).
+  // 73: account deletion is two-phase. Begin sets a barrier before Clerk deletion
+  // so authenticated in-flight requests cannot mutate or recreate quota state.
+  // Finish erases usage data and keeps a tiny tombstone that blocks stale tokens
+  // after Clerk deletion has succeeded.
+  private async handleBeginDelete(body: DeletionBody): Promise<Response> {
+    const now = normalizedNow(body.now);
+    const current = await this.loadAccountDeletionMarker();
+    if (current?.status === "deleted") {
+      return Response.json({ deleting: true, alreadyDeleted: true });
+    }
+    await this.storage.put(ACCOUNT_DELETION_KEY, { status: "deleting", updatedAt: now });
+    return Response.json({ deleting: true, alreadyDeleted: false });
+  }
+
+  private async handleCancelDelete(): Promise<Response> {
+    const current = await this.loadAccountDeletionMarker();
+    if (current?.status === "deleting") {
+      await this.storage.delete(ACCOUNT_DELETION_KEY);
+      await this.schedulePendingSettlementAlarm();
+      return Response.json({ cancelled: true });
+    }
+    return Response.json({ cancelled: false });
+  }
+
+  private async handleFinishDelete(body: DeletionBody): Promise<Response> {
+    const now = normalizedNow(body.now);
+    await this.storage.put(ACCOUNT_DELETION_KEY, { status: "deleted", updatedAt: now });
+    await this.deleteAccountDataExceptDeletionMarker();
+    return Response.json({ deleted: true });
+  }
+
+  // Compatibility for existing internal callers: wipe now means final deletion,
+  // not "reset quota and allow a fresh window".
   private async handleWipe(): Promise<Response> {
-    await this.storage.deleteAll();
-    await this.storage.deleteAlarm();
-    return Response.json({ wiped: true });
+    await this.handleFinishDelete({ now: Date.now() });
+    return Response.json({ wiped: true, deleted: true });
   }
 
-  private async loadMutationWindow(
-    now: number,
-    reservationWindowStart: number | undefined,
-  ): Promise<{ window: WindowState; appliesToStoredReservation: boolean }> {
-    return this.loadMutationWindowFrom(this.storage, now, reservationWindowStart);
+  private async deleteAccountDataExceptDeletionMarker(): Promise<void> {
+    const keys = [...(await this.storage.list()).keys()].filter(
+      (key) => key !== ACCOUNT_DELETION_KEY,
+    );
+    if (keys.length > 0) {
+      await this.storage.delete(keys);
+    }
+    await this.storage.put(ACCOUNT_DELETION_KEY, {
+      status: "deleted",
+      updatedAt: Date.now(),
+    });
+    await this.storage.deleteAlarm();
+  }
+
+  private async loadAccountDeletionMarker(): Promise<AccountDeletionMarker | undefined> {
+    return this.loadAccountDeletionMarkerFrom(this.storage);
+  }
+
+  private async loadAccountDeletionMarkerFrom(
+    storage: StorageReader,
+  ): Promise<AccountDeletionMarker | undefined> {
+    const marker = await storage.get<unknown>(ACCOUNT_DELETION_KEY);
+    return normalizeAccountDeletionMarker(marker);
   }
 
   private async loadMutationWindowFrom(
@@ -326,9 +454,12 @@ export class AccountQuota {
     return [...pendingById.values()];
   }
 
-  private async upsertPendingSettlement(item: PendingSettlement): Promise<void> {
+  private async putPendingSettlement(
+    storage: StorageWriter,
+    item: PendingSettlement,
+  ): Promise<void> {
     const key = pendingSettlementKey(item.reservationId);
-    const existing = await this.storage.get<PendingSettlement>(key);
+    const existing = await storage.get<PendingSettlement>(key);
     const next = isPendingSettlement(existing)
       ? {
           ...item,
@@ -337,8 +468,7 @@ export class AccountQuota {
           nextAttemptAt: Math.min(existing.nextAttemptAt, item.nextAttemptAt),
         }
       : item;
-    await this.storage.put(key, next);
-    await this.schedulePendingSettlementAlarm();
+    await storage.put(key, next);
   }
 
   private async schedulePendingSettlementAlarm(): Promise<void> {
@@ -367,7 +497,10 @@ export class AccountQuota {
           estimatedTokens: item.estimatedTokens,
           tokensDelta: item.tokensDelta,
         });
-      } catch {
+      } catch (err) {
+        if (err instanceof AccountDeletionBlockedError) {
+          return;
+        }
         const attempts = item.attempts + 1;
         await this.storage.put(pendingSettlementKey(item.reservationId), {
           ...item,
@@ -412,8 +545,44 @@ export class AccountQuota {
   }
 }
 
+class AccountDeletionBlockedError extends Error {
+  constructor(readonly marker: AccountDeletionMarker) {
+    super("account deletion blocks quota operation");
+    this.name = "AccountDeletionBlockedError";
+  }
+}
+
 function nonNegativeInt(v: number | undefined): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+}
+
+function normalizedNow(v: number | undefined): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : Date.now();
+}
+
+function normalizeAccountDeletionMarker(v: unknown): AccountDeletionMarker | undefined {
+  if (isAccountDeletionMarker(v)) return v;
+  return undefined;
+}
+
+function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
+  if (typeof v !== "object" || v === null) return false;
+  const marker = v as Record<string, unknown>;
+  return (
+    (marker.status === "deleting" || marker.status === "deleted") &&
+    typeof marker.updatedAt === "number"
+  );
+}
+
+function accountDeletionResponse(marker: AccountDeletionMarker): Response {
+  if (marker.status === "deleting") {
+    return jsonError(
+      409,
+      "account_deletion_in_progress",
+      "Account deletion is in progress. Please try again.",
+    );
+  }
+  return jsonError(410, "account_deleted", "This account has been deleted.");
 }
 
 function normalizedId(v: string | undefined): string | undefined {

@@ -48,11 +48,13 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
   `wrangler.jsonc`), so Cloudflare retains no per-request records — only aggregate metrics (request
   counts, error rates) with no content.
 - **Account deletion removes everything there is to remove** (`DELETE /v1/me`, 73): the Clerk user
-  (with `trialStartedAt` / `subscription`) and the account's Durable Object (all usage counters,
-  reservations, and the settlement alarm). The Analytics Engine metrics are **anonymous, immutable
-  aggregates** — the userId is only ever stored as a one-way SHA-256 hash that cannot be reversed,
-  there is no per-user record to look up or delete, and the rows are not editable by design. So
-  "delete my account" is complete even though those aggregates remain.
+  (with `trialStartedAt` / `subscription`) and the account's Durable Object usage data (all usage
+  counters, reservations, and the settlement alarm). A minimal DO tombstone remains so stale
+  already-issued tokens cannot recreate fresh usage state after deletion. The Analytics Engine
+  metrics are **anonymous, immutable aggregates** — the userId is only ever stored as a one-way
+  SHA-256 hash that cannot be reversed, there is no per-user record to look up or delete, and the
+  rows are not editable by design. So "delete my account" is complete even though those aggregates
+  remain.
 
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
@@ -61,7 +63,7 @@ src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, /admin/margin
   -> src/auth.ts          verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts  derive the account's subscription (trial placeholder until 56c) — pure
   -> src/anthropic.ts     forward to Anthropic, map the response — no logging, no storage
-  -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only; /wipe on delete
+  -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only; deletion tombstone
   -> src/analytics.ts     one aggregate hashed metric per draft — no content
 ```
 
@@ -134,16 +136,20 @@ no body on success.
 
 What is deleted:
 
-1. The account's **usage Durable Object** is wiped first (`AccountQuota` `/wipe`: `deleteAll()` +
-   `deleteAlarm()`) — all weekly counters, in-flight reservations, settlement markers, and the
-   settlement alarm.
+1. The account's **usage Durable Object** first receives a deletion barrier (`AccountQuota`
+   `/begin-delete`). This blocks later `/check`, `/reserve`, `/settle`, `/defer-settlement`,
+   `/release`, and `/peek` calls so an in-flight authenticated request cannot recreate state during
+   deletion.
 2. The **Clerk user** is then deleted (`clerkClient.users.deleteUser`), which removes
    `trialStartedAt` and any `subscription` / `quota` metadata.
+3. After Clerk deletion succeeds (including idempotent 404), the Durable Object finalizes deletion
+   (`/finish-delete`): all weekly counters, in-flight reservations, settlement markers, and the
+   settlement alarm are removed, while a minimal deleted tombstone remains.
 
-The DO is wiped **before** the Clerk user so a Clerk failure leaves a retryable state and a DO failure
-never orphans a deleted user. The call is **idempotent**: if the Clerk user is already gone it still
-returns `204`. A Clerk failure returns **`502 account_deletion_failed`** (a user-safe message with no
-upstream detail; nothing is logged).
+If Clerk returns a non-404 failure, the deletion barrier is cancelled and the existing metering state
+is preserved; quota is not reset for an active account. The call is **idempotent**: if the Clerk user
+is already gone it still returns `204`. A Clerk failure returns **`502 account_deletion_failed`** (a
+user-safe message with no upstream detail; nothing is logged).
 
 What is **not** deleted, because it doesn't exist as per-user data: the **Analytics Engine** metrics
 are anonymous, immutable aggregates keyed by a one-way SHA-256 hash of the userId — there is no

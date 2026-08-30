@@ -30,6 +30,7 @@ interface PendingSettlementRecord {
   tokensDelta: number;
 }
 
+const ACCOUNT_DELETION_KEY = "account_deletion";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
 
 const hardLimits: ResolvedLimits = {
@@ -41,13 +42,17 @@ const hardLimits: ResolvedLimits = {
   extraPurchased: 0,
 };
 
-async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> {
+async function callDOResponse(userId: string, op: string, body: unknown): Promise<Response> {
   const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(userId));
-  const res = await stub.fetch(`https://account-quota.internal${op}`, {
+  return stub.fetch(`https://account-quota.internal${op}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> {
+  const res = await callDOResponse(userId, op, body);
   return res.json<T>();
 }
 
@@ -57,6 +62,12 @@ async function pendingSettlements(stub: DurableObjectStub): Promise<PendingSettl
       prefix: PENDING_SETTLEMENT_KEY_PREFIX,
     });
     return [...pending.values()];
+  });
+}
+
+async function storedKeys(stub: DurableObjectStub): Promise<string[]> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    return [...(await state.storage.list()).keys()].sort();
   });
 }
 
@@ -139,6 +150,118 @@ describe("AccountQuota Durable Object", () => {
     expect(second.reserved).toBe(false);
     expect(second.blockedByQuota).toBe(true);
     expect(second.window.tokensReserved).toBe(80);
+  });
+
+  it("blocks quota operations during deletion without wiping preserved counters", async () => {
+    const uid = "do-delete-barrier";
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+
+    const begin = await callDO<{ deleting: boolean; alreadyDeleted: boolean }>(
+      uid,
+      "/begin-delete",
+      { now: MON + 1 },
+    );
+    expect(begin).toEqual({ deleting: true, alreadyDeleted: false });
+
+    const blockedOps = [
+      ["/check", { now: MON + 2, rateLimitPerMin: 10 }],
+      [
+        "/reserve",
+        {
+          now: MON + 2,
+          reservationId: "delete-barrier-2",
+          estimatedTokens: 1,
+          limits: hardLimits,
+        },
+      ],
+      [
+        "/settle",
+        {
+          now: MON + 2,
+          reservationId: reserved.reservationId,
+          reservationWindowStart: reserved.window.windowStart,
+          estimatedTokens: reserved.estimatedTokens,
+          tokensDelta: 10,
+        },
+      ],
+      [
+        "/defer-settlement",
+        {
+          now: MON + 2,
+          reservationId: reserved.reservationId,
+          reservationWindowStart: reserved.window.windowStart,
+          estimatedTokens: reserved.estimatedTokens,
+          tokensDelta: 10,
+        },
+      ],
+      [
+        "/release",
+        {
+          now: MON + 2,
+          reservationId: reserved.reservationId,
+          reservationWindowStart: reserved.window.windowStart,
+          estimatedTokens: reserved.estimatedTokens,
+        },
+      ],
+      ["/peek", { now: MON + 2 }],
+    ] as const;
+
+    for (const [op, body] of blockedOps) {
+      const res = await callDOResponse(uid, op, body);
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as any).error.type).toBe("account_deletion_in_progress");
+    }
+
+    const cancel = await callDO<{ cancelled: boolean }>(uid, "/cancel-delete", {});
+    expect(cancel.cancelled).toBe(true);
+
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 3 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensUsed).toBe(0);
+    expect(peek.window.activeReservations).toEqual([
+      { id: "delete-barrier-1", estimatedTokens: 250, expiresAt: MON + RESERVATION_TTL_MS },
+    ]);
+  });
+
+  it("final deletion wipes usage data but keeps a tombstone for stale tokens", async () => {
+    const uid = "do-delete-finish";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-finish-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO<WindowResult & { queued: boolean }>(uid, "/defer-settlement", {
+      now: MON + 1,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+      tokensDelta: 500,
+    });
+
+    await callDO(uid, "/begin-delete", { now: MON + 2 });
+    const finish = await callDO<{ deleted: boolean }>(uid, "/finish-delete", { now: MON + 3 });
+    expect(finish.deleted).toBe(true);
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    expect(await pendingSettlements(stub)).toEqual([]);
+
+    const peek = await callDOResponse(uid, "/peek", { now: MON + WEEK_MS });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
+
+    const check = await callDOResponse(uid, "/check", {
+      now: MON + WEEK_MS,
+      rateLimitPerMin: 10,
+    });
+    expect(check.status).toBe(410);
+    expect(((await check.json()) as any).error.type).toBe("account_deleted");
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
   });
 
   it("release rolls back only the reserved draft in the same window", async () => {

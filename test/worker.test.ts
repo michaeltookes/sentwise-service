@@ -51,6 +51,16 @@ function anthropicOk(text = "drafted") {
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function userWith(privateMetadata: Record<string, unknown>) {
   return {
     id: "user_123",
@@ -417,7 +427,7 @@ describe("GET /v1/me", () => {
 });
 
 describe("DELETE /v1/me (73 — account deletion)", () => {
-  it("wipes the usage DO and deletes the Clerk user, returning 204", async () => {
+  it("deletes the Clerk user and tombstones the usage DO, returning 204", async () => {
     // Seed some usage first so the wipe is observable.
     mocks.verifyToken.mockResolvedValue({ sub: "u-del" });
     mocks.getUser.mockResolvedValue(activeTrial());
@@ -432,10 +442,11 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(await del.text()).toBe("");
     expect(mocks.deleteUser).toHaveBeenCalledWith("u-del");
 
-    // The DO is wiped: a subsequent /v1/me reports a fresh, zeroed window.
+    // Stale authenticated calls after deletion cannot recreate a fresh quota window.
     mocks.getUser.mockResolvedValue(activeTrial());
     const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
-    expect(((await me.json()) as any).quota.used).toBe(0);
+    expect(me.status).toBe(410);
+    expect(((await me.json()) as any).error.type).toBe("account_deleted");
   });
 
   it("is idempotent — a Clerk user already gone still returns 204", async () => {
@@ -446,8 +457,14 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(mocks.deleteUser).toHaveBeenCalledOnce();
   });
 
-  it("maps a Clerk failure to 502 account_deletion_failed with no upstream detail", async () => {
+  it("preserves usage and cancels the deletion barrier when Clerk deletion fails", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-fail" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const drafted = await worker.fetch(draftReq("u-del-fail"), env);
+    expect(drafted.status).toBe(200);
+    expect(((await drafted.json()) as any).quota.used).toBe(1);
+
     mocks.deleteUser.mockRejectedValue(
       Object.assign(new Error("clerk exploded: secret-ish detail"), { status: 500 }),
     );
@@ -457,6 +474,34 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(body.error.type).toBe("account_deletion_failed");
     expect(body.error.message).not.toContain("secret-ish");
     expect(body.error.message).not.toContain("clerk exploded");
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(200);
+    expect(((await me.json()) as any).quota.used).toBe(1);
+  });
+
+  it("blocks an authenticated draft from settling after deletion starts", async () => {
+    const started = deferred<void>();
+    const upstream = deferred<Response>();
+    const fetchMock = vi.fn().mockImplementation(() => {
+      started.resolve();
+      return upstream.promise;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(activeTrial());
+    mocks.deleteUser.mockResolvedValue(undefined);
+
+    const draft = worker.fetch(draftReq("u-del-race"), env);
+    await started.promise;
+
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(204);
+
+    upstream.resolve(anthropicOk("late"));
+    const completedDraft = await draft;
+    expect(completedDraft.status).toBe(410);
+    expect(((await completedDraft.json()) as any).error.type).toBe("account_deleted");
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("rejects an unauthenticated delete with 401 and never touches Clerk", async () => {

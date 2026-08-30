@@ -10,13 +10,15 @@ import {
   type WindowState,
 } from "./metering";
 import {
+  quotaBeginAccountDeletion,
+  quotaCancelAccountDeletion,
   quotaCheck,
   quotaDeferSettlement,
+  quotaFinishAccountDeletion,
   quotaPeek,
   quotaRelease,
   quotaReserve,
   quotaSettle,
-  quotaWipe,
 } from "./quota-client";
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
@@ -30,7 +32,7 @@ export { AccountQuota } from "./quota-do";
  * Routes:
  *   GET    /healthz       -> liveness, no auth
  *   GET    /v1/me         -> { userId, email, trial, subscription, quota } for account display
- *   DELETE /v1/me         -> delete the account (wipe usage DO, then delete the Clerk user) (73)
+ *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
  *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
@@ -70,12 +72,14 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "DELETE") {
         const { userId } = await authenticate(request, env);
-        // 73: wipe the account's usage Durable Object FIRST, then delete the Clerk
-        // user. This order means a Clerk failure leaves a retryable state and a DO
-        // failure never orphans a deleted user. deleteClerkUser is idempotent, so a
-        // retry after the Clerk user is already gone still succeeds.
-        await quotaWipe(env, userId);
-        await deleteClerkUser(userId, env);
+        await quotaBeginAccountDeletion(env, userId);
+        try {
+          await deleteClerkUser(userId, env);
+        } catch (err) {
+          await quotaCancelAccountDeletion(env, userId).catch(() => undefined);
+          throw err;
+        }
+        await quotaFinishAccountDeletion(env, userId);
         return new Response(null, { status: 204 });
       }
 
@@ -237,13 +241,16 @@ async function settleReservedUsage(
   };
   try {
     return (await quotaSettle(env, userId, body)).window;
-  } catch {
+  } catch (err) {
+    if (isAccountDeletionError(err)) throw err;
     try {
       return (await quotaSettle(env, userId, { ...body, now: Date.now() })).window;
-    } catch {
+    } catch (retryErr) {
+      if (isAccountDeletionError(retryErr)) throw retryErr;
       try {
         await quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
-      } catch {
+      } catch (deferErr) {
+        if (isAccountDeletionError(deferErr)) throw deferErr;
         ctx?.waitUntil(
           quotaDeferSettlement(env, userId, { ...body, now: Date.now() }).catch(() => undefined),
         );
@@ -282,7 +289,8 @@ async function releaseReservedUsage(
   };
   try {
     await quotaRelease(env, userId, body);
-  } catch {
+  } catch (err) {
+    if (isAccountDeletionError(err)) return;
     try {
       await quotaRelease(env, userId, { ...body, now: Date.now() });
     } catch {
@@ -290,4 +298,11 @@ async function releaseReservedUsage(
       // cannot hold quota capacity until the weekly reset.
     }
   }
+}
+
+function isAccountDeletionError(err: unknown): err is ApiError {
+  return (
+    err instanceof ApiError &&
+    (err.type === "account_deleted" || err.type === "account_deletion_in_progress")
+  );
 }
