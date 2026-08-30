@@ -1,11 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { Env } from "../src/config";
 import {
   RESERVATION_TTL_MS,
   WEEK_MS,
   type ResolvedLimits,
   type WindowState,
 } from "../src/metering";
+import { AccountQuota } from "../src/quota-do";
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 const OLD_BOUNDED_ARRAY_SIZE = 128;
@@ -278,6 +280,54 @@ describe("AccountQuota Durable Object", () => {
     expect(check.status).toBe(410);
     expect(((await check.json()) as any).error.type).toBe("account_deleted");
     expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
+  it("persists the deletion tombstone before scheduling cleanup retry", async () => {
+    const calls: string[] = [];
+    const values = new Map<string, unknown>();
+    const storage = {
+      get: (key: string) => Promise.resolve(values.get(key)),
+      put: (key: string, value: unknown) => {
+        const status =
+          key === ACCOUNT_DELETION_KEY && typeof value === "object" && value !== null
+            ? (value as { status?: unknown }).status
+            : key;
+        calls.push(`put:${String(status)}`);
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      list: () => {
+        calls.push("list");
+        return Promise.resolve(new Map(values));
+      },
+      delete: (keyOrKeys: string | string[]) => {
+        calls.push(`delete:${Array.isArray(keyOrKeys) ? keyOrKeys.length : keyOrKeys}`);
+        for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+          values.delete(key);
+        }
+        return Promise.resolve();
+      },
+      setAlarm: () => {
+        calls.push("setAlarm");
+        return Promise.resolve();
+      },
+      deleteAlarm: () => {
+        calls.push("deleteAlarm");
+        return Promise.resolve();
+      },
+    };
+    const quota = new AccountQuota({ storage } as unknown as DurableObjectState, {} as Env);
+
+    const finish = await quota.fetch(
+      new Request("https://account-quota.internal/finish-delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ now: MON + 1, attemptId: "finish-order-attempt" }),
+      }),
+    );
+
+    expect(finish.status).toBe(200);
+    expect(calls.slice(0, 2)).toEqual(["put:deleted", "setAlarm"]);
   });
 
   it("final deletion wipes account data in bounded storage batches", async () => {

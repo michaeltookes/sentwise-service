@@ -428,8 +428,8 @@ export class AccountQuota {
 
   private async handleFinishDelete(body: DeletionBody): Promise<Response> {
     const now = normalizedNow(body.now);
-    await this.scheduleAccountDeletionAlarm(now + 1);
     await this.storage.put(ACCOUNT_DELETION_KEY, { status: "deleted", updatedAt: now });
+    await this.scheduleAccountDeletionAlarm(now + 1).catch(() => undefined);
     try {
       await this.deleteAccountDataExceptDeletionMarker(now);
       return Response.json({ deleted: true, cleanupPending: false });
