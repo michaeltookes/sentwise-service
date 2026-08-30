@@ -19,6 +19,7 @@ import {
   quotaBeginAccountDeletion,
   quotaCancelAccountDeletion,
   quotaCheck,
+  quotaDeferRelease,
   quotaDeferSettlement,
   quotaFinishAccountDeletion,
   quotaPeek,
@@ -163,6 +164,7 @@ export default {
             reservation.reservationId,
             reservation.window,
             reservation.estimatedTokens,
+            ctx,
           );
           await recordUsage(env, {
             userId,
@@ -318,6 +320,7 @@ async function releaseReservedUsage(
   reservationId: string,
   reservedWindow: WindowState,
   estimatedTokens: number,
+  ctx?: ExecutionContext,
 ): Promise<void> {
   const body = {
     now: Date.now(),
@@ -328,13 +331,41 @@ async function releaseReservedUsage(
   try {
     await quotaRelease(env, userId, body);
   } catch (err) {
+    if (isAccountDeletionInProgressError(err)) {
+      await deferReleaseBlockedByDeletion(env, userId, body, ctx);
+      return;
+    }
     if (isAccountDeletionError(err)) return;
     try {
       await quotaRelease(env, userId, { ...body, now: Date.now() });
-    } catch {
+    } catch (retryErr) {
+      if (isAccountDeletionInProgressError(retryErr)) {
+        await deferReleaseBlockedByDeletion(env, userId, body, ctx);
+        return;
+      }
+      if (isAccountDeletionError(retryErr)) return;
       // The reservation also has a DO-side TTL, so a repeated release outage
       // cannot hold quota capacity until the weekly reset.
     }
+  }
+}
+
+async function deferReleaseBlockedByDeletion(
+  env: Env,
+  userId: string,
+  body: {
+    reservationId: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+  },
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const defer = () => quotaDeferRelease(env, userId, { ...body, now: Date.now() });
+  try {
+    await defer();
+  } catch (err) {
+    if (isAccountDeletionError(err)) return;
+    ctx?.waitUntil(defer().catch(() => undefined));
   }
 }
 

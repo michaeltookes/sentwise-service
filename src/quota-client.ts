@@ -116,6 +116,20 @@ export function quotaDeferSettlement(
   return call<WindowResult>(env, userId, "/defer-settlement", body);
 }
 
+/** Persist a reservation release for alarm replay after deletion temporarily blocks it. */
+export function quotaDeferRelease(
+  env: Env,
+  userId: string,
+  body: {
+    now: number;
+    reservationId: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+  },
+): Promise<WindowResult> {
+  return call<WindowResult>(env, userId, "/defer-release", body);
+}
+
 /** Roll back a reserved draft slot after an upstream failure. */
 export function quotaRelease(
   env: Env,

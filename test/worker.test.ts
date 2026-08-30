@@ -886,6 +886,50 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(quota.tokensUsed).toBe(5);
   });
 
+  it("defers a release blocked by a deletion that is later canceled", async () => {
+    const started = deferred<void>();
+    const upstream = deferred<Response>();
+    const clerkDelete = deferred<Response>();
+    const deleteStarted = deferred<void>();
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isClerkDelete(input, init)) {
+        deleteStarted.resolve();
+        return clerkDelete.promise;
+      }
+      if (isClerkUserLookup(input, init)) return Promise.resolve(clerkDeleteResponse());
+      started.resolve();
+      return upstream.promise;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(activeTrial());
+
+    const draft = worker.fetch(draftReq("u-del-release-cancel"), env);
+    await started.promise;
+    const deletion = worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    await deleteStarted.promise;
+
+    upstream.resolve(
+      new Response(JSON.stringify({ error: { type: "overloaded_error" } }), { status: 529 }),
+    );
+    const failedDraft = await draft;
+    expect(failedDraft.status).toBe(503);
+    expect(((await failedDraft.json()) as any).error.type).toBe("overloaded");
+
+    clerkDelete.resolve(clerkDeleteResponse(500));
+    const failedDeletion = await deletion;
+    expect(failedDeletion.status).toBe(502);
+
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-release-cancel"));
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const quota = ((await me.json()) as any).quota;
+    expect(quota.used).toBe(0);
+    expect(quota.tokensUsed).toBe(0);
+  });
+
   it("rejects an unauthenticated delete with 401 and never touches Clerk", async () => {
     const del = await worker.fetch(req("/v1/me", { method: "DELETE" }), env);
     expect(del.status).toBe(401);

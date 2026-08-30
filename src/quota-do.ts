@@ -16,6 +16,7 @@
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
+//   POST /defer-release { now, reservationId, reservationWindowStart, estimatedTokens }
 //   POST /peek    { now } -> { window }   (read + roll only; no rate-limit, no increment)
 //   POST /begin-delete  { now, attemptId } -> block future quota reads/mutations
 //   POST /cancel-delete { now, attemptId } -> drop one failed deletion attempt from the barrier
@@ -70,6 +71,7 @@ interface DeletionBody {
   attemptId?: string;
 }
 interface PendingSettlement {
+  kind?: "settle" | "release";
   reservationId: string;
   reservationWindowStart: number;
   estimatedTokens: number;
@@ -136,6 +138,8 @@ export class AccountQuota {
         return this.handleFinishDelete(await request.json<DeletionBody>());
       case "/defer-settlement":
         return this.handleDeferSettlement(await request.json<SettleBody>());
+      case "/defer-release":
+        return this.handleDeferRelease(await request.json<ReleaseBody>());
       case "/wipe":
         return this.handleWipe();
     }
@@ -273,10 +277,47 @@ export class AccountQuota {
       }
 
       await this.putPendingSettlement(txn, {
+        kind: "settle",
         reservationId: body.reservationId!,
         reservationWindowStart: nonNegativeInt(body.reservationWindowStart),
         estimatedTokens: nonNegativeInt(body.estimatedTokens),
         tokensDelta: nonNegativeInt(body.tokensDelta),
+        attempts: 0,
+        createdAt: body.now,
+        nextAttemptAt: body.now,
+      });
+      if (deletion?.status === "deleting") {
+        return { queued: true, deletion };
+      }
+      return {
+        queued: true,
+        window: await this.loadWindowFrom(txn, body.now),
+      };
+    });
+    if (result.queued) {
+      await this.schedulePendingSettlementAlarm();
+    }
+    if (result.deletion) return accountDeletionResponse(result.deletion);
+    return Response.json({ window: result.window, queued: true });
+  }
+
+  private async handleDeferRelease(body: ReleaseBody): Promise<Response> {
+    if (!body.reservationId || body.reservationWindowStart === undefined) {
+      return new Response("reservation id and window required", { status: 400 });
+    }
+    const reservationId = body.reservationId;
+    const result = await this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion?.status === "deleted") {
+        return { queued: false, deletion };
+      }
+
+      await this.putPendingSettlement(txn, {
+        kind: "release",
+        reservationId,
+        reservationWindowStart: nonNegativeInt(body.reservationWindowStart),
+        estimatedTokens: nonNegativeInt(body.estimatedTokens),
+        tokensDelta: 0,
         attempts: 0,
         createdAt: body.now,
         nextAttemptAt: body.now,
@@ -339,9 +380,24 @@ export class AccountQuota {
   }
 
   private async handleRelease(body: ReleaseBody): Promise<Response> {
+    let window: WindowState;
+    try {
+      window = await this.applyRelease(body);
+    } catch (err) {
+      if (err instanceof AccountDeletionBlockedError) {
+        return accountDeletionResponse(err.marker);
+      }
+      throw err;
+    }
+    return Response.json({ window });
+  }
+
+  private async applyRelease(body: ReleaseBody): Promise<WindowState> {
     return this.storage.transaction(async (txn) => {
       const deletion = await this.loadAccountDeletionMarkerFrom(txn);
-      if (deletion) return accountDeletionResponse(deletion);
+      if (deletion) {
+        throw new AccountDeletionBlockedError(deletion);
+      }
 
       const { window, appliesToStoredReservation } = await this.loadMutationWindowFrom(
         txn,
@@ -362,7 +418,7 @@ export class AccountQuota {
         }
       }
       await txn.put("window", window);
-      return Response.json({ window });
+      return window;
     });
   }
 
@@ -681,13 +737,22 @@ export class AccountQuota {
       }
 
       try {
-        await this.applySettlement({
-          now,
-          reservationId: item.reservationId,
-          reservationWindowStart: item.reservationWindowStart,
-          estimatedTokens: item.estimatedTokens,
-          tokensDelta: item.tokensDelta,
-        });
+        if (item.kind === "release") {
+          await this.applyRelease({
+            now,
+            reservationId: item.reservationId,
+            reservationWindowStart: item.reservationWindowStart,
+            estimatedTokens: item.estimatedTokens,
+          });
+        } else {
+          await this.applySettlement({
+            now,
+            reservationId: item.reservationId,
+            reservationWindowStart: item.reservationWindowStart,
+            estimatedTokens: item.estimatedTokens,
+            tokensDelta: item.tokensDelta,
+          });
+        }
       } catch (err) {
         if (err instanceof AccountDeletionBlockedError) {
           return;
@@ -831,6 +896,7 @@ function isPendingSettlement(v: unknown): v is PendingSettlement {
   if (typeof v !== "object" || v === null) return false;
   const p = v as Record<string, unknown>;
   return (
+    (p.kind === undefined || p.kind === "settle" || p.kind === "release") &&
     typeof p.reservationId === "string" &&
     typeof p.reservationWindowStart === "number" &&
     typeof p.estimatedTokens === "number" &&

@@ -51,6 +51,7 @@ interface ReserveResult {
   window: WindowState;
 }
 interface PendingSettlementRecord {
+  kind?: string;
   reservationId: string;
   tokensDelta: number;
 }
@@ -337,6 +338,54 @@ describe("AccountQuota Durable Object", () => {
     expect(peek.window.draftsUsed).toBe(1);
     expect(peek.window.tokensUsed).toBe(500);
     expect(peek.window.tokensReserved).toBe(0);
+  });
+
+  it("queues releases blocked by deletion and replays them after cancellation", async () => {
+    const uid = "do-delete-blocked-release-replay";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const baseNow = Date.now() - 10;
+    const reserved = await callDO<ReserveResult>(uid, "/reserve", {
+      now: baseNow,
+      reservationId: "delete-blocked-release-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO(uid, "/begin-delete", {
+      now: baseNow + 1,
+      attemptId: "delete-blocked-release-attempt",
+    });
+
+    const deferred = await callDOResponse(uid, "/defer-release", {
+      now: baseNow + 2,
+      reservationId: reserved.reservationId,
+      reservationWindowStart: reserved.window.windowStart,
+      estimatedTokens: reserved.estimatedTokens,
+    });
+
+    expect(deferred.status).toBe(409);
+    expect(((await deferred.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await pendingSettlements(stub)).toEqual([
+      expect.objectContaining({
+        kind: "release",
+        reservationId: reserved.reservationId,
+        tokensDelta: 0,
+      }),
+    ]);
+
+    await callDO(uid, "/cancel-delete", {
+      now: baseNow + 3,
+      attemptId: "delete-blocked-release-attempt",
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(await pendingSettlements(stub)).toEqual([]);
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: baseNow + 4 });
+    expect(peek.window.draftsUsed).toBe(0);
+    expect(peek.window.tokensUsed).toBe(0);
+    expect(peek.window.tokensReserved).toBe(0);
+    expect(peek.window.activeReservations).toEqual([]);
   });
 
   it("begin-delete schedules a stale-barrier recovery alarm", async () => {
