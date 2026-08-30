@@ -29,6 +29,7 @@ import {
 } from "./quota-client";
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
+import { recordInterest } from "./interest";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -41,6 +42,7 @@ export { AccountQuota } from "./quota-do";
  *   GET    /v1/me         -> { userId, email, trial, subscription, quota } for account display
  *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
  *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
+ *   POST   /v1/interest   -> record demand for a parked capability (item 75; first click wins)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
@@ -203,10 +205,16 @@ export default {
         return Response.json({ ...result, quota: buildQuota(window, limits) });
       }
 
+      if (pathname === "/v1/interest" && request.method === "POST") {
+        const { userId } = await authenticate(request, env);
+        return await recordInterest(userId, request, env);
+      }
+
       // Known paths with the wrong method get 405; everything else 404.
       if (
         pathname === "/v1/draft" ||
         pathname === "/v1/me" ||
+        pathname === "/v1/interest" ||
         pathname === "/healthz" ||
         (pathname === "/admin/margin" && !!env.ADMIN_TOKEN)
       ) {
