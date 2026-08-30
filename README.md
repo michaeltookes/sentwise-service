@@ -3,7 +3,8 @@
 The managed-inference service for **[Sentwise](https://github.com/michaeltookes/sentwise)** — a
 stateless [Cloudflare Worker](https://workers.cloudflare.com/) that lets a signed-in Sentwise user
 draft email through the model provider **without ever holding an API key**. It is the server half of
-backlog items **56a** (account + proxy) and **56b** (metering + limits).
+backlog items **56a** (account + proxy), **56b** (metering + limits), and the account-management
+half of **73** (subscription display + account deletion).
 
 **Deployed:** `https://sentwise-inference.sentwise-service.workers.dev`
 
@@ -36,7 +37,8 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
   `console.*` call appears in `src/`.
 - **The only persisted state is counters, timestamps, random reservation IDs, and one hash — never
   content:**
-  1. `trialStartedAt` in the user's Clerk `privateMetadata` (trial enforcement, 56a).
+  1. `trialStartedAt` (and, once 56c ships, `subscription`) in the user's Clerk `privateMetadata`
+     (trial enforcement, 56a; subscription display, 73).
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
      weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
      reservation IDs keyed by Clerk userId. No prompts, no drafts, no emails.
@@ -45,14 +47,21 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
 - **Cloudflare invocation logs are disabled** (`observability.logs.invocation_logs: false` in
   `wrangler.jsonc`), so Cloudflare retains no per-request records — only aggregate metrics (request
   counts, error rates) with no content.
+- **Account deletion removes everything there is to remove** (`DELETE /v1/me`, 73): the Clerk user
+  (with `trialStartedAt` / `subscription`) and the account's Durable Object (all usage counters,
+  reservations, and the settlement alarm). The Analytics Engine metrics are **anonymous, immutable
+  aggregates** — the userId is only ever stored as a one-way SHA-256 hash that cannot be reversed,
+  there is no per-user record to look up or delete, and the rows are not editable by design. So
+  "delete my account" is complete even though those aggregates remain.
 
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, /v1/me, /v1/draft, /admin/margin
-  -> src/auth.ts          verify Clerk JWT, check/init the trial + read quota overrides
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, /admin/margin
+  -> src/auth.ts          verify Clerk JWT, check/init the trial + read quota/subscription; delete user
+  -> src/subscription.ts  derive the account's subscription (trial placeholder until 56c) — pure
   -> src/anthropic.ts     forward to Anthropic, map the response — no logging, no storage
-  -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only
+  -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only; /wipe on delete
   -> src/analytics.ts     one aggregate hashed metric per draft — no content
 ```
 
@@ -71,6 +80,12 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
   "userId": "user_...",
   "email": "you@example.com",
   "trial": { "startedAt": "2026-08-20T...Z", "endsAt": "2026-09-03T...Z", "active": true },
+  "subscription": {
+    "plan": "trial",
+    "status": "trialing",
+    "renewsAt": "2026-09-03T00:00:00.000Z",
+    "manageBillingUrl": null
+  },
   "quota": {
     "unit": "drafts",
     "used": 12,
@@ -86,6 +101,55 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
 ```
 
 Viewing your account never starts the trial — the trial begins on your first real draft.
+
+#### `subscription` (item 73)
+
+The account's plan for the Settings account pane:
+
+- `plan`: `"trial" | "individual" | "team" | "none"`
+- `status`: `"trialing" | "active" | "past_due" | "canceled" | "lapsed"`
+- `renewsAt`: ISO 8601 timestamp, or `null`
+- `manageBillingUrl`: an `https` URL to the billing portal, or `null`
+
+**Placeholder until 56c.** Checkout / licensing (56c) is not built yet, so today the field is
+**derived from the trial** on the same Clerk `getUser` as `trial`/`quota` (no extra round-trip):
+
+| Trial state     | `plan`  | `status`   | `renewsAt`     | `manageBillingUrl` |
+| --------------- | ------- | ---------- | -------------- | ------------------ |
+| Not started yet | `trial` | `trialing` | `null`         | `null`             |
+| Active          | `trial` | `trialing` | trial `endsAt` | `null`             |
+| Expired         | `trial` | `lapsed`   | trial `endsAt` | `null`             |
+
+**Override.** When 56c ships it will write a `subscription` record into the Clerk user's
+`privateMetadata`, shaped `{ plan, status, renewsAt?, manageBillingUrl? }`. If a **valid** record is
+present it is used verbatim (and wins over the trial derivation). Validation is strict: `plan` and
+`status` must each match the enums above or the whole record is ignored (the trial fallback applies);
+a malformed `renewsAt` or a non-`https` `manageBillingUrl` is dropped to `null` rather than poisoning
+an otherwise-valid record.
+
+### `DELETE /v1/me` (item 73)
+
+Requires `Authorization: Bearer <clerk-session-token>`. **Deletes the account.** Returns **`204`** with
+no body on success.
+
+What is deleted:
+
+1. The account's **usage Durable Object** is wiped first (`AccountQuota` `/wipe`: `deleteAll()` +
+   `deleteAlarm()`) — all weekly counters, in-flight reservations, settlement markers, and the
+   settlement alarm.
+2. The **Clerk user** is then deleted (`clerkClient.users.deleteUser`), which removes
+   `trialStartedAt` and any `subscription` / `quota` metadata.
+
+The DO is wiped **before** the Clerk user so a Clerk failure leaves a retryable state and a DO failure
+never orphans a deleted user. The call is **idempotent**: if the Clerk user is already gone it still
+returns `204`. A Clerk failure returns **`502 account_deletion_failed`** (a user-safe message with no
+upstream detail; nothing is logged).
+
+What is **not** deleted, because it doesn't exist as per-user data: the **Analytics Engine** metrics
+are anonymous, immutable aggregates keyed by a one-way SHA-256 hash of the userId — there is no
+reversible per-user record to remove (see [Privacy design](#privacy-design--content-stateless-by-construction)).
+No content is ever stored, so there is nothing else to delete. Local Mac data (mail, voice profile)
+never leaves the machine and is untouched by this call.
 
 ### `POST /v1/draft`
 
