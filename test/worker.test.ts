@@ -189,6 +189,7 @@ function quotaNamespaceWithSettleFailure(now: number): {
 function quotaNamespaceWithDeletionFailures(options: {
   cancelFailures?: number;
   finishFailures?: number;
+  cancelMismatch?: boolean;
 }): {
   namespace: DurableObjectNamespace;
   cancelCalls: () => number;
@@ -226,9 +227,12 @@ function quotaNamespaceWithDeletionFailures(options: {
         if (cancelCalls <= (options.cancelFailures ?? 0)) {
           return Promise.reject(new Error("cancel failed"));
         }
-        const wasDeleting = deleting && attemptIds.has(body.attemptId ?? "");
-        attemptIds.delete(body.attemptId ?? "");
-        deleting = attemptIds.size > 0;
+        const wasDeleting =
+          deleting && attemptIds.has(body.attemptId ?? "") && !options.cancelMismatch;
+        if (!options.cancelMismatch) {
+          attemptIds.delete(body.attemptId ?? "");
+          deleting = attemptIds.size > 0;
+        }
         return Promise.resolve(
           Response.json({ cancelled: wasDeleting, barrierActive: deleting || deleted }),
         );
@@ -621,6 +625,22 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
       req("/v1/me", { method: "DELETE", headers: bearer() }),
       flakyQuotaEnv,
     );
+    expect(del.status).toBe(503);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_recovery_failed");
+    expect(quota.cancelCalls()).toBe(2);
+  });
+
+  it("surfaces deletion barrier cancellation mismatch when the DO leaves the barrier active", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-cancel-mismatch" });
+    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("clerk failed"), { status: 500 }));
+    const quota = quotaNamespaceWithDeletionFailures({ cancelMismatch: true });
+    const flakyQuotaEnv: Env = { ...env, ACCOUNT_QUOTA: quota.namespace };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      flakyQuotaEnv,
+    );
+
     expect(del.status).toBe(503);
     expect(((await del.json()) as any).error.type).toBe("account_deletion_recovery_failed");
     expect(quota.cancelCalls()).toBe(2);

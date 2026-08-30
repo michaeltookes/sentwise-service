@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
 import {
@@ -8,6 +8,24 @@ import {
   type WindowState,
 } from "../src/metering";
 import { AccountQuota } from "../src/quota-do";
+
+const clerkMocks = vi.hoisted(() => ({
+  verifyToken: vi.fn(),
+  getUser: vi.fn(),
+  updateUserMetadata: vi.fn(),
+  deleteUser: vi.fn(),
+}));
+
+vi.mock("@clerk/backend", () => ({
+  verifyToken: clerkMocks.verifyToken,
+  createClerkClient: () => ({
+    users: {
+      getUser: clerkMocks.getUser,
+      updateUserMetadata: clerkMocks.updateUserMetadata,
+      deleteUser: clerkMocks.deleteUser,
+    },
+  }),
+}));
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 const OLD_BOUNDED_ARRAY_SIZE = 128;
@@ -34,6 +52,14 @@ interface PendingSettlementRecord {
 
 const ACCOUNT_DELETION_KEY = "account_deletion";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
+
+beforeEach(() => {
+  clerkMocks.verifyToken.mockReset();
+  clerkMocks.getUser.mockReset();
+  clerkMocks.getUser.mockRejectedValue(new Error("clerk unavailable"));
+  clerkMocks.updateUserMetadata.mockReset();
+  clerkMocks.deleteUser.mockReset();
+});
 
 const hardLimits: ResolvedLimits = {
   weeklyDraftLimit: 1,
@@ -174,11 +200,12 @@ describe("AccountQuota Durable Object", () => {
       "/begin-delete",
       { now: MON + 1, attemptId: "delete-barrier-attempt" },
     );
-    expect(begin).toEqual({
+    expect(begin).toMatchObject({
       deleting: true,
       alreadyDeleted: false,
       attemptId: "delete-barrier-attempt",
     });
+    expect((begin as { expiresAt?: unknown }).expiresAt).toEqual(expect.any(Number));
 
     const blockedOps = [
       ["/check", { now: MON + 2, rateLimitPerMin: 10 }],
@@ -241,6 +268,21 @@ describe("AccountQuota Durable Object", () => {
     expect(peek.window.activeReservations).toEqual([
       { id: "delete-barrier-1", estimatedTokens: 250, expiresAt: MON + RESERVATION_TTL_MS },
     ]);
+  });
+
+  it("begin-delete schedules a stale-barrier recovery alarm", async () => {
+    const uid = "do-delete-begin-alarm";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+
+    const begin = await callDO<{ deleting: boolean; alreadyDeleted: boolean }>(
+      uid,
+      "/begin-delete",
+      { now: Date.now(), attemptId: "delete-begin-alarm-attempt" },
+    );
+
+    expect(begin.deleting).toBe(true);
+    expect(begin.alreadyDeleted).toBe(false);
+    expect(await alarmTime(stub)).not.toBeNull();
   });
 
   it("final deletion wipes usage data but keeps a tombstone for stale tokens", async () => {
@@ -494,9 +536,10 @@ describe("AccountQuota Durable Object", () => {
     expect(await alarmTime(stub)).not.toBeNull();
   });
 
-  it("alarm preserves an in-progress deletion barrier without wiping counters", async () => {
+  it("alarm preserves an unexpired in-progress deletion barrier without wiping counters", async () => {
     const uid = "do-delete-stale-barrier";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const expiresAt = Date.now() + 60_000;
     await callDO<ReserveResult>(uid, "/reserve", {
       now: MON,
       reservationId: "delete-stale-barrier-1",
@@ -506,8 +549,9 @@ describe("AccountQuota Durable Object", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       await state.storage.put(ACCOUNT_DELETION_KEY, {
         status: "deleting",
-        updatedAt: MON,
+        updatedAt: Date.now(),
         attemptIds: ["stale-attempt"],
+        attempts: [{ id: "stale-attempt", expiresAt }],
       });
     });
 
@@ -519,6 +563,94 @@ describe("AccountQuota Durable Object", () => {
     expect(peek.status).toBe(409);
     expect(((await peek.json()) as any).error.type).toBe("account_deletion_in_progress");
     expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
+    expect(clerkMocks.getUser).not.toHaveBeenCalled();
+    expect(await alarmTime(stub)).not.toBeNull();
+  });
+
+  it("alarm cancels an expired deletion barrier when Clerk still has the user", async () => {
+    const uid = "do-delete-expired-barrier-active-user";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.getUser.mockResolvedValue({ id: uid });
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(clerkMocks.getUser).toHaveBeenCalledWith(uid);
+    expect(await storedKeys(stub)).not.toContain(ACCOUNT_DELETION_KEY);
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 2 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensReserved).toBe(250);
+  });
+
+  it("quota requests recover an expired deletion barrier when Clerk still has the user", async () => {
+    const uid = "do-delete-expired-barrier-request";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-request-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.getUser.mockResolvedValue({ id: uid });
+
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 2 });
+
+    expect(clerkMocks.getUser).toHaveBeenCalledWith(uid);
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(await storedKeys(stub)).not.toContain(ACCOUNT_DELETION_KEY);
+  });
+
+  it("alarm finalizes an expired deletion barrier when Clerk user is gone", async () => {
+    const uid = "do-delete-expired-barrier-gone-user";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-expired-barrier-gone-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+        attemptIds: ["expired-attempt"],
+        attempts: [{ id: "expired-attempt", expiresAt: MON + 1 }],
+      });
+    });
+    clerkMocks.getUser.mockRejectedValue(Object.assign(new Error("not found"), { status: 404 }));
+
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as { alarm: () => Promise<void> }).alarm();
+    });
+
+    expect(clerkMocks.getUser).toHaveBeenCalledWith(uid);
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+    expect(peek.status).toBe(410);
+    expect(((await peek.json()) as any).error.type).toBe("account_deleted");
   });
 
   it("release rolls back only the reserved draft in the same window", async () => {

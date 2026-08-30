@@ -22,7 +22,8 @@
 //   POST /finish-delete { now, attemptId } -> wipe counters and keep a deleted tombstone
 //   POST /wipe    {} -> compatibility alias for /finish-delete
 
-import type { Env } from "./config";
+import { ACCOUNT_DELETION_BARRIER_TIMEOUT_MS, type Env } from "./config";
+import { clerkUserExists } from "./auth";
 import { jsonError } from "./errors";
 import {
   activeReservations,
@@ -80,16 +81,24 @@ interface PendingSettlement {
 interface SettledSettlementMarker {
   settledAt: number;
 }
+interface AccountDeletionAttempt {
+  id: string;
+  expiresAt: number;
+}
 interface AccountDeletionMarker {
   status: "deleting" | "deleted";
   updatedAt: number;
   attemptIds?: string[];
+  attempts?: AccountDeletionAttempt[];
 }
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
 }
 interface StorageWriter extends StorageReader {
   put<T = unknown>(key: string, value: T): Promise<void>;
+}
+interface AlarmScheduler {
+  setAlarm(scheduledTime: number | Date): Promise<void>;
 }
 
 const ACCOUNT_DELETION_KEY = "account_deletion";
@@ -107,9 +116,13 @@ const STORAGE_BULK_OPERATION_LIMIT = 128;
 
 export class AccountQuota {
   private readonly storage: DurableObjectStorage;
+  private readonly env: Env;
+  private readonly userId?: string;
 
-  constructor(state: DurableObjectState, _env: Env) {
+  constructor(state: DurableObjectState, env: Env) {
     this.storage = state.storage;
+    this.env = env;
+    this.userId = state.id?.name;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -125,7 +138,7 @@ export class AccountQuota {
         return this.handleWipe();
     }
 
-    const deletion = await this.loadAccountDeletionMarker();
+    const deletion = await this.loadBlockingAccountDeletionMarker(Date.now());
     if (deletion) {
       return accountDeletionResponse(deletion);
     }
@@ -375,16 +388,23 @@ export class AccountQuota {
         return { deleting: true, alreadyDeleted: true, attemptId };
       }
 
-      const attemptIds = current?.status === "deleting" ? activeDeletionAttemptIds(current) : [];
-      if (!attemptIds.includes(attemptId)) {
-        attemptIds.push(attemptId);
+      const expiresAt = now + ACCOUNT_DELETION_BARRIER_TIMEOUT_MS;
+      const attempts = current?.status === "deleting" ? activeDeletionAttempts(current) : [];
+      const existingAttempt = attempts.find((attempt) => attempt.id === attemptId);
+      if (existingAttempt) {
+        existingAttempt.expiresAt = expiresAt;
+      } else {
+        attempts.push({ id: attemptId, expiresAt });
       }
+      const nextAttemptAt = earliestDeletionAttemptExpiry(attempts);
       await txn.put(ACCOUNT_DELETION_KEY, {
         status: "deleting",
         updatedAt: now,
-        attemptIds,
+        attemptIds: attempts.map((attempt) => attempt.id),
+        attempts,
       });
-      return { deleting: true, alreadyDeleted: false, attemptId };
+      await scheduleAccountDeletionAlarmOn(txn, nextAttemptAt);
+      return { deleting: true, alreadyDeleted: false, attemptId, expiresAt };
     });
     return Response.json(result);
   }
@@ -402,18 +422,20 @@ export class AccountQuota {
         return { cancelled: false, barrierActive: current !== undefined };
       }
 
-      const attemptIds = activeDeletionAttemptIds(current);
-      if (!attemptIds.includes(attemptId)) {
+      const attempts = activeDeletionAttempts(current);
+      if (!attempts.some((attempt) => attempt.id === attemptId)) {
         return { cancelled: false, barrierActive: true };
       }
 
-      const remainingAttemptIds = attemptIds.filter((id) => id !== attemptId);
-      if (remainingAttemptIds.length > 0) {
+      const remainingAttempts = attempts.filter((attempt) => attempt.id !== attemptId);
+      if (remainingAttempts.length > 0) {
         await txn.put(ACCOUNT_DELETION_KEY, {
           ...current,
           updatedAt: now,
-          attemptIds: remainingAttemptIds,
+          attemptIds: remainingAttempts.map((attempt) => attempt.id),
+          attempts: remainingAttempts,
         });
+        await scheduleAccountDeletionAlarmOn(txn, earliestDeletionAttemptExpiry(remainingAttempts));
         return { cancelled: true, barrierActive: true };
       }
 
@@ -478,13 +500,83 @@ export class AccountQuota {
       return;
     }
 
-    // The DO cannot infer whether Clerk deletion failed or succeeded. Preserve
-    // the barrier until a matching cancel-delete or finish-delete call records
-    // the outcome.
+    await this.recoverExpiredDeletingMarker(marker, now);
   }
 
   private async scheduleAccountDeletionAlarm(when: number): Promise<void> {
-    await this.storage.setAlarm(new Date(Math.max(Date.now() + 1, when)));
+    await scheduleAccountDeletionAlarmOn(this.storage, when);
+  }
+
+  private async loadBlockingAccountDeletionMarker(
+    now: number,
+  ): Promise<AccountDeletionMarker | undefined> {
+    const marker = await this.loadAccountDeletionMarker();
+    if (marker?.status !== "deleting") return marker;
+    return this.recoverExpiredDeletingMarker(marker, now);
+  }
+
+  private async recoverExpiredDeletingMarker(
+    marker: AccountDeletionMarker,
+    now: number,
+  ): Promise<AccountDeletionMarker | undefined> {
+    const attempts = activeDeletionAttempts(marker);
+    const expiredAttempts = attempts.filter((attempt) => attempt.expiresAt <= now);
+    if (expiredAttempts.length === 0) {
+      await this.scheduleAccountDeletionAlarm(earliestDeletionAttemptExpiry(attempts)).catch(
+        () => undefined,
+      );
+      return marker;
+    }
+
+    if (!this.userId) {
+      await this.scheduleAccountDeletionAlarm(
+        now + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS,
+      ).catch(() => undefined);
+      return marker;
+    }
+
+    let userExists: boolean;
+    try {
+      userExists = await clerkUserExists(this.userId, this.env);
+    } catch {
+      await this.scheduleAccountDeletionAlarm(
+        now + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS,
+      ).catch(() => undefined);
+      return marker;
+    }
+
+    if (!userExists) {
+      const tombstone: AccountDeletionMarker = { status: "deleted", updatedAt: now };
+      await this.storage.put(ACCOUNT_DELETION_KEY, tombstone);
+      await this.scheduleAccountDeletionAlarm(now + 1).catch(() => undefined);
+      try {
+        await this.deleteAccountDataExceptDeletionMarker(now);
+      } catch {
+        await this.scheduleAccountDeletionAlarm(
+          now + ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS,
+        ).catch(() => undefined);
+      }
+      return tombstone;
+    }
+
+    const remainingAttempts = attempts.filter((attempt) => attempt.expiresAt > now);
+    if (remainingAttempts.length === 0) {
+      await this.storage.delete(ACCOUNT_DELETION_KEY);
+      await this.schedulePendingSettlementAlarm();
+      return undefined;
+    }
+
+    const nextMarker: AccountDeletionMarker = {
+      status: "deleting",
+      updatedAt: now,
+      attemptIds: remainingAttempts.map((attempt) => attempt.id),
+      attempts: remainingAttempts,
+    };
+    await this.storage.put(ACCOUNT_DELETION_KEY, nextMarker);
+    await this.scheduleAccountDeletionAlarm(earliestDeletionAttemptExpiry(remainingAttempts)).catch(
+      () => undefined,
+    );
+    return nextMarker;
   }
 
   private async loadAccountDeletionMarker(): Promise<AccountDeletionMarker | undefined> {
@@ -662,11 +754,44 @@ function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
   );
 }
 
-function activeDeletionAttemptIds(marker: AccountDeletionMarker): string[] {
+function activeDeletionAttempts(marker: AccountDeletionMarker): AccountDeletionAttempt[] {
+  const fallbackExpiresAt = marker.updatedAt + ACCOUNT_DELETION_BARRIER_TIMEOUT_MS;
+  const attemptsById = new Map<string, AccountDeletionAttempt>();
+  if (Array.isArray(marker.attempts)) {
+    for (const attempt of marker.attempts) {
+      if (!isAccountDeletionAttempt(attempt)) continue;
+      attemptsById.set(attempt.id, attempt);
+    }
+  }
   const attemptIds = Array.isArray(marker.attemptIds)
     ? marker.attemptIds.filter((id): id is string => typeof id === "string" && id !== "")
     : [];
-  return attemptIds.length > 0 ? attemptIds : [LEGACY_DELETION_ATTEMPT_ID];
+  for (const id of attemptIds) {
+    if (!attemptsById.has(id)) attemptsById.set(id, { id, expiresAt: fallbackExpiresAt });
+  }
+  if (attemptsById.size === 0) {
+    attemptsById.set(LEGACY_DELETION_ATTEMPT_ID, {
+      id: LEGACY_DELETION_ATTEMPT_ID,
+      expiresAt: fallbackExpiresAt,
+    });
+  }
+  return [...attemptsById.values()];
+}
+
+function isAccountDeletionAttempt(v: unknown): v is AccountDeletionAttempt {
+  if (typeof v !== "object" || v === null) return false;
+  const attempt = v as Record<string, unknown>;
+  return (
+    typeof attempt.id === "string" &&
+    attempt.id !== "" &&
+    typeof attempt.expiresAt === "number" &&
+    Number.isFinite(attempt.expiresAt) &&
+    attempt.expiresAt > 0
+  );
+}
+
+function earliestDeletionAttemptExpiry(attempts: AccountDeletionAttempt[]): number {
+  return Math.min(...attempts.map((attempt) => attempt.expiresAt));
 }
 
 function accountDeletionResponse(marker: AccountDeletionMarker): Response {
@@ -682,6 +807,13 @@ function accountDeletionResponse(marker: AccountDeletionMarker): Response {
 
 function normalizedId(v: string | undefined): string | undefined {
   return typeof v === "string" && v !== "" ? v : undefined;
+}
+
+async function scheduleAccountDeletionAlarmOn(
+  storage: AlarmScheduler,
+  when: number,
+): Promise<void> {
+  await storage.setAlarm(new Date(Math.max(Date.now() + 1, when)));
 }
 
 function isPendingSettlement(v: unknown): v is PendingSettlement {

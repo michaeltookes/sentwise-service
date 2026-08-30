@@ -307,14 +307,17 @@ async function cancelAccountDeletionBarrier(
   attemptId: string,
   ctx?: ExecutionContext,
 ): Promise<void> {
+  const cancel = async () => {
+    const result = await quotaCancelAccountDeletion(env, userId, attemptId);
+    if (!result.cancelled && result.barrierActive) {
+      throw new Error("account deletion barrier is still active");
+    }
+    return result;
+  };
   try {
-    await retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId, attemptId));
+    await retryQuotaSideEffect(cancel);
   } catch {
-    ctx?.waitUntil(
-      retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId, attemptId)).catch(
-        () => undefined,
-      ),
-    );
+    ctx?.waitUntil(retryQuotaSideEffect(cancel).catch(() => undefined));
     throw new ApiError(
       503,
       "account_deletion_recovery_failed",

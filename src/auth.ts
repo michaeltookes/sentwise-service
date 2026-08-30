@@ -1,5 +1,5 @@
 import { verifyToken, createClerkClient } from "@clerk/backend";
-import type { Env } from "./config";
+import { CLERK_DELETE_TIMEOUT_MS, type Env } from "./config";
 import { ApiError } from "./errors";
 import { computeTrial, type TrialState } from "./trial";
 import { parseQuotaOverride, type QuotaOverride } from "./metering";
@@ -115,6 +115,18 @@ export async function resolveAccount(
   return { userId, email, trial, subscription, quotaOverride };
 }
 
+/** Return whether Clerk still has this user; 404 means already deleted. */
+export async function clerkUserExists(userId: string, env: Env): Promise<boolean> {
+  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  try {
+    await clerk.users.getUser(userId);
+    return true;
+  } catch (err) {
+    if (isClerkNotFound(err)) return false;
+    throw err;
+  }
+}
+
 /** Enforce the trial: throw 402 when expired. Returns the resolved account. */
 export async function requireActiveTrial(userId: string, env: Env): Promise<AccountInfo> {
   const account = await resolveAccount(userId, env, { initialize: true });
@@ -139,7 +151,7 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
 export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
   try {
-    await clerk.users.deleteUser(userId);
+    await withTimeout(clerk.users.deleteUser(userId), CLERK_DELETE_TIMEOUT_MS);
   } catch (err) {
     if (isClerkNotFound(err)) return; // already deleted — idempotent success
     throw new ApiError(
@@ -148,6 +160,18 @@ export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
       "Could not delete your account. Please try again.",
     );
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error("clerk_delete_timeout")), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timeout !== undefined) clearTimeout(timeout);
+  });
 }
 
 /** True when a Clerk error reports the resource is gone (HTTP 404). */

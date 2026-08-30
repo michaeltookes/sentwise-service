@@ -32,6 +32,7 @@ export interface BeginAccountDeletionResult {
   deleting: boolean;
   alreadyDeleted: boolean;
   attemptId: string;
+  expiresAt?: number;
 }
 export interface CancelAccountDeletionResult {
   cancelled: boolean;
