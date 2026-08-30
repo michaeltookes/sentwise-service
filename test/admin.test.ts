@@ -33,10 +33,11 @@ describe("SQL builders", () => {
     expect(sql).toContain("blob3 = 'ok'");
     expect(sql).toContain("quantileWeighted(0.5)");
     expect(sql).toContain("quantileWeighted(0.95)");
-    expect(sql).toContain("inclusion_probability");
-    expect(sql).toContain("toFloat64(_sample_interval)");
-    expect(sql).toContain("SUM(1 / greatest(inclusion_probability");
-    expect(sql).not.toContain("COUNT(DISTINCT index1)");
+    expect(sql).toContain("COUNT(DISTINCT index1) AS active_accounts");
+    // Analytics Engine rejects scalar subqueries in the SELECT list (verified
+    // live 2026-08-29: 422 unsupported expression type) — never reintroduce one.
+    expect(sql).not.toContain("(SELECT");
+    expect(sql).not.toContain("inclusion_probability");
   });
   it("topAccountsSql groups by account and limits to 10", () => {
     const sql = topAccountsSql(USAGE_DATASET, "2026-08-01 00:00:00");
