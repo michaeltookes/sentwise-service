@@ -44,6 +44,11 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
      reservation IDs keyed by Clerk userId. No prompts, no drafts, no emails.
   3. **Aggregate, hashed usage metrics** in Workers Analytics Engine (56b): a SHA-256 hash of the
      userId (never the raw id), the model, token counts, estimated cost, latency, and outcome.
+  4. **Interest flags** in the user's Clerk `privateMetadata.interest` (75): a topic key mapped to
+     the ISO timestamp of the user's first click asking to be notified when a parked capability
+     ships (e.g. `google-oauth`). Just a topic name + timestamp on the user's own account — no mail,
+     prompt, or draft content. The maintainer reads demand by filtering Clerk users on
+     `privateMetadata.interest` — there is no separate dashboard or off-account store.
 - **Cloudflare invocation logs are disabled** (`observability.logs.invocation_logs: false` in
   `wrangler.jsonc`), so Cloudflare retains no per-request records — only aggregate metrics (request
   counts, error rates) with no content.
@@ -60,12 +65,13 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, /admin/margin
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, /admin/margin
   -> src/auth.ts          verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts  derive the account's subscription (trial placeholder until 56c) — pure
   -> src/anthropic.ts     forward to Anthropic, map the response — no logging, no storage
   -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only; deletion tombstone
   -> src/analytics.ts     one aggregate hashed metric per draft — no content
+  -> src/interest.ts      record demand for a parked capability — a topic key + timestamp, no content
 ```
 
 ## API
@@ -266,6 +272,34 @@ are read on the same `getUser` as the trial, so metering adds no extra Clerk rou
 
 **Privacy.** The Durable Object stores only integers and timestamps; it never sees prompt or draft
 content. See the [Privacy design](#privacy-design--content-stateless-by-construction) section.
+
+### `POST /v1/interest` (item 75 — demand capture)
+
+Requires `Authorization: Bearer <clerk-session-token>`. Records that the signed-in user asked to be
+notified when a **parked capability** ships — today only sign-in-with-Google (the OAuth path the app
+offers when Workspace IMAP fails). This turns demand for the parked path into a measured signal
+instead of a guess.
+
+Request body:
+
+```json
+{ "topic": "google-oauth" }
+```
+
+`topic` must be one of a small server-side allowlist (currently just `google-oauth`; extend
+`INTEREST_TOPICS` in `src/interest.ts`). On success the Worker sets
+`privateMetadata.interest[topic]` on the user's own Clerk account to the ISO timestamp of the
+**first** click and returns **`204`** with no body. **First click wins:** a repeat call never
+overwrites the original timestamp and still returns `204` (idempotent). The write merges into
+`privateMetadata` exactly like `trialStartedAt`, leaving trial/quota/subscription keys untouched.
+
+- Unknown/missing `topic` or malformed JSON → **`400 invalid_request`**.
+- Missing/invalid session → **`401`**; wrong method (e.g. `GET`) → **`405`**.
+- A Clerk read/write failure → **`502 interest_failed`** (user-safe message, nothing logged).
+
+**Privacy.** The only thing stored is a topic name + timestamp on the user's own account — no mail,
+prompt, or draft content ever touches this path. There is no new dashboard: the maintainer reads
+demand by filtering Clerk users on `privateMetadata.interest`.
 
 ### `GET /admin/margin` (maintainer only)
 
