@@ -72,14 +72,15 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "DELETE") {
         const { userId } = await authenticate(request, env);
-        await quotaBeginAccountDeletion(env, userId);
+        const deletionAttemptId = crypto.randomUUID();
+        await quotaBeginAccountDeletion(env, userId, deletionAttemptId);
         try {
           await deleteClerkUser(userId, env);
         } catch (err) {
-          await cancelAccountDeletionBarrier(env, userId, ctx);
+          await cancelAccountDeletionBarrier(env, userId, deletionAttemptId, ctx);
           throw err;
         }
-        await finishAccountDeletion(env, userId, ctx);
+        await finishAccountDeletion(env, userId, deletionAttemptId, ctx);
         return new Response(null, { status: 204 });
       }
 
@@ -303,13 +304,16 @@ async function releaseReservedUsage(
 async function cancelAccountDeletionBarrier(
   env: Env,
   userId: string,
+  attemptId: string,
   ctx?: ExecutionContext,
 ): Promise<void> {
   try {
-    await retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId));
+    await retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId, attemptId));
   } catch {
     ctx?.waitUntil(
-      retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId)).catch(() => undefined),
+      retryQuotaSideEffect(() => quotaCancelAccountDeletion(env, userId, attemptId)).catch(
+        () => undefined,
+      ),
     );
     throw new ApiError(
       503,
@@ -322,13 +326,16 @@ async function cancelAccountDeletionBarrier(
 async function finishAccountDeletion(
   env: Env,
   userId: string,
+  attemptId: string,
   ctx?: ExecutionContext,
 ): Promise<void> {
   try {
-    await retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId));
+    await retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId, attemptId));
   } catch {
     ctx?.waitUntil(
-      retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId)).catch(() => undefined),
+      retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId, attemptId)).catch(
+        () => undefined,
+      ),
     );
   }
 }

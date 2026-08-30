@@ -17,9 +17,9 @@
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /peek    { now } -> { window }   (read + roll only; no rate-limit, no increment)
-//   POST /begin-delete  { now } -> block future quota reads/mutations without wiping counters
-//   POST /cancel-delete { now } -> remove an in-progress barrier after Clerk deletion fails
-//   POST /finish-delete { now } -> wipe counters and keep a deleted tombstone
+//   POST /begin-delete  { now, attemptId } -> block future quota reads/mutations
+//   POST /cancel-delete { now, attemptId } -> drop one failed deletion attempt from the barrier
+//   POST /finish-delete { now, attemptId } -> wipe counters and keep a deleted tombstone
 //   POST /wipe    {} -> compatibility alias for /finish-delete
 
 import type { Env } from "./config";
@@ -66,6 +66,7 @@ interface PeekBody {
 }
 interface DeletionBody {
   now?: number;
+  attemptId?: string;
 }
 interface PendingSettlement {
   reservationId: string;
@@ -82,7 +83,7 @@ interface SettledSettlementMarker {
 interface AccountDeletionMarker {
   status: "deleting" | "deleted";
   updatedAt: number;
-  recoverAt?: number;
+  attemptIds?: string[];
 }
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -100,8 +101,8 @@ const SETTLEMENT_RETRY_BASE_DELAY_MS = 60_000;
 const SETTLEMENT_RETRY_MAX_DELAY_MS = 15 * 60_000;
 const SETTLEMENT_MARKER_RETENTION_MS = RESERVATION_TTL_MS + SETTLEMENT_RETRY_MAX_DELAY_MS;
 const SETTLEMENT_MARKER_PRUNE_INTERVAL_MS = SETTLEMENT_RETRY_MAX_DELAY_MS;
-const ACCOUNT_DELETION_BARRIER_RECOVERY_MS = 15 * 60_000;
 const ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS = 60_000;
+const LEGACY_DELETION_ATTEMPT_ID = "legacy-deletion-attempt";
 
 export class AccountQuota {
   private readonly storage: DurableObjectStorage;
@@ -116,7 +117,7 @@ export class AccountQuota {
       case "/begin-delete":
         return this.handleBeginDelete(await request.json<DeletionBody>());
       case "/cancel-delete":
-        return this.handleCancelDelete();
+        return this.handleCancelDelete(await request.json<DeletionBody>());
       case "/finish-delete":
         return this.handleFinishDelete(await request.json<DeletionBody>());
       case "/wipe":
@@ -125,9 +126,6 @@ export class AccountQuota {
 
     const deletion = await this.loadAccountDeletionMarker();
     if (deletion) {
-      if (await this.recoverStaleDeletingMarker(deletion, Date.now())) {
-        return this.fetchWithoutDeletionPreflight(pathname, request);
-      }
       return accountDeletionResponse(deletion);
     }
 
@@ -365,28 +363,66 @@ export class AccountQuota {
   // after Clerk deletion has succeeded.
   private async handleBeginDelete(body: DeletionBody): Promise<Response> {
     const now = normalizedNow(body.now);
-    const current = await this.loadAccountDeletionMarker();
-    if (current?.status === "deleted") {
-      return Response.json({ deleting: true, alreadyDeleted: true });
+    const attemptId = normalizedId(body.attemptId);
+    if (!attemptId) {
+      return jsonError(400, "invalid_deletion_attempt", "A deletion attempt id is required.");
     }
-    const recoverAt = Date.now() + ACCOUNT_DELETION_BARRIER_RECOVERY_MS;
-    await this.scheduleAccountDeletionAlarm(recoverAt);
-    await this.storage.put(ACCOUNT_DELETION_KEY, {
-      status: "deleting",
-      updatedAt: now,
-      recoverAt,
+
+    const result = await this.storage.transaction(async (txn) => {
+      const current = await this.loadAccountDeletionMarkerFrom(txn);
+      if (current?.status === "deleted") {
+        return { deleting: true, alreadyDeleted: true, attemptId };
+      }
+
+      const attemptIds = current?.status === "deleting" ? activeDeletionAttemptIds(current) : [];
+      if (!attemptIds.includes(attemptId)) {
+        attemptIds.push(attemptId);
+      }
+      await txn.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: now,
+        attemptIds,
+      });
+      return { deleting: true, alreadyDeleted: false, attemptId };
     });
-    return Response.json({ deleting: true, alreadyDeleted: false });
+    return Response.json(result);
   }
 
-  private async handleCancelDelete(): Promise<Response> {
-    const current = await this.loadAccountDeletionMarker();
-    if (current?.status === "deleting") {
-      await this.storage.delete(ACCOUNT_DELETION_KEY);
-      await this.schedulePendingSettlementAlarm();
-      return Response.json({ cancelled: true });
+  private async handleCancelDelete(body: DeletionBody): Promise<Response> {
+    const now = normalizedNow(body.now);
+    const attemptId = normalizedId(body.attemptId);
+    if (!attemptId) {
+      return jsonError(400, "invalid_deletion_attempt", "A deletion attempt id is required.");
     }
-    return Response.json({ cancelled: false });
+
+    const result = await this.storage.transaction(async (txn) => {
+      const current = await this.loadAccountDeletionMarkerFrom(txn);
+      if (current?.status !== "deleting") {
+        return { cancelled: false, barrierActive: current !== undefined };
+      }
+
+      const attemptIds = activeDeletionAttemptIds(current);
+      if (!attemptIds.includes(attemptId)) {
+        return { cancelled: false, barrierActive: true };
+      }
+
+      const remainingAttemptIds = attemptIds.filter((id) => id !== attemptId);
+      if (remainingAttemptIds.length > 0) {
+        await txn.put(ACCOUNT_DELETION_KEY, {
+          ...current,
+          updatedAt: now,
+          attemptIds: remainingAttemptIds,
+        });
+        return { cancelled: true, barrierActive: true };
+      }
+
+      await txn.delete(ACCOUNT_DELETION_KEY);
+      return { cancelled: true, barrierActive: false };
+    });
+    if (result.cancelled && !result.barrierActive) {
+      await this.schedulePendingSettlementAlarm();
+    }
+    return Response.json(result);
   }
 
   private async handleFinishDelete(body: DeletionBody): Promise<Response> {
@@ -438,23 +474,9 @@ export class AccountQuota {
       return;
     }
 
-    if (await this.recoverStaleDeletingMarker(marker, now)) {
-      return;
-    }
-
-    await this.scheduleAccountDeletionAlarm(deletingRecoverAt(marker));
-  }
-
-  private async recoverStaleDeletingMarker(
-    marker: AccountDeletionMarker,
-    now: number,
-  ): Promise<boolean> {
-    if (marker.status !== "deleting" || deletingRecoverAt(marker) > now) {
-      return false;
-    }
-    await this.storage.delete(ACCOUNT_DELETION_KEY);
-    await this.schedulePendingSettlementAlarm();
-    return true;
+    // The DO cannot infer whether Clerk deletion failed or succeeded. Preserve
+    // the barrier until a matching cancel-delete or finish-delete call records
+    // the outcome.
   }
 
   private async scheduleAccountDeletionAlarm(when: number): Promise<void> {
@@ -636,8 +658,11 @@ function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
   );
 }
 
-function deletingRecoverAt(marker: AccountDeletionMarker): number {
-  return marker.recoverAt ?? marker.updatedAt + ACCOUNT_DELETION_BARRIER_RECOVERY_MS;
+function activeDeletionAttemptIds(marker: AccountDeletionMarker): string[] {
+  const attemptIds = Array.isArray(marker.attemptIds)
+    ? marker.attemptIds.filter((id): id is string => typeof id === "string" && id !== "")
+    : [];
+  return attemptIds.length > 0 ? attemptIds : [LEGACY_DELETION_ATTEMPT_ID];
 }
 
 function accountDeletionResponse(marker: AccountDeletionMarker): Response {

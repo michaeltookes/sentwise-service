@@ -77,6 +77,7 @@ function internalUrl(input: RequestInfo | URL): URL {
 
 function internalBody(init: RequestInit | undefined): {
   now?: number;
+  attemptId?: string;
   reservationId?: string;
   reservationWindowStart?: number;
   estimatedTokens?: number;
@@ -85,6 +86,7 @@ function internalBody(init: RequestInit | undefined): {
   if (typeof init?.body !== "string") return {};
   return JSON.parse(init.body) as {
     now?: number;
+    attemptId?: string;
     reservationId?: string;
     reservationWindowStart?: number;
     estimatedTokens?: number;
@@ -194,6 +196,7 @@ function quotaNamespaceWithDeletionFailures(options: {
 } {
   let deleting = false;
   let deleted = false;
+  const attemptIds = new Set<string>();
   let cancelCalls = 0;
   let finishCalls = 0;
   const windowStart = mondayStartUtc(Date.now());
@@ -204,20 +207,31 @@ function quotaNamespaceWithDeletionFailures(options: {
     tokensUsed: 5,
   };
   const stub = {
-    fetch: vi.fn((input: RequestInfo | URL) => {
+    fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const path = internalUrl(input).pathname;
+      const body = internalBody(init);
       if (path === "/begin-delete") {
         deleting = true;
-        return Promise.resolve(Response.json({ deleting: true, alreadyDeleted: false }));
+        attemptIds.add(body.attemptId ?? "");
+        return Promise.resolve(
+          Response.json({
+            deleting: true,
+            alreadyDeleted: false,
+            attemptId: body.attemptId,
+          }),
+        );
       }
       if (path === "/cancel-delete") {
         cancelCalls += 1;
         if (cancelCalls <= (options.cancelFailures ?? 0)) {
           return Promise.reject(new Error("cancel failed"));
         }
-        const wasDeleting = deleting;
-        deleting = false;
-        return Promise.resolve(Response.json({ cancelled: wasDeleting }));
+        const wasDeleting = deleting && attemptIds.has(body.attemptId ?? "");
+        attemptIds.delete(body.attemptId ?? "");
+        deleting = attemptIds.size > 0;
+        return Promise.resolve(
+          Response.json({ cancelled: wasDeleting, barrierActive: deleting || deleted }),
+        );
       }
       if (path === "/finish-delete") {
         finishCalls += 1;
@@ -226,6 +240,7 @@ function quotaNamespaceWithDeletionFailures(options: {
         }
         deleting = false;
         deleted = true;
+        attemptIds.clear();
         return Promise.resolve(Response.json({ deleted: true, cleanupPending: false }));
       }
       if (path === "/peek") {

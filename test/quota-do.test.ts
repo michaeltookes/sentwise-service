@@ -164,9 +164,13 @@ describe("AccountQuota Durable Object", () => {
     const begin = await callDO<{ deleting: boolean; alreadyDeleted: boolean }>(
       uid,
       "/begin-delete",
-      { now: MON + 1 },
+      { now: MON + 1, attemptId: "delete-barrier-attempt" },
     );
-    expect(begin).toEqual({ deleting: true, alreadyDeleted: false });
+    expect(begin).toEqual({
+      deleting: true,
+      alreadyDeleted: false,
+      attemptId: "delete-barrier-attempt",
+    });
 
     const blockedOps = [
       ["/check", { now: MON + 2, rateLimitPerMin: 10 }],
@@ -217,7 +221,10 @@ describe("AccountQuota Durable Object", () => {
       expect(((await res.json()) as any).error.type).toBe("account_deletion_in_progress");
     }
 
-    const cancel = await callDO<{ cancelled: boolean }>(uid, "/cancel-delete", {});
+    const cancel = await callDO<{ cancelled: boolean }>(uid, "/cancel-delete", {
+      now: MON + 3,
+      attemptId: "delete-barrier-attempt",
+    });
     expect(cancel.cancelled).toBe(true);
 
     const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 3 });
@@ -245,8 +252,11 @@ describe("AccountQuota Durable Object", () => {
       tokensDelta: 500,
     });
 
-    await callDO(uid, "/begin-delete", { now: MON + 2 });
-    const finish = await callDO<{ deleted: boolean }>(uid, "/finish-delete", { now: MON + 3 });
+    await callDO(uid, "/begin-delete", { now: MON + 2, attemptId: "delete-finish-attempt" });
+    const finish = await callDO<{ deleted: boolean }>(uid, "/finish-delete", {
+      now: MON + 3,
+      attemptId: "delete-finish-attempt",
+    });
     expect(finish.deleted).toBe(true);
     expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
     expect(await pendingSettlements(stub)).toEqual([]);
@@ -289,7 +299,79 @@ describe("AccountQuota Durable Object", () => {
     expect(((await peek.json()) as any).error.type).toBe("account_deleted");
   });
 
-  it("alarm recovers a stale in-progress deletion barrier without wiping counters", async () => {
+  it("cancel-delete only removes the matching deletion attempt", async () => {
+    const uid = "do-delete-concurrent-cancel";
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-concurrent-cancel-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await callDO(uid, "/begin-delete", { now: MON + 1, attemptId: "attempt-a" });
+    await callDO(uid, "/begin-delete", { now: MON + 2, attemptId: "attempt-b" });
+
+    const cancelA = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: MON + 3,
+        attemptId: "attempt-a",
+      },
+    );
+    expect(cancelA).toEqual({ cancelled: true, barrierActive: true });
+
+    const blocked = await callDOResponse(uid, "/peek", { now: MON + 4 });
+    expect(blocked.status).toBe(409);
+    expect(((await blocked.json()) as any).error.type).toBe("account_deletion_in_progress");
+
+    const cancelB = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: MON + 5,
+        attemptId: "attempt-b",
+      },
+    );
+    expect(cancelB).toEqual({ cancelled: true, barrierActive: false });
+
+    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 6 });
+    expect(peek.window.draftsUsed).toBe(1);
+    expect(peek.window.tokensReserved).toBe(250);
+  });
+
+  it("does not cancel a legacy deletion barrier with a new failed attempt", async () => {
+    const uid = "do-delete-legacy-barrier";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await callDO<ReserveResult>(uid, "/reserve", {
+      now: MON,
+      reservationId: "delete-legacy-barrier-1",
+      estimatedTokens: 250,
+      limits: hardLimits,
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(ACCOUNT_DELETION_KEY, {
+        status: "deleting",
+        updatedAt: MON,
+      });
+    });
+
+    await callDO(uid, "/begin-delete", { now: MON + 1, attemptId: "new-attempt" });
+    const cancel = await callDO<{ cancelled: boolean; barrierActive: boolean }>(
+      uid,
+      "/cancel-delete",
+      {
+        now: MON + 2,
+        attemptId: "new-attempt",
+      },
+    );
+    expect(cancel).toEqual({ cancelled: true, barrierActive: true });
+
+    const blocked = await callDOResponse(uid, "/peek", { now: MON + 3 });
+    expect(blocked.status).toBe(409);
+    expect(((await blocked.json()) as any).error.type).toBe("account_deletion_in_progress");
+  });
+
+  it("alarm preserves an in-progress deletion barrier without wiping counters", async () => {
     const uid = "do-delete-stale-barrier";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
     await callDO<ReserveResult>(uid, "/reserve", {
@@ -302,7 +384,7 @@ describe("AccountQuota Durable Object", () => {
       await state.storage.put(ACCOUNT_DELETION_KEY, {
         status: "deleting",
         updatedAt: MON,
-        recoverAt: 1,
+        attemptIds: ["stale-attempt"],
       });
     });
 
@@ -310,10 +392,10 @@ describe("AccountQuota Durable Object", () => {
       await (instance as { alarm: () => Promise<void> }).alarm();
     });
 
-    const peek = await callDO<WindowResult>(uid, "/peek", { now: MON + 1 });
-    expect(peek.window.draftsUsed).toBe(1);
-    expect(peek.window.tokensReserved).toBe(250);
-    expect(await storedKeys(stub)).not.toContain(ACCOUNT_DELETION_KEY);
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 1 });
+    expect(peek.status).toBe(409);
+    expect(((await peek.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(await storedKeys(stub)).toContain(ACCOUNT_DELETION_KEY);
   });
 
   it("release rolls back only the reserved draft in the same window", async () => {

@@ -31,9 +31,11 @@ export interface SettleBody {
 export interface BeginAccountDeletionResult {
   deleting: boolean;
   alreadyDeleted: boolean;
+  attemptId: string;
 }
 export interface CancelAccountDeletionResult {
   cancelled: boolean;
+  barrierActive?: boolean;
 }
 export interface FinishAccountDeletionResult {
   deleted: boolean;
@@ -136,24 +138,36 @@ export function quotaPeek(env: Env, userId: string, body: { now: number }): Prom
 export function quotaBeginAccountDeletion(
   env: Env,
   userId: string,
+  attemptId: string,
 ): Promise<BeginAccountDeletionResult> {
-  return call<BeginAccountDeletionResult>(env, userId, "/begin-delete", { now: Date.now() });
+  return call<BeginAccountDeletionResult>(env, userId, "/begin-delete", {
+    now: Date.now(),
+    attemptId,
+  });
 }
 
 /** Remove an in-progress deletion barrier when Clerk deletion fails. */
 export function quotaCancelAccountDeletion(
   env: Env,
   userId: string,
+  attemptId: string,
 ): Promise<CancelAccountDeletionResult> {
-  return call<CancelAccountDeletionResult>(env, userId, "/cancel-delete", { now: Date.now() });
+  return call<CancelAccountDeletionResult>(env, userId, "/cancel-delete", {
+    now: Date.now(),
+    attemptId,
+  });
 }
 
 /** Wipe account quota data after Clerk deletion succeeds and keep a stale-token tombstone. */
 export function quotaFinishAccountDeletion(
   env: Env,
   userId: string,
+  attemptId: string,
 ): Promise<FinishAccountDeletionResult> {
-  return call<FinishAccountDeletionResult>(env, userId, "/finish-delete", { now: Date.now() });
+  return call<FinishAccountDeletionResult>(env, userId, "/finish-delete", {
+    now: Date.now(),
+    attemptId,
+  });
 }
 
 /**
