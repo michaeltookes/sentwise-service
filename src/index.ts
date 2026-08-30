@@ -176,8 +176,18 @@ export default {
         }
         const latencyMs = Date.now() - t0;
 
-        // 5) Settle real usage into the reserved window, then report the updated quota.
+        // 5) Record provider usage, then settle it into the reserved window.
+        // Settlement may be delayed by account deletion, but the provider cost
+        // already happened and should still feed aggregate margin metrics.
         const tokensDelta = result.usage.inputTokens + result.usage.outputTokens;
+        await recordUsage(env, {
+          userId,
+          model,
+          inputTokens: result.usage.inputTokens,
+          outputTokens: result.usage.outputTokens,
+          latencyMs,
+          outcome: "ok",
+        });
         const window = await settleReservedUsage(
           env,
           userId,
@@ -187,14 +197,6 @@ export default {
           tokensDelta,
           ctx,
         );
-        await recordUsage(env, {
-          userId,
-          model,
-          inputTokens: result.usage.inputTokens,
-          outputTokens: result.usage.outputTokens,
-          latencyMs,
-          outcome: "ok",
-        });
 
         return Response.json({ ...result, quota: buildQuota(window, limits) });
       }

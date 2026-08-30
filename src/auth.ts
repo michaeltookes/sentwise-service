@@ -165,8 +165,9 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
 /**
  * Delete the Clerk user (73, account deletion). Idempotent: a user that is
  * already gone (Clerk 404) resolves successfully so DELETE /v1/me stays 204 on
- * retry. Any other Clerk failure becomes a user-safe 502 — no upstream detail
- * leaks, and (per the privacy guard) nothing is logged.
+ * retry. Definitive non-404 Clerk responses become a user-safe 502; rejected
+ * requests are treated as unknown outcomes because Clerk may have committed the
+ * delete before the transport failed.
  *
  * The caller wraps this with the AccountQuota deletion barrier so in-flight
  * requests cannot mutate quota state while Clerk deletion is in progress.
@@ -191,21 +192,10 @@ export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
     );
   } catch (err) {
     if (err instanceof ApiError) throw err;
-    if (isAbortError(err)) throw new ClerkDeletionOutcomeUnknownError();
-    throw new ApiError(
-      502,
-      "account_deletion_failed",
-      "Could not delete your account. Please try again.",
-    );
+    throw new ClerkDeletionOutcomeUnknownError();
   } finally {
     clearTimeout(timeout);
   }
-}
-
-function isAbortError(err: unknown): boolean {
-  return (
-    typeof err === "object" && err !== null && (err as { name?: unknown }).name === "AbortError"
-  );
 }
 
 interface ClerkUserLike {

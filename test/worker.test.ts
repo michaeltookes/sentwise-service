@@ -36,6 +36,22 @@ const env: Env = {
 
 const ACCOUNT_DELETION_KEY = "account_deletion";
 
+function usageAnalytics() {
+  const writeDataPoint = vi.fn();
+  return {
+    dataset: { writeDataPoint } as unknown as AnalyticsEngineDataset,
+    writeDataPoint,
+  };
+}
+
+async function clearAccountDeletionState(userId: string): Promise<void> {
+  const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.delete(ACCOUNT_DELETION_KEY);
+    await state.storage.deleteAlarm();
+  });
+}
+
 function req(path: string, init?: RequestInit): Request {
   return new Request(`https://sentwise-inference.test${path}`, init);
 }
@@ -756,14 +772,31 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
       const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
       expect(me.status).toBe(409);
       expect(((await me.json()) as any).error.type).toBe("account_deletion_in_progress");
-      const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-timeout"));
-      await runInDurableObject(stub, async (_instance, state) => {
-        await state.storage.delete(ACCOUNT_DELETION_KEY);
-        await state.storage.deleteAlarm();
-      });
+      await clearAccountDeletionState("u-del-timeout");
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps the deletion barrier when Clerk delete has a transport failure", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-transport-fail" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("network failed"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+
+    expect(del.status).toBe(503);
+    expect(((await del.json()) as any).error.type).toBe("account_deletion_status_unknown");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.clerk.com/v1/users/u-del-transport-fail",
+      expect.objectContaining({ method: "DELETE", signal: expect.any(AbortSignal) }),
+    );
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(409);
+    expect(((await me.json()) as any).error.type).toBe("account_deletion_in_progress");
+    await clearAccountDeletionState("u-del-transport-fail");
   });
 
   it("blocks an authenticated draft from settling after deletion starts", async () => {
@@ -803,6 +836,8 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     const upstream = deferred<Response>();
     const clerkDelete = deferred<Response>();
     const deleteStarted = deferred<void>();
+    const analytics = usageAnalytics();
+    const analyticsEnv: Env = { ...env, USAGE_ANALYTICS: analytics.dataset };
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (isClerkDelete(input, init)) {
         deleteStarted.resolve();
@@ -815,15 +850,26 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     vi.stubGlobal("fetch", fetchMock);
     mocks.getUser.mockResolvedValue(activeTrial());
 
-    const draft = worker.fetch(draftReq("u-del-settle-cancel"), env);
+    const draft = worker.fetch(draftReq("u-del-settle-cancel"), analyticsEnv);
     await started.promise;
-    const deletion = worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    const deletion = worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      analyticsEnv,
+    );
     await deleteStarted.promise;
 
     upstream.resolve(anthropicOk("late"));
     const completedDraft = await draft;
     expect(completedDraft.status).toBe(409);
     expect(((await completedDraft.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(analytics.writeDataPoint).toHaveBeenCalledOnce();
+    const dataPoint = analytics.writeDataPoint.mock.calls[0][0] as {
+      blobs: string[];
+      doubles: number[];
+    };
+    expect(dataPoint.blobs[2]).toBe("ok");
+    expect(dataPoint.doubles[0]).toBe(3);
+    expect(dataPoint.doubles[1]).toBe(2);
 
     clerkDelete.resolve(clerkDeleteResponse(500));
     const failedDeletion = await deletion;
@@ -834,7 +880,7 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
       await (instance as { alarm: () => Promise<void> }).alarm();
     });
 
-    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), analyticsEnv);
     const quota = ((await me.json()) as any).quota;
     expect(quota.used).toBe(1);
     expect(quota.tokensUsed).toBe(5);
