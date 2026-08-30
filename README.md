@@ -47,14 +47,15 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
 - **Cloudflare invocation logs are disabled** (`observability.logs.invocation_logs: false` in
   `wrangler.jsonc`), so Cloudflare retains no per-request records — only aggregate metrics (request
   counts, error rates) with no content.
-- **Account deletion removes everything there is to remove** (`DELETE /v1/me`, 73): the Clerk user
-  (with `trialStartedAt` / `subscription`) and the account's Durable Object usage data (all usage
-  counters, reservations, and the settlement alarm). A minimal DO tombstone remains so stale
-  already-issued tokens cannot recreate fresh usage state after deletion. The Analytics Engine
-  metrics are **anonymous, immutable aggregates** — the userId is only ever stored as a one-way
-  SHA-256 hash that cannot be reversed, there is no per-user record to look up or delete, and the
-  rows are not editable by design. So "delete my account" is complete even though those aggregates
-  remain.
+- **Account deletion removes Clerk account state and Durable Object usage state**
+  (`DELETE /v1/me`, 73): the Clerk user (with `trialStartedAt` / `subscription`) and the account's
+  Durable Object usage data (all usage counters, reservations, and the settlement alarm). A minimal
+  DO tombstone remains so stale already-issued tokens cannot recreate fresh usage state after
+  deletion. Workers Analytics Engine usage rows are retained separately as content-free,
+  pseudonymous metrics keyed by a deterministic SHA-256 hash of the Clerk userId. The hash is not
+  reversible by itself, but anyone who already knows the former Clerk userId can recompute it and
+  find those rows. They are retained for aggregate margin/usage reporting and are not deleted by
+  this endpoint.
 
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
@@ -138,24 +139,31 @@ What is deleted:
 
 1. The account's **usage Durable Object** first receives a deletion barrier (`AccountQuota`
    `/begin-delete`). This blocks later `/check`, `/reserve`, `/settle`, `/defer-settlement`,
-   `/release`, and `/peek` calls so an in-flight authenticated request cannot recreate state during
-   deletion.
-2. The **Clerk user** is then deleted (`clerkClient.users.deleteUser`), which removes
-   `trialStartedAt` and any `subscription` / `quota` metadata.
+   `/defer-release`, `/release`, and `/peek` calls so an in-flight authenticated request cannot
+   recreate state during deletion.
+2. The **Clerk user** is then deleted via Clerk's REST API, which removes `trialStartedAt` and any
+   `subscription` / `quota` metadata.
 3. After Clerk deletion succeeds (including idempotent 404), the Durable Object finalizes deletion
    (`/finish-delete`): all weekly counters, in-flight reservations, settlement markers, and the
    settlement alarm are removed, while a minimal deleted tombstone remains.
 
-If Clerk returns a non-404 failure, the deletion barrier is cancelled and the existing metering state
-is preserved; quota is not reset for an active account. The call is **idempotent**: if the Clerk user
-is already gone it still returns `204`. A Clerk failure returns **`502 account_deletion_failed`** (a
-user-safe message with no upstream detail; nothing is logged).
+If Clerk returns a definitive non-404 failure response, the deletion barrier is cancelled and the
+existing metering state is preserved; quota is not reset for an active account. That failure returns
+**`502 account_deletion_failed`** with a user-safe message and no upstream detail.
 
-What is **not** deleted, because it doesn't exist as per-user data: the **Analytics Engine** metrics
-are anonymous, immutable aggregates keyed by a one-way SHA-256 hash of the userId — there is no
-reversible per-user record to remove (see [Privacy design](#privacy-design--content-stateless-by-construction)).
-No content is ever stored, so there is nothing else to delete. Local Mac data (mail, voice profile)
-never leaves the machine and is untouched by this call.
+If the Clerk delete times out or fails at the transport layer, the outcome is unknown because Clerk
+may still have committed the deletion. In that case the Worker returns
+**`503 account_deletion_status_unknown`** and deliberately leaves the Durable Object deletion barrier
+active. The Durable Object alarm continues checking Clerk; it finalizes deletion if Clerk confirms
+the user is gone, and a user with a still-valid session can retry `DELETE /v1/me`.
+
+The call is **idempotent**: if the Clerk user is already gone it still returns `204`.
+
+What is **not** deleted: the **Analytics Engine** usage metrics. They contain no content, email, or
+raw userId, but they are pseudonymous per-account metric rows keyed by a deterministic SHA-256 hash
+of the Clerk userId and retained for aggregate margin/usage reporting (see
+[Privacy design](#privacy-design--content-stateless-by-construction)). Local Mac data (mail, voice
+profile) never leaves the machine and is untouched by this call.
 
 ### `POST /v1/draft`
 
