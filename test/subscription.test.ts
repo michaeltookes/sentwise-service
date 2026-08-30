@@ -96,6 +96,35 @@ describe("parseSubscriptionOverride", () => {
     ).toEqual({ plan: "individual", status: "active", renewsAt: null, manageBillingUrl: null });
   });
 
+  it("drops parseable but non-canonical renewsAt values to null", () => {
+    for (const renewsAt of [
+      "12/01/2026",
+      "2026-12-01",
+      "2026-12-01T00:00:00Z",
+      "2026-12-01T00:00:00.000+00:00",
+      "2026-02-30T00:00:00.000Z",
+    ]) {
+      expect(parseSubscriptionOverride({ plan: "individual", status: "active", renewsAt })).toEqual(
+        { plan: "individual", status: "active", renewsAt: null, manageBillingUrl: null },
+      );
+    }
+  });
+
+  it("keeps canonical ISO renewsAt values", () => {
+    expect(
+      parseSubscriptionOverride({
+        plan: "individual",
+        status: "active",
+        renewsAt: "2026-12-01T00:00:00.000Z",
+      }),
+    ).toEqual({
+      plan: "individual",
+      status: "active",
+      renewsAt: "2026-12-01T00:00:00.000Z",
+      manageBillingUrl: null,
+    });
+  });
+
   it("drops a non-https manageBillingUrl to null", () => {
     expect(
       parseSubscriptionOverride({

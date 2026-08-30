@@ -41,7 +41,11 @@ function isStatus(v: unknown): v is SubscriptionStatus {
 }
 
 function validIso(v: unknown): string | null {
-  return typeof v === "string" && v !== "" && !Number.isNaN(Date.parse(v)) ? v : null;
+  if (typeof v !== "string" || v === "") return null;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(v)) return null;
+
+  const parsed = new Date(v);
+  return Number.isNaN(parsed.getTime()) || parsed.toISOString() !== v ? null : v;
 }
 
 function validHttpsUrl(v: unknown): string | null {
