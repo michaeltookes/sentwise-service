@@ -84,7 +84,6 @@ interface SettledSettlementMarker {
 interface AccountDeletionAttempt {
   id: string;
   expiresAt: number;
-  liveVerifiedAt?: number;
 }
 interface AccountDeletionMarker {
   status: "deleting" | "deleted";
@@ -400,7 +399,6 @@ export class AccountQuota {
       const existingAttempt = attempts.find((attempt) => attempt.id === attemptId);
       if (existingAttempt) {
         existingAttempt.expiresAt = expiresAt;
-        delete existingAttempt.liveVerifiedAt;
       } else {
         attempts.push({ id: attemptId, expiresAt });
       }
@@ -573,21 +571,13 @@ export class AccountQuota {
 
       const remainingAttempts = activeDeletionAttempts(current).flatMap((attempt) => {
         if (attempt.expiresAt > now) return [attempt];
-        if (isDeletionAttemptConfirmedLive(attempt, now)) return [];
         return [
           {
             ...attempt,
             expiresAt: now + ACCOUNT_DELETION_BARRIER_TIMEOUT_MS,
-            liveVerifiedAt: now,
           },
         ];
       });
-      if (remainingAttempts.length === 0) {
-        await txn.delete(ACCOUNT_DELETION_KEY);
-        await scheduleAccountDeletionAlarmOn(txn, now + 1);
-        return undefined;
-      }
-
       const nextMarker: AccountDeletionMarker = {
         status: "deleting",
         updatedAt: now,
@@ -781,7 +771,7 @@ function activeDeletionAttempts(marker: AccountDeletionMarker): AccountDeletionA
   if (Array.isArray(marker.attempts)) {
     for (const attempt of marker.attempts) {
       if (!isAccountDeletionAttempt(attempt)) continue;
-      attemptsById.set(attempt.id, attempt);
+      attemptsById.set(attempt.id, { id: attempt.id, expiresAt: attempt.expiresAt });
     }
   }
   const attemptIds = Array.isArray(marker.attemptIds)
@@ -808,14 +798,6 @@ function isAccountDeletionAttempt(v: unknown): v is AccountDeletionAttempt {
     typeof attempt.expiresAt === "number" &&
     Number.isFinite(attempt.expiresAt) &&
     attempt.expiresAt > 0
-  );
-}
-
-function isDeletionAttemptConfirmedLive(attempt: AccountDeletionAttempt, now: number): boolean {
-  return (
-    typeof attempt.liveVerifiedAt === "number" &&
-    Number.isFinite(attempt.liveVerifiedAt) &&
-    attempt.liveVerifiedAt + ACCOUNT_DELETION_BARRIER_TIMEOUT_MS <= now
   );
 }
 

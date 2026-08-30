@@ -128,13 +128,25 @@ export async function resolveAccount(
 
 /** Return whether Clerk still has this user; 404 means already deleted. */
 export async function clerkUserExists(userId: string, env: Env): Promise<boolean> {
-  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CLERK_DELETE_TIMEOUT_MS);
   try {
-    await clerk.users.getUser(userId);
-    return true;
-  } catch (err) {
-    if (isClerkNotFound(err)) return false;
-    throw err;
+    const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+      headers: {
+        Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (res.ok) return true;
+    if (res.status === 404) return false;
+    throw new ApiError(
+      502,
+      "account_lookup_failed",
+      "Could not confirm your account deletion status. Please try again.",
+    );
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -194,12 +206,6 @@ function isAbortError(err: unknown): boolean {
   return (
     typeof err === "object" && err !== null && (err as { name?: unknown }).name === "AbortError"
   );
-}
-
-/** True when a Clerk error reports the resource is gone (HTTP 404). */
-function isClerkNotFound(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  return (err as { status?: number }).status === 404;
 }
 
 interface ClerkUserLike {

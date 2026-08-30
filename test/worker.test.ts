@@ -25,6 +25,7 @@ vi.mock("@clerk/backend", () => ({
 
 // Import AFTER the mock is registered.
 import worker from "../src/index";
+import { clerkUserExists } from "../src/auth";
 
 const env: Env = {
   ...testEnv,
@@ -32,6 +33,8 @@ const env: Env = {
   ANTHROPIC_API_KEY: "sk-ant-test",
   CLERK_PUBLISHABLE_KEY: "pk_test",
 };
+
+const ACCOUNT_DELETION_KEY = "account_deletion";
 
 function req(path: string, init?: RequestInit): Request {
   return new Request(`https://sentwise-inference.test${path}`, init);
@@ -64,6 +67,10 @@ function isClerkDelete(input: RequestInfo | URL, init?: RequestInit): boolean {
   return (
     requestUrl(input).startsWith("https://api.clerk.com/v1/users/") && init?.method === "DELETE"
   );
+}
+
+function isClerkUserLookup(input: RequestInfo | URL, init?: RequestInit): boolean {
+  return requestUrl(input).startsWith("https://api.clerk.com/v1/users/") && !init?.method;
 }
 
 function deferred<T>() {
@@ -300,6 +307,7 @@ function quotaNamespaceWithDeletionFailures(options: {
 }
 
 beforeEach(() => {
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   mocks.verifyToken.mockReset();
   mocks.getUser.mockReset();
@@ -335,6 +343,49 @@ describe("auth", () => {
     );
     expect(res.status).toBe(401);
     expect(((await res.json()) as any).error.type).toBe("session_invalid");
+  });
+
+  it("bounds Clerk user existence lookups with an abort signal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-05T00:00:00.000Z"));
+    try {
+      const lookupStarted = deferred<void>();
+      let aborted = false;
+      const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        lookupStarted.resolve();
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            aborted = true;
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+            },
+            { once: true },
+          );
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const lookup = clerkUserExists("user_lookup_timeout", env);
+      const rejected = expect(lookup).rejects.toMatchObject({ name: "AbortError" });
+      await lookupStarted.promise;
+      await vi.advanceTimersByTimeAsync(CLERK_DELETE_TIMEOUT_MS);
+
+      await rejected;
+      expect(aborted).toBe(true);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://api.clerk.com/v1/users/user_lookup_timeout",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -705,6 +756,11 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
       const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
       expect(me.status).toBe(409);
       expect(((await me.json()) as any).error.type).toBe("account_deletion_in_progress");
+      const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-timeout"));
+      await runInDurableObject(stub, async (_instance, state) => {
+        await state.storage.delete(ACCOUNT_DELETION_KEY);
+        await state.storage.deleteAlarm();
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -715,6 +771,7 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     const upstream = deferred<Response>();
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (isClerkDelete(input, init)) return Promise.resolve(clerkDeleteResponse());
+      if (isClerkUserLookup(input, init)) return Promise.resolve(clerkDeleteResponse());
       started.resolve();
       return upstream.promise;
     });
@@ -731,7 +788,14 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     const completedDraft = await draft;
     expect(completedDraft.status).toBe(410);
     expect(((await completedDraft.json()) as any).error.type).toBe("account_deleted");
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const calls = fetchMock.mock.calls;
+    expect(calls.filter(([input, init]) => isClerkDelete(input, init))).toHaveLength(1);
+    expect(
+      calls.filter(
+        ([input, init]) =>
+          requestUrl(input).startsWith("https://api.anthropic.com/") && init?.method === "POST",
+      ),
+    ).toHaveLength(1);
   });
 
   it("defers a settlement blocked by a deletion that is later canceled", async () => {
@@ -744,6 +808,7 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
         deleteStarted.resolve();
         return clerkDelete.promise;
       }
+      if (isClerkUserLookup(input, init)) return Promise.resolve(clerkDeleteResponse());
       started.resolve();
       return upstream.promise;
     });
