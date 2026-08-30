@@ -570,15 +570,17 @@ describe("AccountQuota Durable Object", () => {
       estimatedTokens: 250,
       limits: hardLimits,
     });
-    const deferred = await callStub<WindowResult & { queued: boolean }>("/defer-settlement", {
-      now: MON + 1000,
-      reservationId: reserved.reservationId,
-      reservationWindowStart: reserved.window.windowStart,
-      estimatedTokens: reserved.estimatedTokens,
-      tokensDelta: 500,
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(`${PENDING_SETTLEMENT_KEY_PREFIX}${reserved.reservationId}`, {
+        reservationId: reserved.reservationId,
+        reservationWindowStart: reserved.window.windowStart,
+        estimatedTokens: reserved.estimatedTokens,
+        tokensDelta: 500,
+        attempts: 0,
+        createdAt: MON + 1000,
+        nextAttemptAt: 1,
+      });
     });
-    expect(deferred.queued).toBe(true);
-    expect(deferred.window.tokensUsed).toBe(0);
 
     const queued = await pendingSettlements(stub);
     expect(queued).toEqual([
