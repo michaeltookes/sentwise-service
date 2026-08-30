@@ -9,12 +9,17 @@ const mocks = vi.hoisted(() => ({
   verifyToken: vi.fn(),
   getUser: vi.fn(),
   updateUserMetadata: vi.fn(),
+  deleteUser: vi.fn(),
 }));
 
 vi.mock("@clerk/backend", () => ({
   verifyToken: mocks.verifyToken,
   createClerkClient: () => ({
-    users: { getUser: mocks.getUser, updateUserMetadata: mocks.updateUserMetadata },
+    users: {
+      getUser: mocks.getUser,
+      updateUserMetadata: mocks.updateUserMetadata,
+      deleteUser: mocks.deleteUser,
+    },
   }),
 }));
 
@@ -174,6 +179,7 @@ beforeEach(() => {
   mocks.verifyToken.mockReset();
   mocks.getUser.mockReset();
   mocks.updateUserMetadata.mockReset();
+  mocks.deleteUser.mockReset();
 });
 
 describe("GET /healthz", () => {
@@ -362,6 +368,108 @@ describe("GET /v1/me", () => {
     const body = (await res.json()) as any;
     expect(body.trial.active).toBe(true);
     expect(body.trial.startedAt).toBe(started);
+  });
+
+  // 73 — subscription field (placeholder derived from the trial until 56c).
+  it("derives a not-started subscription before the trial begins", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({})); // no trial yet
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const body = (await res.json()) as any;
+    expect(body.subscription).toEqual({
+      plan: "trial",
+      status: "trialing",
+      renewsAt: null,
+      manageBillingUrl: null,
+    });
+  });
+
+  it("derives a trialing subscription with renewsAt from an active trial", async () => {
+    const started = new Date(Date.now() - 1000).toISOString();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ trialStartedAt: started }));
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const body = (await res.json()) as any;
+    expect(body.subscription.plan).toBe("trial");
+    expect(body.subscription.status).toBe("trialing");
+    expect(body.subscription.renewsAt).toBe(body.trial.endsAt);
+    expect(body.subscription.manageBillingUrl).toBeNull();
+  });
+
+  it("uses a valid privateMetadata.subscription override verbatim", async () => {
+    const override = {
+      plan: "individual",
+      status: "active",
+      renewsAt: "2026-12-01T00:00:00.000Z",
+      manageBillingUrl: "https://billing.example.com/p/abc",
+    };
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: override,
+      }),
+    );
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const body = (await res.json()) as any;
+    expect(body.subscription).toEqual(override);
+  });
+});
+
+describe("DELETE /v1/me (73 — account deletion)", () => {
+  it("wipes the usage DO and deletes the Clerk user, returning 204", async () => {
+    // Seed some usage first so the wipe is observable.
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const drafted = await worker.fetch(draftReq("u-del"), env);
+    expect(drafted.status).toBe(200);
+    expect(((await drafted.json()) as any).quota.used).toBe(1);
+
+    mocks.deleteUser.mockResolvedValue(undefined);
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(204);
+    expect(await del.text()).toBe("");
+    expect(mocks.deleteUser).toHaveBeenCalledWith("u-del");
+
+    // The DO is wiped: a subsequent /v1/me reports a fresh, zeroed window.
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(((await me.json()) as any).quota.used).toBe(0);
+  });
+
+  it("is idempotent — a Clerk user already gone still returns 204", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-gone" });
+    mocks.deleteUser.mockRejectedValue(Object.assign(new Error("not found"), { status: 404 }));
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(204);
+    expect(mocks.deleteUser).toHaveBeenCalledOnce();
+  });
+
+  it("maps a Clerk failure to 502 account_deletion_failed with no upstream detail", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-fail" });
+    mocks.deleteUser.mockRejectedValue(
+      Object.assign(new Error("clerk exploded: secret-ish detail"), { status: 500 }),
+    );
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(502);
+    const body = (await del.json()) as any;
+    expect(body.error.type).toBe("account_deletion_failed");
+    expect(body.error.message).not.toContain("secret-ish");
+    expect(body.error.message).not.toContain("clerk exploded");
+  });
+
+  it("rejects an unauthenticated delete with 401 and never touches Clerk", async () => {
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE" }), env);
+    expect(del.status).toBe(401);
+    expect(((await del.json()) as any).error.type).toBe("unauthenticated");
+    expect(mocks.deleteUser).not.toHaveBeenCalled();
+  });
+
+  it("405s a wrong method on /v1/me (e.g. POST) while GET and DELETE work", async () => {
+    const res = await worker.fetch(req("/v1/me", { method: "POST", headers: bearer() }), env);
+    expect(res.status).toBe(405);
+    expect(((await res.json()) as any).error.type).toBe("method_not_allowed");
   });
 });
 
