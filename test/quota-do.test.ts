@@ -274,6 +274,37 @@ describe("AccountQuota Durable Object", () => {
     expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
   });
 
+  it("final deletion wipes account data in bounded storage batches", async () => {
+    const uid = "do-delete-finish-many-keys";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("window", {
+        windowStart: MON,
+        resetsAt: MON + WEEK_MS,
+        draftsUsed: 1,
+        tokensUsed: 5,
+      });
+      for (let i = 0; i < OLD_BOUNDED_ARRAY_SIZE + 5; i++) {
+        await state.storage.put(`settled_settlement:delete-batch-${i}`, {
+          settledAt: MON + i,
+        });
+      }
+    });
+
+    await callDO(uid, "/begin-delete", { now: MON + 1, attemptId: "delete-batch-attempt" });
+    const finish = await callDO<{ deleted: boolean; cleanupPending: boolean }>(
+      uid,
+      "/finish-delete",
+      {
+        now: MON + 2,
+        attemptId: "delete-batch-attempt",
+      },
+    );
+
+    expect(finish).toEqual({ deleted: true, cleanupPending: false });
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
   it("alarm retries final deletion cleanup from a persisted tombstone", async () => {
     const uid = "do-delete-finish-alarm";
     const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));

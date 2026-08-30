@@ -103,6 +103,7 @@ const SETTLEMENT_MARKER_RETENTION_MS = RESERVATION_TTL_MS + SETTLEMENT_RETRY_MAX
 const SETTLEMENT_MARKER_PRUNE_INTERVAL_MS = SETTLEMENT_RETRY_MAX_DELAY_MS;
 const ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS = 60_000;
 const LEGACY_DELETION_ATTEMPT_ID = "legacy-deletion-attempt";
+const STORAGE_BULK_OPERATION_LIMIT = 128;
 
 export class AccountQuota {
   private readonly storage: DurableObjectStorage;
@@ -448,11 +449,14 @@ export class AccountQuota {
   }
 
   private async deleteAccountDataExceptDeletionMarker(deletedAt: number): Promise<void> {
-    const keys = [...(await this.storage.list()).keys()].filter(
-      (key) => key !== ACCOUNT_DELETION_KEY,
-    );
-    if (keys.length > 0) {
-      await this.storage.delete(keys);
+    while (true) {
+      const keys = [...(await this.storage.list()).keys()].filter(
+        (key) => key !== ACCOUNT_DELETION_KEY,
+      );
+      if (keys.length === 0) break;
+      for (let i = 0; i < keys.length; i += STORAGE_BULK_OPERATION_LIMIT) {
+        await this.storage.delete(keys.slice(i, i + STORAGE_BULK_OPERATION_LIMIT));
+      }
     }
     await this.storage.put(ACCOUNT_DELETION_KEY, {
       status: "deleted",
