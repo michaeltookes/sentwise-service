@@ -1006,6 +1006,37 @@ describe("POST /v1/interest (75 — demand capture)", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("serializes overlapping writes so the first timestamp wins", async () => {
+    let privateMetadata: Record<string, unknown> = {};
+    const firstWrite = deferred<void>();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(privateMetadata)));
+    mocks.updateUserMetadata.mockImplementation(async (_userId, update) => {
+      await firstWrite.promise;
+      privateMetadata = { ...privateMetadata, ...update.privateMetadata };
+    });
+
+    const first = worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    await vi.waitFor(() => expect(mocks.updateUserMetadata).toHaveBeenCalledOnce());
+
+    const second = worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    await vi.waitFor(() => expect(mocks.verifyToken).toHaveBeenCalledTimes(2));
+
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+    expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
+
+    firstWrite.resolve();
+    const [firstRes, secondRes] = await Promise.all([first, second]);
+
+    expect(firstRes.status).toBe(204);
+    expect(secondRes.status).toBe(204);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+    expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
+    expect((privateMetadata.interest as Record<string, unknown>)["google-oauth"]).toBe(
+      mocks.updateUserMetadata.mock.calls[0][1].privateMetadata.interest["google-oauth"],
+    );
+  });
+
   it("preserves unrelated privateMetadata keys and existing interest topics", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(
