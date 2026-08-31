@@ -970,6 +970,161 @@ describe("routing", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 75 — POST /v1/interest demand capture (first click wins; content-free).
+// ---------------------------------------------------------------------------
+describe("POST /v1/interest (75 — demand capture)", () => {
+  function interestReq(body: string, headers: HeadersInit = bearer()): Request {
+    return req("/v1/interest", { method: "POST", headers, body });
+  }
+
+  it("records first interest and returns 204", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({}));
+    mocks.updateUserMetadata.mockResolvedValue(undefined);
+
+    const before = Date.now();
+    const res = await worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+
+    expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
+    const arg = mocks.updateUserMetadata.mock.calls[0][1];
+    const ts = arg.privateMetadata.interest["google-oauth"];
+    expect(typeof ts).toBe("string");
+    expect(Date.parse(ts)).toBeGreaterThanOrEqual(before);
+  });
+
+  it("does not overwrite an existing timestamp on a second call (first click wins)", async () => {
+    const firstTs = "2026-08-01T00:00:00.000Z";
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ interest: { "google-oauth": firstTs } }));
+    mocks.updateUserMetadata.mockResolvedValue(undefined);
+
+    const res = await worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    expect(res.status).toBe(204);
+    // Idempotent: no write happens, so the original timestamp is preserved.
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("serializes overlapping writes so the first timestamp wins", async () => {
+    let privateMetadata: Record<string, unknown> = {};
+    const firstWrite = deferred<void>();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(privateMetadata)));
+    mocks.updateUserMetadata.mockImplementation(async (_userId, update) => {
+      await firstWrite.promise;
+      privateMetadata = { ...privateMetadata, ...update.privateMetadata };
+    });
+
+    const first = worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    await vi.waitFor(() => expect(mocks.updateUserMetadata).toHaveBeenCalledOnce());
+
+    const second = worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    await vi.waitFor(() => expect(mocks.verifyToken).toHaveBeenCalledTimes(2));
+
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+    expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
+
+    firstWrite.resolve();
+    const [firstRes, secondRes] = await Promise.all([first, second]);
+
+    expect(firstRes.status).toBe(204);
+    expect(secondRes.status).toBe(204);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+    expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
+    expect((privateMetadata.interest as Record<string, unknown>)["google-oauth"]).toBe(
+      mocks.updateUserMetadata.mock.calls[0][1].privateMetadata.interest["google-oauth"],
+    );
+  });
+
+  it("preserves unrelated privateMetadata keys and existing interest topics", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: "2026-08-01T00:00:00.000Z",
+        quota: { weeklyDrafts: 500 },
+        subscription: { plan: "individual" },
+        interest: { "some-legacy-topic": "2026-07-01T00:00:00.000Z" },
+      }),
+    );
+    mocks.updateUserMetadata.mockResolvedValue(undefined);
+
+    const res = await worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    expect(res.status).toBe(204);
+
+    const arg = mocks.updateUserMetadata.mock.calls[0][1];
+    // Top-level write carries ONLY `interest` — Clerk shallow-merges, so trial,
+    // quota, and subscription keys are left untouched (mirrors trialStartedAt).
+    expect(Object.keys(arg.privateMetadata)).toEqual(["interest"]);
+    // Within `interest`, the pre-existing topic is preserved alongside the new one.
+    expect(arg.privateMetadata.interest["some-legacy-topic"]).toBe("2026-07-01T00:00:00.000Z");
+    expect(typeof arg.privateMetadata.interest["google-oauth"]).toBe("string");
+  });
+
+  it("400s an unknown topic without touching Clerk", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const res = await worker.fetch(interestReq(JSON.stringify({ topic: "slack-approvals" })), env);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("400s a missing topic", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const res = await worker.fetch(interestReq(JSON.stringify({})), env);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+  });
+
+  it("400s malformed JSON", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const res = await worker.fetch(interestReq("{not json"), env);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+  });
+
+  it("401s an unauthenticated request without touching Clerk", async () => {
+    const res = await worker.fetch(
+      req("/v1/interest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ topic: "google-oauth" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as any).error.type).toBe("unauthenticated");
+    expect(mocks.verifyToken).not.toHaveBeenCalled();
+  });
+
+  it("405s a wrong method (GET)", async () => {
+    const res = await worker.fetch(req("/v1/interest", { method: "GET", headers: bearer() }), env);
+    expect(res.status).toBe(405);
+    expect(((await res.json()) as any).error.type).toBe("method_not_allowed");
+  });
+
+  it("502s interest_failed when the Clerk lookup fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockRejectedValue(new Error("clerk down"));
+    const res = await worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("interest_failed");
+  });
+
+  it("502s interest_failed when the Clerk write fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({}));
+    mocks.updateUserMetadata.mockRejectedValue(new Error("clerk write down"));
+    const res = await worker.fetch(interestReq(JSON.stringify({ topic: "google-oauth" })), env);
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("interest_failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 56b — metering + limits, end to end through the Worker (real AccountQuota DO).
 // ---------------------------------------------------------------------------
 

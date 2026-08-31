@@ -4,6 +4,7 @@
 import type { Env } from "./config";
 import { ApiError, type ErrorExtra } from "./errors";
 import type { ResolvedLimits, WindowState } from "./metering";
+import type { InterestTopic } from "./interest";
 
 export interface CheckResult {
   allowed: boolean;
@@ -41,6 +42,9 @@ export interface CancelAccountDeletionResult {
 export interface FinishAccountDeletionResult {
   deleted: boolean;
   cleanupPending?: boolean;
+}
+export interface RecordInterestResult {
+  recorded: boolean;
 }
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
@@ -147,6 +151,15 @@ export function quotaRelease(
 /** Read (and roll) the window without rate-limiting or incrementing — for /v1/me. */
 export function quotaPeek(env: Env, userId: string, body: { now: number }): Promise<WindowResult> {
   return call<WindowResult>(env, userId, "/peek", body);
+}
+
+/** Serialize and record an interest signal through the user's Durable Object. */
+export function quotaRecordInterest(
+  env: Env,
+  userId: string,
+  body: { topic: InterestTopic },
+): Promise<RecordInterestResult> {
+  return call<RecordInterestResult>(env, userId, "/interest", body);
 }
 
 /** Set a deletion barrier before attempting Clerk deletion. Does not wipe counters. */

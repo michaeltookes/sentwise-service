@@ -14,6 +14,7 @@
 //   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
 //   POST /reserve { now, reservationId, estimatedTokens, limits } -> { reserved, ... }
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
+//   POST /interest { topic } -> serialize Clerk interest metadata writes per user
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /defer-release { now, reservationId, reservationWindowStart, estimatedTokens }
@@ -25,7 +26,8 @@
 
 import { ACCOUNT_DELETION_BARRIER_TIMEOUT_MS, type Env } from "./config";
 import { clerkUserExists, deleteClerkUser } from "./auth";
-import { jsonError } from "./errors";
+import { ApiError, jsonError } from "./errors";
+import { parseInterestTopic, recordInterestInClerk } from "./interest";
 import {
   activeReservations,
   pruneStamps,
@@ -120,6 +122,7 @@ export class AccountQuota {
   private readonly storage: DurableObjectStorage;
   private readonly env: Env;
   private readonly userId?: string;
+  private interestWriteQueue: Promise<void> = Promise.resolve();
 
   constructor(state: DurableObjectState, env: Env) {
     this.storage = state.storage;
@@ -167,6 +170,8 @@ export class AccountQuota {
         return this.handleRelease(await request.json<ReleaseBody>());
       case "/peek":
         return this.handlePeek(await request.json<PeekBody>());
+      case "/interest":
+        return this.handleInterest(await request.json<unknown>());
       default:
         return new Response("not found", { status: 404 });
     }
@@ -431,6 +436,34 @@ export class AccountQuota {
       await txn.put("window", window);
       return Response.json({ window });
     });
+  }
+
+  private async handleInterest(body: unknown): Promise<Response> {
+    try {
+      const topic = parseInterestTopic(body);
+      const userId = this.requireUserId();
+      const result = await this.enqueueInterestWrite(() =>
+        recordInterestInClerk(userId, topic, this.env),
+      );
+      return Response.json(result);
+    } catch (err) {
+      if (err instanceof ApiError) return err.toResponse();
+      throw err;
+    }
+  }
+
+  private enqueueInterestWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.interestWriteQueue.catch(() => undefined).then(operation);
+    this.interestWriteQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private requireUserId(): string {
+    if (this.userId) return this.userId;
+    throw new ApiError(500, "internal_error", "Missing account context.");
   }
 
   // 73: account deletion is two-phase. Begin sets a barrier before Clerk deletion
