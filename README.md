@@ -346,7 +346,11 @@ webhook, which turns billing events into the account's entitlement — the `subs
 
 **Clerk bearer required.** The request body is `{ "priceId": "pri_...", "quantity": 1 }`.
 `priceId` must be one of the configured subscription tier prices or `EXTRA_DRAFTS_PRICE_ID`.
-Subscription quantities must be `1`; overage quantities are capped.
+Subscription quantities must be `1`; overage quantities are capped. Subscription checkout is rejected
+while the account already has an active/trialing/past-due Paddle subscription, so tier changes must
+go through Paddle subscription management instead of creating a second recurring subscription. Overage
+checkout requires an active Paddle subscription with a stored `paddleCustomerId`; the Worker passes
+that `customer_id` to Paddle so the later webhook credits the same bound customer.
 
 The Worker creates `POST /transactions` in Paddle with server-minted `custom_data` and returns:
 
@@ -401,8 +405,10 @@ per-tier numbers are unresolved. The plumbing is deliberately window-agnostic (i
 var holds and stamps overage to the 56b Monday window); it does not encode a final answer.
 
 **Billing management.** Paddle portal URLs are temporary authenticated links, so the webhook never
-persists them. The app should open `GET /v1/paddle/manage-billing`, which fetches
-`GET /subscriptions/{id}` → `data.management_urls` on demand and redirects to the fresh URL.
+persists them. The app should open `GET /v1/paddle/manage-billing` for payment-method changes or
+`GET /v1/paddle/manage-billing?action=cancel` for cancellation, which fetches
+`GET /subscriptions/{id}` → `data.management_urls` on demand and redirects to the requested fresh
+URL.
 
 **Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
 `EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
@@ -417,10 +423,10 @@ applied when the prerequisite is later delivered.
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
 updated. Subscription writes are skipped when the incoming `event_id` equals the stored `lastEventId`,
 when a strictly older `occurred_at` would clobber a newer stored record, or when a different
-subscription id is already known as superseded. A different active/trialing subscription may replace
-the stored one only with a signed checkout binding and a live Paddle subscription lookup confirming
-that it is still active/trialing for the same customer. Overage writes are skipped when the `event_id`
-is in the bounded `processedOverageEventIds` list (the legacy
+subscription id is already known as superseded. A different subscription may replace the stored one
+only with a signed checkout binding and a live Paddle subscription lookup confirming the event's
+current Paddle status for the same customer. Overage writes are skipped when the `event_id` is in the
+bounded `processedOverageEventIds` list (the legacy
 `lastOverageEventId` is still honored). Approved adjustment reversals/restores are skipped when the
 `adjustment_id` is in the bounded `processedOverageAdjustmentIds` list; unmatched approved
 reversals/restores are retained in a bounded `pendingOverageReversals` list by transaction id. A

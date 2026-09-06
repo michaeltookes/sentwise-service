@@ -79,7 +79,7 @@ export default {
 
       if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
-        return await handlePaddleManageBilling(userId, env);
+        return await handlePaddleManageBilling(userId, request, env);
       }
 
       if (pathname === "/v1/paddle/checkout" && request.method === "POST") {

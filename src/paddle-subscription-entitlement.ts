@@ -15,7 +15,6 @@ import {
   isSubscriptionEvent,
   planFromEvent,
   resolvePlanDraftLimit,
-  statusFromEvent,
   subscriptionIdFromEvent,
   type PaddleEvent,
 } from "./paddle";
@@ -165,7 +164,6 @@ async function isCurrentSubscriptionReplacement(
   userId: string,
   env: Env,
 ): Promise<boolean> {
-  if (!isPromotableSubscriptionReplacement(event)) return false;
   if (!(await paddleCheckoutBindingMatchesEvent(event, userId, env))) return false;
 
   const incomingSubscriptionId = subscriptionIdFromEvent(event);
@@ -176,15 +174,36 @@ async function isCurrentSubscriptionReplacement(
 
   const incomingCustomerId = customerIdFromEvent(event);
   if (incomingCustomerId && snapshot.customerId !== incomingCustomerId) return false;
-  return snapshot.status === "active" || snapshot.status === "trialing";
+  return snapshot.status !== null && snapshot.status === paddleSubscriptionStatusFromEvent(event);
 }
 
-function isPromotableSubscriptionReplacement(event: PaddleEvent): boolean {
-  if (event.eventType !== "subscription.created" && event.eventType !== "subscription.activated") {
-    return false;
+function paddleSubscriptionStatusFromEvent(event: PaddleEvent): string | null {
+  const dataStatus = typeof event.data.status === "string" ? event.data.status : null;
+  if (isPaddleSubscriptionStatus(dataStatus)) return dataStatus;
+
+  switch (event.eventType) {
+    case "subscription.canceled":
+      return "canceled";
+    case "subscription.paused":
+      return "paused";
+    case "subscription.past_due":
+      return "past_due";
+    case "subscription.activated":
+    case "subscription.resumed":
+      return "active";
+    default:
+      return null;
   }
-  const status = statusFromEvent(event);
-  return status === "active" || status === "trialing";
+}
+
+function isPaddleSubscriptionStatus(value: unknown): value is string {
+  return (
+    value === "active" ||
+    value === "trialing" ||
+    value === "past_due" ||
+    value === "paused" ||
+    value === "canceled"
+  );
 }
 
 function supersededSubscriptionHistory(

@@ -523,6 +523,56 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     });
   });
 
+  it("allows a terminal replacement subscription event when Paddle reports the same current status", async () => {
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL): Promise<Response> => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/subscriptions/sub_current")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "canceled" } }), {
+              status: 200,
+            }),
+          );
+        }
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      }),
+    );
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "starter",
+          status: "active",
+          paddleSubscriptionId: "sub_old",
+          paddleCustomerId: "ctm_123",
+          lastEventId: "evt_old",
+          updatedAt: "2026-09-05T00:00:00.000Z",
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.canceled",
+        eventId: "evt_new_sub_canceled",
+        subscriptionId: "sub_current",
+        status: "canceled",
+        occurredAt: "2026-09-06T00:00:00.000Z",
+        customData,
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(lastWrite()?.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_current",
+      status: "canceled",
+      lastEventId: "evt_new_sub_canceled",
+      supersededPaddleSubscriptionIds: ["sub_old"],
+    });
+  });
+
   it("serializes overlapping subscription writes before the ordering check", async () => {
     let storedMeta: Record<string, unknown> = {
       subscription: {

@@ -5,6 +5,7 @@ export interface PaddleCheckoutTransactionInput {
   priceId: string;
   quantity: number;
   customData: Record<string, string>;
+  customerId?: string | null;
 }
 
 export interface PaddleCheckoutTransaction {
@@ -16,6 +17,8 @@ export interface PaddleSubscriptionSnapshot {
   customerId: string | null;
   status: string | null;
 }
+
+export type PaddleManagementAction = "update_payment_method" | "cancel";
 
 export async function fetchPaddleCustomerEmail(
   env: Env,
@@ -53,18 +56,23 @@ export async function createPaddleCheckoutTransaction(
 ): Promise<PaddleCheckoutTransaction> {
   const apiKey = requirePaddleApiKey("checkout_unavailable", "Could not start checkout.", env);
   try {
+    const payload: Record<string, unknown> = {
+      collection_mode: "automatic",
+      items: [{ price_id: input.priceId, quantity: input.quantity }],
+      custom_data: input.customData,
+      checkout: { url: null },
+    };
+    if (input.customerId) {
+      payload.customer_id = input.customerId;
+    }
+
     const res = await fetch(`${paddleApiBase(env)}/transactions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        collection_mode: "automatic",
-        items: [{ price_id: input.priceId, quantity: input.quantity }],
-        custom_data: input.customData,
-        checkout: { url: null },
-      }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       throw new ApiError(502, "checkout_unavailable", "Could not start checkout.");
@@ -90,6 +98,7 @@ export async function createPaddleCheckoutTransaction(
 export async function fetchPaddleManagementUrl(
   env: Env,
   subscriptionId: string,
+  action: PaddleManagementAction,
 ): Promise<string | null> {
   if (!env.PADDLE_API_KEY) return null;
   try {
@@ -106,7 +115,7 @@ export async function fetchPaddleManagementUrl(
     const body: unknown = await res.json();
     const data = asRecord(asRecord(body)?.data);
     const urls = asRecord(data?.management_urls);
-    const candidate = urls?.update_payment_method ?? urls?.cancel;
+    const candidate = urls?.[action];
     return validHttpsUrl(candidate);
   } catch {
     return null;

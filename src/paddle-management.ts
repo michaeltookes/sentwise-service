@@ -1,11 +1,16 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { storedPaddleSubscriptionId } from "./paddle-account";
-import { fetchPaddleManagementUrl } from "./paddle-api";
+import { fetchPaddleManagementUrl, type PaddleManagementAction } from "./paddle-api";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
 
-export async function handlePaddleManageBilling(userId: string, env: Env): Promise<Response> {
+export async function handlePaddleManageBilling(
+  userId: string,
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const action = parseManagementAction(request);
   const subscriptionId = await loadPaddleSubscriptionId(userId, env);
   if (!subscriptionId) {
     throw new ApiError(
@@ -15,7 +20,7 @@ export async function handlePaddleManageBilling(userId: string, env: Env): Promi
     );
   }
 
-  const url = await fetchPaddleManagementUrl(env, subscriptionId);
+  const url = await fetchPaddleManagementUrl(env, subscriptionId, action);
   if (!url) {
     throw new ApiError(
       502,
@@ -28,6 +33,12 @@ export async function handlePaddleManageBilling(userId: string, env: Env): Promi
     status: 303,
     headers: { Location: url, "Cache-Control": "no-store" },
   });
+}
+
+function parseManagementAction(request: Request): PaddleManagementAction {
+  const action = new URL(request.url).searchParams.get("action") ?? "update_payment_method";
+  if (action === "update_payment_method" || action === "cancel") return action;
+  throw new ApiError(400, "invalid_request", "Unsupported billing management action.");
 }
 
 async function loadPaddleSubscriptionId(userId: string, env: Env): Promise<string | null> {
