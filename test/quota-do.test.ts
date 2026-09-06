@@ -58,6 +58,7 @@ type CheckoutReservationResult =
       checkoutUrl?: string | null;
       priceId?: string;
       quantity?: number;
+      extraDrafts?: number;
       customerId?: string;
     };
 type CheckoutReservationRecordResult = { recorded: true } | { stale: true } | { unusable: true };
@@ -89,6 +90,7 @@ const SUBSCRIPTION_CHECKOUT_REQUEST = { priceId: PRO_PRICE, quantity: 1 };
 const OVERAGE_CHECKOUT_REQUEST = {
   priceId: OVERAGE_PRICE,
   quantity: 2,
+  extraDrafts: 2,
   customerId: "ctm_123",
 };
 

@@ -166,7 +166,13 @@ export async function findPaddleCheckoutTransactionByReservationId(
   );
   try {
     let nextUrl: string | null = checkoutTransactionLookupUrl(env, input);
-    for (let page = 0; nextUrl && page < 3; page++) {
+    const seenUrls = new Set<string>();
+    while (nextUrl) {
+      if (seenUrls.has(nextUrl)) {
+        throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
+      }
+      seenUrls.add(nextUrl);
+
       const res = await fetch(nextUrl, {
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -199,9 +205,6 @@ export async function findPaddleCheckoutTransactionByReservationId(
       const pageInfo = asRecord(pagination);
       const next = pageInfo?.next;
       nextUrl = pageInfo?.has_more === true && typeof next === "string" && next ? next : null;
-    }
-    if (nextUrl) {
-      throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
     }
     return null;
   } catch (err) {

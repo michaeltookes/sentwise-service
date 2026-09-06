@@ -78,6 +78,7 @@ export type PaddleSubscriptionCheckoutReservationResult =
       checkoutUrl?: string | null;
       priceId?: string;
       quantity?: number;
+      extraDrafts?: number;
       customerId?: string;
     };
 export type PaddleOverageCheckoutReservationResult = PaddleSubscriptionCheckoutReservationResult;
@@ -321,6 +322,7 @@ export function quotaReservePaddleOverageCheckout(
     reservationId: string;
     priceId: string;
     quantity: number;
+    extraDrafts: number;
     customerId: string;
   },
 ): Promise<PaddleOverageCheckoutReservationResult> {

@@ -25,7 +25,7 @@
 //   POST /paddle-subscription-checkout-record { reservationId, transactionId, checkoutUrl, priceId, quantity } -> attach the Paddle transaction to a reservation
 //   POST /paddle-subscription-checkout-peek { now } -> read the pending subscription checkout without reserving
 //   POST /paddle-subscription-checkout-release { reservationId } -> release a matching pending subscription checkout after failed creation
-//   POST /paddle-overage-checkout-reserve { now, reservationId, priceId, quantity, customerId } -> reserve one pending overage checkout
+//   POST /paddle-overage-checkout-reserve { now, reservationId, priceId, quantity, extraDrafts, customerId } -> reserve one pending overage checkout
 //   POST /paddle-overage-checkout-record { reservationId, transactionId, checkoutUrl, priceId, quantity, customerId } -> attach the Paddle transaction to a reservation
 //   POST /paddle-overage-checkout-peek { now } -> read the pending overage checkout without reserving
 //   POST /paddle-overage-checkout-release { reservationId } -> release a matching pending overage checkout after cancellation/completion
@@ -134,6 +134,7 @@ interface PaddleCheckoutReservation {
   checkoutUrl?: string | null;
   priceId?: string;
   quantity?: number;
+  extraDrafts?: number;
   plan?: PaidPlan;
   customerId?: string;
   blocked?: boolean;
@@ -608,15 +609,23 @@ export class AccountQuota {
     const quantity = nonNegativeInt(
       typeof record?.quantity === "number" ? record.quantity : undefined,
     );
+    const extraDrafts = nonNegativeInt(
+      typeof record?.extraDrafts === "number" ? record.extraDrafts : undefined,
+    );
     const customerId = normalizedId(
       typeof record?.customerId === "string" ? record.customerId : undefined,
     );
-    if (!reservationId || !priceId || quantity <= 0 || (options.requireCustomerId && !customerId)) {
+    if (
+      !reservationId ||
+      !priceId ||
+      quantity <= 0 ||
+      (options.requireCustomerId && (!customerId || extraDrafts <= 0))
+    ) {
       return jsonError(
         400,
         "invalid_request",
         options.requireCustomerId
-          ? "A checkout reservation id, price id, quantity, and customer id are required."
+          ? "A checkout reservation id, price id, quantity, extra draft total, and customer id are required."
           : "A checkout reservation id, price id, and quantity are required.",
       );
     }
@@ -639,6 +648,7 @@ export class AccountQuota {
         priceId,
         quantity,
         ...subscriptionCheckoutPlanForPrice(storageKey, priceId),
+        ...(options.requireCustomerId ? { extraDrafts } : {}),
         ...(customerId ? { customerId } : {}),
       });
       return Response.json({ reserved: true, reservationId });
@@ -1333,6 +1343,9 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
   const quantity = nonNegativeInt(
     typeof reservation?.quantity === "number" ? reservation.quantity : undefined,
   );
+  const extraDrafts = nonNegativeInt(
+    typeof reservation?.extraDrafts === "number" ? reservation.extraDrafts : undefined,
+  );
   const customerId = normalizedId(
     typeof reservation?.customerId === "string" ? reservation.customerId : undefined,
   );
@@ -1349,6 +1362,7 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
     ...(checkoutUrl ? { checkoutUrl } : {}),
     ...(priceId ? { priceId } : {}),
     ...(quantity > 0 ? { quantity } : {}),
+    ...(extraDrafts > 0 ? { extraDrafts } : {}),
     ...(plan ? { plan } : {}),
     ...(customerId ? { customerId } : {}),
     ...(reservation.blocked === true ? { blocked: true } : {}),
@@ -1364,6 +1378,7 @@ function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation
   checkoutUrl: string | null;
   priceId?: string;
   quantity?: number;
+  extraDrafts?: number;
   customerId?: string;
 } {
   return {
@@ -1375,6 +1390,7 @@ function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation
     checkoutUrl: reservation.checkoutUrl ?? null,
     ...(reservation.priceId ? { priceId: reservation.priceId } : {}),
     ...(reservation.quantity ? { quantity: reservation.quantity } : {}),
+    ...(reservation.extraDrafts ? { extraDrafts: reservation.extraDrafts } : {}),
     ...(reservation.customerId ? { customerId: reservation.customerId } : {}),
   };
 }

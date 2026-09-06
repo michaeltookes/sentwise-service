@@ -37,12 +37,15 @@ import {
   isApprovedOverageAdjustment,
   overageAdjustmentFromEvent,
   overageCreditFromEvent,
+  overageCreditFromReservedCheckout,
   parsePaddleEvent,
   transactionIdFromEvent,
   verifyPaddleSignature,
+  type OverageCreditSummary,
   type PaddleEvent,
 } from "./paddle";
 import {
+  quotaPeekPaddleOverageCheckout,
   quotaRecordPaddleOverage,
   quotaRecordPaddleOverageReversal,
   quotaRecordPaddleSubscription,
@@ -90,12 +93,6 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 
   if (isAdjustmentEvent(event.eventType) && !isApprovedOverageAdjustment(event)) {
     return ack({ ignored: "adjustment_not_reversal" });
-  }
-  if (
-    event.eventType === "transaction.completed" &&
-    overageCreditFromEvent(event, env).extraDrafts <= 0
-  ) {
-    return ack({ ignored: "not_overage" });
   }
 
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
@@ -147,23 +144,29 @@ async function applySubscriptionEvent(
 // ---------------------------------------------------------------------------
 
 async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): Promise<Response> {
-  const credit = overageCreditFromEvent(event, env);
-  if (credit.extraDrafts <= 0) {
-    // Most transaction.completed events are subscription renewals, not overage.
-    return ack({ ignored: "not_overage" });
-  }
-
   try {
     const transactionId = transactionIdFromEvent(event);
     if (!transactionId) {
       return ack({ ignored: "missing_transaction_id" });
+    }
+    const customerId = customerIdFromEvent(event);
+    const credit = await overageCreditForTransactionCompletedEvent(
+      event,
+      env,
+      userId,
+      transactionId,
+      customerId,
+    );
+    if (credit.extraDrafts <= 0) {
+      // Most transaction.completed events are subscription renewals, not overage.
+      return ack({ ignored: "not_overage" });
     }
     const result = await quotaRecordPaddleOverage(env, userId, {
       now: Date.now(),
       eventWindowStart: overageEventWindowStart(event),
       eventId: event.eventId,
       transactionId,
-      customerId: customerIdFromEvent(event),
+      customerId,
       extraDrafts: credit.extraDrafts,
       credits: credit.credits,
     });
@@ -177,6 +180,36 @@ async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): 
     }
     throw err;
   }
+}
+
+async function overageCreditForTransactionCompletedEvent(
+  event: PaddleEvent,
+  env: Env,
+  userId: string,
+  transactionId: string,
+  customerId: string | null,
+): Promise<OverageCreditSummary> {
+  const currentCatalogCredit = overageCreditFromEvent(event, env);
+  if (currentCatalogCredit.extraDrafts > 0) return currentCatalogCredit;
+
+  if (!customerId) return currentCatalogCredit;
+  const reservation = await quotaPeekPaddleOverageCheckout(env, userId, { now: Date.now() });
+  if (
+    !reservation.pending ||
+    reservation.transactionId !== transactionId ||
+    reservation.customerId !== customerId ||
+    !reservation.priceId ||
+    !reservation.quantity ||
+    !reservation.extraDrafts
+  ) {
+    return currentCatalogCredit;
+  }
+
+  return overageCreditFromReservedCheckout(event, {
+    priceId: reservation.priceId,
+    quantity: reservation.quantity,
+    extraDrafts: reservation.extraDrafts,
+  });
 }
 
 // ---------------------------------------------------------------------------

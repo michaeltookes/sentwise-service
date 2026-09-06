@@ -404,60 +404,119 @@ export function overageCreditFromEvent(event: PaddleEvent, env: OverageEnv): Ove
   if (!overagePriceId) return { extraDrafts: 0, credits: [] };
 
   const perUnit = numFrom(env.EXTRA_DRAFTS_PER_UNIT, DEFAULT_EXTRA_DRAFTS_PER_UNIT);
-  const credits = overageCreditItemsFromDetails(event, overagePriceId, perUnit);
-  const fallbackCredits =
-    credits.length > 0
-      ? credits
-      : overageCreditItemsFromTransactionItems(event, overagePriceId, perUnit);
-  return {
-    extraDrafts: fallbackCredits.reduce((sum, item) => sum + item.extraDrafts, 0),
-    credits: fallbackCredits,
-  };
+  return overageCreditFromMatchedItems(
+    matchingOverageLineItemsFromEvent(event, overagePriceId),
+    (item) => item.quantity * perUnit,
+  );
 }
 
-function overageCreditItemsFromDetails(
+export function overageCreditFromReservedCheckout(
+  event: PaddleEvent,
+  input: { priceId: string; quantity: number; extraDrafts: number },
+): OverageCreditSummary {
+  if (event.eventType !== "transaction.completed") return { extraDrafts: 0, credits: [] };
+  if (input.priceId === "" || input.quantity <= 0 || input.extraDrafts <= 0) {
+    return { extraDrafts: 0, credits: [] };
+  }
+
+  const items = matchingOverageLineItemsFromEvent(event, input.priceId);
+  const matchedQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
+  if (matchedQuantity !== input.quantity) return { extraDrafts: 0, credits: [] };
+
+  return reservedOverageCreditFromMatchedItems(items, matchedQuantity, input.extraDrafts);
+}
+
+interface MatchedOverageLineItem {
+  transactionItemId: string | null;
+  quantity: number;
+  amount: number | null;
+}
+
+function matchingOverageLineItemsFromEvent(
   event: PaddleEvent,
   overagePriceId: string,
-  perUnit: number,
-): OverageCreditItem[] {
+): MatchedOverageLineItem[] {
+  const detailItems = matchingOverageLineItemsFromDetails(event, overagePriceId);
+  return detailItems.length > 0
+    ? detailItems
+    : matchingOverageLineItemsFromTransactionItems(event, overagePriceId);
+}
+
+function matchingOverageLineItemsFromDetails(
+  event: PaddleEvent,
+  overagePriceId: string,
+): MatchedOverageLineItem[] {
   const details = asRecord(event.data.details);
   const lineItems = Array.isArray(details?.line_items) ? details.line_items : [];
-  const credits: OverageCreditItem[] = [];
+  const matched: MatchedOverageLineItem[] = [];
   for (const item of lineItems) {
     const record = asRecord(item);
     if (record?.price_id !== overagePriceId) continue;
     const quantity = positiveInt(record.quantity) ?? 0;
-    const extraDrafts = quantity * perUnit;
-    if (extraDrafts <= 0) continue;
-    credits.push({
+    if (quantity <= 0) continue;
+    matched.push({
       transactionItemId: typeof record.id === "string" && record.id !== "" ? record.id : null,
-      extraDrafts,
+      quantity,
       amount: transactionLineItemTotal(record, quantity),
     });
   }
-  return credits;
+  return matched;
 }
 
-function overageCreditItemsFromTransactionItems(
+function matchingOverageLineItemsFromTransactionItems(
   event: PaddleEvent,
   overagePriceId: string,
-  perUnit: number,
-): OverageCreditItem[] {
+): MatchedOverageLineItem[] {
   const items = Array.isArray(event.data.items) ? event.data.items : [];
-  const credits: OverageCreditItem[] = [];
+  const matched: MatchedOverageLineItem[] = [];
   for (const item of items) {
     const record = asRecord(item);
     if (asRecord(record?.price)?.id !== overagePriceId) continue;
     const quantity = positiveInt(record?.quantity) ?? 0;
-    const extraDrafts = quantity * perUnit;
-    if (extraDrafts <= 0) continue;
-    credits.push({
+    if (quantity <= 0) continue;
+    matched.push({
       transactionItemId: typeof record?.id === "string" && record.id !== "" ? record.id : null,
-      extraDrafts,
+      quantity,
       amount: null,
     });
   }
-  return credits;
+  return matched;
+}
+
+function overageCreditFromMatchedItems(
+  items: MatchedOverageLineItem[],
+  extraDraftsForItem: (item: MatchedOverageLineItem) => number,
+): OverageCreditSummary {
+  const credits: OverageCreditItem[] = [];
+  for (const item of items) {
+    const extraDrafts = extraDraftsForItem(item);
+    if (extraDrafts <= 0) continue;
+    credits.push({
+      transactionItemId: item.transactionItemId,
+      extraDrafts,
+      amount: item.amount,
+    });
+  }
+  return {
+    extraDrafts: credits.reduce((sum, item) => sum + item.extraDrafts, 0),
+    credits,
+  };
+}
+
+function reservedOverageCreditFromMatchedItems(
+  items: MatchedOverageLineItem[],
+  matchedQuantity: number,
+  extraDrafts: number,
+): OverageCreditSummary {
+  let allocated = 0;
+  return overageCreditFromMatchedItems(items, (item) => {
+    const drafts =
+      item === items[items.length - 1]
+        ? extraDrafts - allocated
+        : Math.floor((extraDrafts * item.quantity) / matchedQuantity);
+    allocated += drafts;
+    return drafts;
+  });
 }
 
 function transactionLineItemTotal(

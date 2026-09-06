@@ -1,7 +1,8 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
-import { PRICE_TO_PLAN, type Env } from "./config";
+import { DEFAULT_EXTRA_DRAFTS_PER_UNIT, PRICE_TO_PLAN, type Env } from "./config";
 import { ApiError } from "./errors";
+import { numFrom } from "./metering";
 import {
   buildPaddleCheckoutCustomData,
   paddleCheckoutBindingMatchesCustomData,
@@ -45,6 +46,7 @@ interface PendingCheckoutReservation {
   checkoutUrl?: string | null;
   priceId?: string;
   quantity?: number;
+  extraDrafts?: number;
   customerId?: string;
 }
 
@@ -226,6 +228,7 @@ async function reserveCheckout(
             reservationId,
             priceId: request.priceId,
             quantity: request.quantity,
+            extraDrafts: overageExtraDraftsForCheckout(request.quantity, env),
             customerId: customerId ?? "",
           });
     if ("reserved" in reservation) return null;
@@ -495,6 +498,13 @@ function checkoutResponse(transaction: {
   });
   res.headers.set("Cache-Control", "no-store");
   return res;
+}
+
+function overageExtraDraftsForCheckout(quantity: number, env: Env): number {
+  return Math.max(
+    0,
+    Math.floor(quantity * numFrom(env.EXTRA_DRAFTS_PER_UNIT, DEFAULT_EXTRA_DRAFTS_PER_UNIT)),
+  );
 }
 
 interface CheckoutRequestBody {

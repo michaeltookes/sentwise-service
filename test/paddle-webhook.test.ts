@@ -1158,6 +1158,60 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(await storedPaddleOverageCheckoutReservation()).toBeUndefined();
   });
 
+  it("credits a tracked overage checkout after the configured price rotates", async () => {
+    const monday = mondayStartUtc(Date.now());
+    const oldOveragePrice = "pri_old_overage";
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env, "overage-open");
+    await seedPaddleOverageCheckoutReservation({
+      reservationId: "overage-open",
+      createdAt: Date.now(),
+      transactionId: "txn_evt_rotated",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_evt_rotated",
+      priceId: oldOveragePrice,
+      quantity: 2,
+      extraDrafts: 50,
+      customerId: "ctm_123",
+    });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+        quota: { weeklyDraftLimit: 120 },
+      }),
+    );
+
+    const res = await signedReq(
+      txnBody(
+        {
+          custom_data: customData,
+          items: [{ id: "txnitm_old", price: { id: oldOveragePrice }, quantity: 2 }],
+        },
+        "evt_rotated",
+      ),
+      { overrideEnv: { ...overageEnv, EXTRA_DRAFTS_PRICE_ID: "pri_new_overage" } },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true, extraDrafts: 50 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(50);
+    expect(quota.extraDraftsWindowStart).toBe(monday);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_rotated",
+        transactionId: "txn_evt_rotated",
+        transactionItemId: "txnitm_old",
+        extraDrafts: 50,
+        windowStart: monday,
+      },
+    ]);
+    expect(await storedPaddleOverageCheckoutReservation()).toBeUndefined();
+  });
+
   it("accumulates a second purchase within the same window", async () => {
     const monday = mondayStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(

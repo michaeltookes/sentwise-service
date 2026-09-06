@@ -1481,7 +1481,7 @@ describe("POST /v1/paddle/checkout", () => {
     expect(transactionCreates).toHaveLength(1);
   });
 
-  it("recovers an expired unrecorded subscription checkout reservation when Paddle has a matching transaction", async () => {
+  it("recovers an expired unrecorded subscription checkout reservation after multiple Paddle pages", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
     const customData = await buildPaddleCheckoutCustomData("user_123", paddleEnv, "checkout-lost");
@@ -1533,9 +1533,24 @@ describe("POST /v1/paddle/checkout", () => {
         get: vi.fn(() => quotaStub as unknown as DurableObjectStub),
       } as unknown as DurableObjectNamespace,
     };
+    let lookupPage = 0;
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = requestUrl(input);
       if (url.startsWith("https://sandbox-api.paddle.com/transactions?")) {
+        lookupPage += 1;
+        if (lookupPage < 4) {
+          return Promise.resolve(
+            Response.json({
+              data: [],
+              meta: {
+                pagination: {
+                  has_more: true,
+                  next: `https://sandbox-api.paddle.com/transactions?page=${lookupPage + 1}`,
+                },
+              },
+            }),
+          );
+        }
         return Promise.resolve(
           Response.json({
             data: [
@@ -1587,6 +1602,10 @@ describe("POST /v1/paddle/checkout", () => {
         requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
         init?.method === "POST",
     );
+    const transactionLookups = fetchMock.mock.calls.filter(([input]) =>
+      requestUrl(input).startsWith("https://sandbox-api.paddle.com/transactions?"),
+    );
+    expect(transactionLookups).toHaveLength(4);
     expect(transactionCreates).toHaveLength(0);
   });
 
@@ -1745,6 +1764,7 @@ describe("POST /v1/paddle/checkout", () => {
         transactionId: "txn_overage",
         priceId: OVERAGE_PRICE,
         quantity: 3,
+        extraDrafts: 3,
         customerId: "ctm_123",
       });
     });
