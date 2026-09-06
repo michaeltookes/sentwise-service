@@ -1,10 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
+  adjustedTransactionIdFromEvent,
+  adjustmentIdFromEvent,
   buildSubscriptionRecord,
   clerkUserIdFromEvent,
   computeHmacSha256Hex,
   customerIdFromEvent,
   HANDLED_EVENT_TYPES,
+  isAdjustmentEvent,
+  isApprovedOverageReversal,
   isSubscriptionEvent,
   normalizeIso,
   overageDraftsFromEvent,
@@ -15,6 +19,7 @@ import {
   resolvePlanDraftLimit,
   statusFromEvent,
   subscriptionIdFromEvent,
+  transactionIdFromEvent,
   timingSafeEqualHex,
   verifyPaddleSignature,
 } from "../src/paddle";
@@ -197,12 +202,38 @@ describe("field extraction", () => {
     expect(isSubscriptionEvent("subscription.updated")).toBe(true);
     expect(isSubscriptionEvent("transaction.completed")).toBe(false);
   });
+
+  it("reads transaction and adjustment ids", () => {
+    const transaction = parsePaddleEvent(
+      JSON.stringify({
+        event_id: "evt_txn",
+        event_type: "transaction.completed",
+        data: { id: "txn_123" },
+      }),
+    )!;
+    expect(transactionIdFromEvent(transaction)).toBe("txn_123");
+
+    const adjustment = parsePaddleEvent(
+      JSON.stringify({
+        event_id: "evt_adj",
+        event_type: "adjustment.updated",
+        data: { id: "adj_123", transaction_id: "txn_123" },
+      }),
+    )!;
+    expect(adjustmentIdFromEvent(adjustment)).toBe("adj_123");
+    expect(adjustedTransactionIdFromEvent(adjustment)).toBe("txn_123");
+  });
 });
 
 describe("handled event types", () => {
-  it("includes paused and resumed subscription lifecycle events", () => {
+  it("includes activation, pause/resume, and adjustment lifecycle events", () => {
+    expect(HANDLED_EVENT_TYPES).toContain("subscription.activated");
     expect(HANDLED_EVENT_TYPES).toContain("subscription.paused");
     expect(HANDLED_EVENT_TYPES).toContain("subscription.resumed");
+    expect(HANDLED_EVENT_TYPES).toContain("adjustment.created");
+    expect(HANDLED_EVENT_TYPES).toContain("adjustment.updated");
+    expect(isAdjustmentEvent("adjustment.created")).toBe(true);
+    expect(isAdjustmentEvent("transaction.completed")).toBe(false);
   });
 });
 
@@ -285,6 +316,38 @@ describe("statusFromEvent", () => {
       data: { id: "s", items: [{ price: { id: PRO_PRICE } }] },
     });
     expect(statusFromEvent(parsePaddleEvent(resumed)!)).toBe("active");
+    const activated = JSON.stringify({
+      event_id: "e",
+      event_type: "subscription.activated",
+      data: { id: "s", items: [{ price: { id: PRO_PRICE } }] },
+    });
+    expect(statusFromEvent(parsePaddleEvent(activated)!)).toBe("active");
+  });
+});
+
+describe("isApprovedOverageReversal", () => {
+  function adjustment(data: Record<string, unknown>): ReturnType<typeof parsePaddleEvent> {
+    return parsePaddleEvent(
+      JSON.stringify({ event_id: "evt_adj", event_type: "adjustment.updated", data }),
+    );
+  }
+
+  it("requires an approved refund, chargeback, or credit adjustment", () => {
+    expect(isApprovedOverageReversal(adjustment({ action: "refund", status: "approved" })!)).toBe(
+      true,
+    );
+    expect(
+      isApprovedOverageReversal(adjustment({ action: "chargeback", status: "approved" })!),
+    ).toBe(true);
+    expect(isApprovedOverageReversal(adjustment({ action: "credit", status: "approved" })!)).toBe(
+      true,
+    );
+    expect(
+      isApprovedOverageReversal(adjustment({ action: "refund", status: "pending_approval" })!),
+    ).toBe(false);
+    expect(
+      isApprovedOverageReversal(adjustment({ action: "chargeback_warning", status: "approved" })!),
+    ).toBe(false);
   });
 });
 
@@ -319,7 +382,11 @@ describe("resolvePlanDraftLimit", () => {
 describe("overageDraftsFromEvent", () => {
   function txn(data: Record<string, unknown>): ReturnType<typeof parsePaddleEvent> {
     return parsePaddleEvent(
-      JSON.stringify({ event_id: "evt_txn", event_type: "transaction.completed", data }),
+      JSON.stringify({
+        event_id: "evt_txn",
+        event_type: "transaction.completed",
+        data: { id: "txn_123", ...data },
+      }),
     );
   }
 

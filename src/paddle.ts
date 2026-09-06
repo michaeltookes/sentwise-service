@@ -19,9 +19,12 @@ import {
 import { numFrom } from "./metering";
 import type { SubscriptionPlan, SubscriptionStatus } from "./subscription";
 
-// The subscription lifecycle events we act on, plus the transaction event that
-// carries an overage ("buy more drafts") purchase.
+// The subscription lifecycle events we act on, plus transaction overage
+// purchases and adjustment reversals.
 export const HANDLED_EVENT_TYPES = [
+  "adjustment.created",
+  "adjustment.updated",
+  "subscription.activated",
   "subscription.created",
   "subscription.updated",
   "subscription.canceled",
@@ -35,6 +38,10 @@ export type HandledEventType = (typeof HANDLED_EVENT_TYPES)[number];
 
 export function isSubscriptionEvent(eventType: string): boolean {
   return eventType.startsWith("subscription.");
+}
+
+export function isAdjustmentEvent(eventType: string): boolean {
+  return eventType === "adjustment.created" || eventType === "adjustment.updated";
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +180,24 @@ export function customerIdFromEvent(event: PaddleEvent): string | null {
   return typeof id === "string" && id !== "" ? id : null;
 }
 
+/** `data.id` on a transaction.completed event. */
+export function transactionIdFromEvent(event: PaddleEvent): string | null {
+  const id = event.data.id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** `data.id` on an adjustment event. */
+export function adjustmentIdFromEvent(event: PaddleEvent): string | null {
+  const id = event.data.id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** `data.transaction_id` on an adjustment event. */
+export function adjustedTransactionIdFromEvent(event: PaddleEvent): string | null {
+  const id = event.data.transaction_id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
 /** `data.id` — the subscription id on subscription.* events. */
 export function subscriptionIdFromEvent(event: PaddleEvent): string | null {
   const id = event.data.id;
@@ -229,11 +254,23 @@ export function statusFromEvent(event: PaddleEvent): SubscriptionStatus {
       return "canceled";
     case "subscription.past_due":
       return "past_due";
+    case "subscription.activated":
     case "subscription.resumed":
       return "active";
     default:
       return "active";
   }
+}
+
+/**
+ * Whether an adjustment should revoke overage credit. Paddle creates `refund`
+ * adjustments as pending in many live cases, so wait for an approved status.
+ */
+export function isApprovedOverageReversal(event: PaddleEvent): boolean {
+  if (!isAdjustmentEvent(event.eventType)) return false;
+  const action = event.data.action;
+  if (action !== "refund" && action !== "chargeback" && action !== "credit") return false;
+  return event.data.status === "approved";
 }
 
 /** Normalize any parseable timestamp to canonical ISO-with-millis, or null. */

@@ -49,6 +49,11 @@ export interface RecordInterestResult {
 }
 export type PaddleOverageResult =
   { applied: true; extraDrafts: number } | { idempotent: true } | { mapped: false };
+export type PaddleOverageReversalResult =
+  | { revoked: true; extraDrafts: number }
+  | { idempotent: true }
+  | { ignored: "not_overage_reversal" }
+  | { mapped: false };
 export type PaddleSubscriptionResult =
   | { applied: true }
   | { idempotent: true }
@@ -175,9 +180,30 @@ export function quotaRecordInterest(
 export function quotaRecordPaddleOverage(
   env: Env,
   userId: string,
-  body: { now: number; eventId: string; extraDrafts: number },
+  body: {
+    now: number;
+    eventId: string;
+    transactionId: string;
+    customerId: string | null;
+    extraDrafts: number;
+  },
 ): Promise<PaddleOverageResult> {
   return call<PaddleOverageResult>(env, userId, "/paddle-overage", body);
+}
+
+/** Serialize and revoke a refunded/charged-back Paddle overage entitlement. */
+export function quotaRecordPaddleOverageReversal(
+  env: Env,
+  userId: string,
+  body: {
+    now: number;
+    eventId: string;
+    adjustmentId: string;
+    transactionId: string;
+    customerId: string | null;
+  },
+): Promise<PaddleOverageReversalResult> {
+  return call<PaddleOverageReversalResult>(env, userId, "/paddle-overage-reversal", body);
 }
 
 /** Serialize and record a Paddle subscription entitlement through the user's Durable Object. */

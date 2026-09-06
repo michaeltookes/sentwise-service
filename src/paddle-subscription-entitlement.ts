@@ -2,8 +2,10 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
+import { paddleCustomerMatchesAccount } from "./paddle-account";
 import {
   buildSubscriptionRecord,
+  customerIdFromEvent,
   isSubscriptionEvent,
   planFromEvent,
   resolvePlanDraftLimit,
@@ -80,6 +82,10 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const meta = user.privateMetadata ?? {};
+  if (!(await paddleCustomerMatchesAccount(user, meta, customerIdFromEvent(body.event), env))) {
+    return { mapped: false };
+  }
+
   const existingSub = asRecord(meta.subscription);
   if (existingSub && existingSub.lastEventId === body.event.eventId) {
     return { idempotent: true };

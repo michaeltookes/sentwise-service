@@ -356,15 +356,19 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 
 **Events handled** (others are acknowledged `200` and ignored):
 
-| Event                                                                                    | Write                                                                                                                                                        |
-| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `subscription.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids) **and** `privateMetadata.quota.weeklyDraftLimit` = the tier's limit               |
-| `transaction.completed` (overage / "buy more drafts")                                    | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID` |
+| Event                                                                                                   | Write                                                                                                                                                        |
+| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids) **and** `privateMetadata.quota.weeklyDraftLimit` = the tier's limit               |
+| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID` |
+| `adjustment.created` / `.updated` (approved refund/chargeback/credit)                                   | Marks matching overage credits reversed and removes any still-current weekly extra drafts for the adjusted transaction                                       |
 
-**Account mapping.** `data.custom_data.clerkUserId` (attached by the app's checkout) is primary; the
-fallback looks the Paddle customer's email up in Clerk (`GET /customers/{id}` → `getUserList`). If no
-account matches, the event is acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help.
-Transient Paddle/Clerk lookup failures return `502` so Paddle retries.
+**Account mapping.** `data.custom_data.clerkUserId` (attached by the app's checkout) identifies the
+candidate Clerk user, but it is trusted only when the Paddle `customer_id` matches the account's
+stored `paddleCustomerId` or `GET /customers/{id}` returns an email on that Clerk user. Events
+without custom data use the same Paddle customer-email lookup (`GET /customers/{id}` →
+`getUserList`). If no account matches, or if the candidate user does not match the Paddle customer,
+the event is acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help. Transient
+Paddle/Clerk lookup failures return `502` so Paddle retries.
 
 **Price → tier.** `data.items[].price.id` maps to a tier via `PRICE_TO_PLAN` in `src/config.ts`
 (SANDBOX ids today):
@@ -385,14 +389,18 @@ persists them. The app should open `GET /v1/paddle/manage-billing`, which fetche
 `GET /subscriptions/{id}` → `data.management_urls` on demand and redirects to the fresh URL.
 
 **Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
-`EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored.
+`EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
+the Paddle transaction id; approved Paddle refund/chargeback/credit adjustments mark matching credits
+as reversed and subtract any still-current weekly extras.
 
 **Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
 updated. Subscription writes are skipped when the incoming `event_id` equals the stored `lastEventId`,
 or when a strictly older `occurred_at` would clobber a newer stored record. Overage writes are skipped
 when the `event_id` is in the bounded `processedOverageEventIds` list (the legacy
-`lastOverageEventId` is still honored). A transient Clerk failure returns **`502`** so Paddle retries.
+`lastOverageEventId` is still honored). Approved adjustment reversals are skipped when the
+`adjustment_id` is in the bounded `processedOverageAdjustmentIds` list. A transient Clerk failure
+returns **`502`** so Paddle retries.
 
 **Privacy.** This endpoint handles only plan/status/timestamps and price/subscription/customer ids
 (plus a customer email used solely to match an account). It never sees prompt or draft content and
@@ -401,8 +409,9 @@ when the `event_id` is in the bounded `processedOverageEventIds` list (the legac
 **Going live (owner, after the app half lands).** Nothing is live until the owner: (1) sets the two
 Paddle secrets (below); (2) in the Paddle dashboard creates a **notification destination** pointing at
 `https://sentwise-inference.sentwise-service.workers.dev/v1/paddle/webhook`, subscribed to
-`subscription.created`, `subscription.updated`, `subscription.canceled`, `subscription.past_due`,
-`subscription.paused`, `subscription.resumed`, and `transaction.completed`, and copies its signing secret into
+`subscription.activated`, `subscription.created`, `subscription.updated`, `subscription.canceled`,
+`subscription.past_due`, `subscription.paused`, `subscription.resumed`, `transaction.completed`,
+`adjustment.created`, and `adjustment.updated`, and copies its signing secret into
 `PADDLE_WEBHOOK_SECRET`; (3) when moving off sandbox, flips `PADDLE_API_BASE` to
 `https://api.paddle.com` and swaps the sandbox price ids in `PRICE_TO_PLAN` for live ids. End-to-end
 verification (a real Paddle test event → a real entitlement write) happens then.
@@ -435,9 +444,10 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   (`pdl_ntfset_…`) that verifies `POST /v1/paddle/webhook`. When unset, every webhook is rejected
   `401` (nothing is entitled).
 - `PADDLE_API_KEY` — **56c, optional-but-recommended.** A Paddle API key (`subscription.read` +
-  `customer.read`) used by `GET /v1/paddle/manage-billing` to fetch a fresh temporary portal URL and,
-  in the email fallback, the customer's email. When unset, billing management cannot redirect and only
-  `custom_data.clerkUserId` mapping works.
+  `customer.read`) used by `GET /v1/paddle/manage-billing` to fetch a fresh temporary portal URL and
+  by the webhook to verify a checkout's Paddle customer against the Clerk account. When unset,
+  billing management cannot redirect and first-time Paddle customer mappings are not accepted unless
+  the account already has a matching stored `paddleCustomerId`.
 
 Push them to the Worker with (values are read from the file, never printed):
 

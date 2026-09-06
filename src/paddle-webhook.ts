@@ -11,20 +11,30 @@
 // body.
 
 import { createClerkClient } from "@clerk/backend";
-import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, PADDLE_SANDBOX_API_BASE, type Env } from "./config";
+import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, type Env } from "./config";
 import { ApiError } from "./errors";
 import { numFrom } from "./metering";
+import { fetchPaddleCustomerEmail } from "./paddle-api";
 import {
+  adjustedTransactionIdFromEvent,
+  adjustmentIdFromEvent,
   clerkUserIdFromEvent,
   customerIdFromEvent,
   HANDLED_EVENT_TYPES,
+  isAdjustmentEvent,
   isSubscriptionEvent,
+  isApprovedOverageReversal,
   overageDraftsFromEvent,
   parsePaddleEvent,
+  transactionIdFromEvent,
   verifyPaddleSignature,
   type PaddleEvent,
 } from "./paddle";
-import { quotaRecordPaddleOverage, quotaRecordPaddleSubscription } from "./quota-client";
+import {
+  quotaRecordPaddleOverage,
+  quotaRecordPaddleOverageReversal,
+  quotaRecordPaddleSubscription,
+} from "./quota-client";
 
 const HANDLED = new Set<string>(HANDLED_EVENT_TYPES);
 
@@ -63,6 +73,10 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
     return ack({ ignored: "unhandled_event_type" });
   }
 
+  if (isAdjustmentEvent(event.eventType) && !isApprovedOverageReversal(event)) {
+    return ack({ ignored: "adjustment_not_reversal" });
+  }
+
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
   // Resolve the Clerk user: custom_data.clerkUserId (primary), else email match.
@@ -73,6 +87,9 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 
   if (isSubscriptionEvent(event.eventType)) {
     return await applySubscriptionEvent(event, env, userId);
+  }
+  if (isAdjustmentEvent(event.eventType)) {
+    return await applyOverageReversalEvent(event, env, userId);
   }
   // transaction.completed → overage credit.
   return await applyOverageEvent(event, env, userId);
@@ -116,10 +133,51 @@ async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): 
   }
 
   try {
+    const transactionId = transactionIdFromEvent(event);
+    if (!transactionId) {
+      return ack({ ignored: "missing_transaction_id" });
+    }
     const result = await quotaRecordPaddleOverage(env, userId, {
       now: Date.now(),
       eventId: event.eventId,
+      transactionId,
+      customerId: customerIdFromEvent(event),
       extraDrafts: credit,
+    });
+    return ack(result);
+  } catch (err) {
+    if (err instanceof ApiError && err.type === "account_deleted") {
+      return ack({ mapped: false });
+    }
+    if (err instanceof ApiError && err.type === "account_deletion_in_progress") {
+      throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// adjustment.* → revoke refunded/charged-back overage credit.
+// ---------------------------------------------------------------------------
+
+async function applyOverageReversalEvent(
+  event: PaddleEvent,
+  env: Env,
+  userId: string,
+): Promise<Response> {
+  const adjustmentId = adjustmentIdFromEvent(event);
+  const transactionId = adjustedTransactionIdFromEvent(event);
+  if (!adjustmentId || !transactionId) {
+    return ack({ ignored: "missing_adjustment_reference" });
+  }
+
+  try {
+    const result = await quotaRecordPaddleOverageReversal(env, userId, {
+      now: Date.now(),
+      eventId: event.eventId,
+      adjustmentId,
+      transactionId,
+      customerId: customerIdFromEvent(event),
     });
     return ack(result);
   } catch (err) {
@@ -148,7 +206,7 @@ async function resolveClerkUserId(
   // Fallback: look the customer's email up in Clerk.
   const customerId = customerIdFromEvent(event);
   if (!customerId) return null;
-  const email = await fetchCustomerEmail(env, customerId);
+  const email = await fetchPaddleCustomerEmail(env, customerId);
   if (!email) return null;
   try {
     const list: unknown = await clerk.users.getUserList({ emailAddress: [email] });
@@ -158,39 +216,6 @@ async function resolveClerkUserId(
     return typeof firstId === "string" ? firstId : null;
   } catch {
     throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Paddle REST reads.
-// ---------------------------------------------------------------------------
-
-function paddleApiBase(env: Env): string {
-  return env.PADDLE_API_BASE && env.PADDLE_API_BASE !== ""
-    ? env.PADDLE_API_BASE
-    : PADDLE_SANDBOX_API_BASE;
-}
-
-async function fetchCustomerEmail(env: Env, customerId: string): Promise<string | null> {
-  if (!env.PADDLE_API_KEY) return null;
-  try {
-    const res = await fetch(`${paddleApiBase(env)}/customers/${encodeURIComponent(customerId)}`, {
-      headers: {
-        Authorization: `Bearer ${env.PADDLE_API_KEY}`,
-        "content-type": "application/json",
-      },
-    });
-    if (res.status === 404) return null;
-    if (!res.ok) {
-      throw new ApiError(502, "customer_lookup_failed", "Could not resolve the customer.");
-    }
-    const body: unknown = await res.json();
-    const data = asRecord(asRecord(body)?.data);
-    const email = data?.email;
-    return typeof email === "string" && email !== "" ? email : null;
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    throw new ApiError(502, "customer_lookup_failed", "Could not resolve the customer.");
   }
 }
 

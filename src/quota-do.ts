@@ -16,7 +16,8 @@
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /interest { topic } -> serialize Clerk interest metadata writes per user
 //   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
-//   POST /paddle-overage { now, eventId, extraDrafts } -> serialize Paddle overage entitlement writes
+//   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts } -> serialize Paddle overage entitlement writes
+//   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId } -> revoke refunded overage credit
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /defer-release { now, reservationId, reservationWindowStart, estimatedTokens }
@@ -30,7 +31,12 @@ import { ACCOUNT_DELETION_BARRIER_TIMEOUT_MS, type Env } from "./config";
 import { clerkUserExists, deleteClerkUser } from "./auth";
 import { ApiError, jsonError } from "./errors";
 import { parseInterestTopic, recordInterestInClerk } from "./interest";
-import { parsePaddleOverageBody, recordPaddleOverageInClerk } from "./paddle-entitlement";
+import {
+  parsePaddleOverageBody,
+  parsePaddleOverageReversalBody,
+  recordPaddleOverageInClerk,
+  revokePaddleOverageInClerk,
+} from "./paddle-entitlement";
 import {
   parsePaddleSubscriptionBody,
   recordPaddleSubscriptionInClerk,
@@ -183,6 +189,8 @@ export class AccountQuota {
         return this.handlePaddleSubscription(await request.json<unknown>());
       case "/paddle-overage":
         return this.handlePaddleOverage(await request.json<unknown>());
+      case "/paddle-overage-reversal":
+        return this.handlePaddleOverageReversal(await request.json<unknown>());
       default:
         return new Response("not found", { status: 404 });
     }
@@ -483,6 +491,20 @@ export class AccountQuota {
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(() =>
         recordPaddleOverageInClerk(userId, parsed, this.env),
+      );
+      return Response.json(result);
+    } catch (err) {
+      if (err instanceof ApiError) return err.toResponse();
+      throw err;
+    }
+  }
+
+  private async handlePaddleOverageReversal(body: unknown): Promise<Response> {
+    try {
+      const parsed = parsePaddleOverageReversalBody(body);
+      const userId = this.requireUserId();
+      const result = await this.enqueuePrivateMetadataWrite(() =>
+        revokePaddleOverageInClerk(userId, parsed, this.env),
       );
       return Response.json(result);
     } catch (err) {

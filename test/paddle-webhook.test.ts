@@ -36,7 +36,8 @@ const env: Env = {
   ANTHROPIC_API_KEY: "sk-ant-test",
   CLERK_PUBLISHABLE_KEY: "pk_test",
   PADDLE_WEBHOOK_SECRET: SECRET,
-  // No PADDLE_API_KEY by default → manage-URL/email fetches are skipped (no global fetch).
+  PADDLE_API_KEY: "pdl_apikey",
+  PADDLE_API_BASE: "https://sandbox-api.paddle.com",
   STARTER_DRAFT_LIMIT: "30",
   PRO_DRAFT_LIMIT: "120",
   UNLIMITED_DRAFT_LIMIT: "100000",
@@ -44,6 +45,18 @@ const env: Env = {
 
 beforeEach(() => {
   vi.unstubAllGlobals();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/customers/")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { email: "marcus@example.com" } }), { status: 200 }),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    }),
+  );
   mocks.getUser.mockReset();
   mocks.updateUserMetadata.mockReset();
   mocks.getUserList.mockReset();
@@ -204,6 +217,13 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     expect(lastWrite()?.subscription).toMatchObject({ status: "past_due", plan: "pro" });
   });
 
+  it("records active status on subscription.activated", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const res = await signedReq(subBody({ eventType: "subscription.activated", status: "active" }));
+    expect(res.status).toBe(200);
+    expect(lastWrite()?.subscription).toMatchObject({ status: "active", plan: "pro" });
+  });
+
   it("records paused subscriptions as canceled for access purposes", async () => {
     mocks.getUser.mockResolvedValue(userWith({}));
     const res = await signedReq(subBody({ eventType: "subscription.paused", status: "paused" }));
@@ -361,7 +381,12 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
       event_id: eventId,
       event_type: "transaction.completed",
       occurred_at: "2026-09-05T10:00:00.000Z",
-      data: { customer_id: "ctm_123", custom_data: { clerkUserId: "user_abc" }, ...data },
+      data: {
+        id: `txn_${eventId}`,
+        customer_id: "ctm_123",
+        custom_data: { clerkUserId: "user_abc" },
+        ...data,
+      },
     });
   }
 
@@ -385,6 +410,14 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.weeklyDraftLimit).toBe(120); // preserved
     expect(quota.lastOverageEventId).toBe("evt_txn");
     expect(quota.processedOverageEventIds).toEqual(["evt_txn"]);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: mondayStartUtc(Date.now()),
+      },
+    ]);
   });
 
   it("accumulates a second purchase within the same window", async () => {
@@ -408,6 +441,14 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.extraDrafts).toBe(15);
     expect(quota.extraDraftsWindowStart).toBe(monday);
     expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_new"]);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_new",
+        transactionId: "txn_evt_new",
+        extraDrafts: 5,
+        windowStart: monday,
+      },
+    ]);
   });
 
   it("resets extras when the stored purchase belongs to a prior window", async () => {
@@ -524,6 +565,10 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.extraDrafts).toBe(15);
     expect(quota.extraDraftsWindowStart).toBe(monday);
     expect(quota.processedOverageEventIds).toEqual(["evt_a", "evt_b"]);
+    expect(quota.overageCredits).toEqual([
+      { eventId: "evt_a", transactionId: "txn_evt_a", extraDrafts: 10, windowStart: monday },
+      { eventId: "evt_b", transactionId: "txn_evt_b", extraDrafts: 5, windowStart: monday },
+    ]);
   });
 
   it("serializes overlapping subscription and overage writes through the account Durable Object", async () => {
@@ -575,6 +620,14 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect((storedMeta.quota as Record<string, unknown>).processedOverageEventIds).toEqual([
       "evt_overage",
     ]);
+    expect((storedMeta.quota as Record<string, unknown>).overageCredits).toEqual([
+      {
+        eventId: "evt_overage",
+        transactionId: "txn_evt_overage",
+        extraDrafts: 5,
+        windowStart: monday,
+      },
+    ]);
   });
 
   it("ignores a plain renewal transaction (no overage markers)", async () => {
@@ -586,10 +639,122 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 });
 
+describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
+  beforeEach(() => {
+    mocks.getUserList.mockResolvedValue({ data: [{ id: "user_abc" }] });
+  });
+
+  function adjustmentBody(data: Record<string, unknown> = {}, eventId = "evt_adj"): string {
+    return JSON.stringify({
+      event_id: eventId,
+      event_type: data.event_type ?? "adjustment.updated",
+      occurred_at: "2026-09-05T11:00:00.000Z",
+      data: {
+        id: "adj_123",
+        action: "refund",
+        status: "approved",
+        transaction_id: "txn_evt_txn",
+        customer_id: "ctm_123",
+        ...data,
+      },
+    });
+  }
+
+  it("revokes current-window overage credit when an adjustment is approved", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 25,
+          extraDraftsWindowStart: monday,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 25,
+              windowStart: monday,
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(adjustmentBody());
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, revoked: true, extraDrafts: 25 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(0);
+    expect(quota.processedOverageAdjustmentIds).toEqual(["adj_123"]);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedByAdjustmentId: "adj_123",
+      },
+    ]);
+  });
+
+  it("is idempotent on the adjustment id", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 0,
+          extraDraftsWindowStart: monday,
+          processedOverageAdjustmentIds: ["adj_123"],
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 25,
+              windowStart: monday,
+              reversedByAdjustmentId: "adj_123",
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(adjustmentBody());
+
+    expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("ignores pending or rejected adjustments until Paddle approves them", async () => {
+    mocks.getUser.mockResolvedValue(userWith({ subscription: { paddleCustomerId: "ctm_123" } }));
+
+    for (const [status, action] of [
+      ["pending_approval", "refund"],
+      ["rejected", "refund"],
+      ["approved", "chargeback_warning"],
+    ]) {
+      const res = await signedReq(adjustmentBody({ status, action }, `evt_adj_${status}`));
+      expect((await res.json()) as any).toEqual({ ok: true, ignored: "adjustment_not_reversal" });
+    }
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("ignores approved adjustments for transactions without stored overage credit", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({ subscription: { paddleCustomerId: "ctm_123" }, quota: {} }),
+    );
+
+    const res = await signedReq(adjustmentBody());
+
+    expect((await res.json()) as any).toEqual({ ok: true, ignored: "not_overage_reversal" });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+});
+
 describe("POST /v1/paddle/webhook — user resolution", () => {
   it("acknowledges 200 mapped:false when no user can be resolved", async () => {
     const res = await signedReq(subBody({ clerkUserId: null, customerId: "ctm_x" }));
-    // No PADDLE_API_KEY → email fallback can't fetch → unmapped.
     expect(res.status).toBe(200);
     expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
     expect(mocks.getUser).not.toHaveBeenCalled();
@@ -601,6 +766,41 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     expect(res.status).toBe(200);
     expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("does not trust custom_data.clerkUserId when the Paddle customer belongs to another email", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ data: { email: "attacker@example.com" } }), {
+            status: 200,
+          }),
+        ),
+      ),
+    );
+    mocks.getUser.mockResolvedValue(userWith({}));
+
+    const res = await signedReq(subBody({ clerkUserId: "user_abc", customerId: "ctm_attacker" }));
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("accepts custom_data.clerkUserId when the stored Paddle customer id matches", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(
+      userWith({ subscription: { paddleCustomerId: "ctm_123" }, quota: {} }),
+    );
+
+    const res = await signedReq(subBody({ clerkUserId: "user_abc", customerId: "ctm_123" }));
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(lastWrite()?.subscription.paddleCustomerId).toBe("ctm_123");
   });
 
   it("returns 502 when direct Clerk user lookup fails transiently", async () => {
