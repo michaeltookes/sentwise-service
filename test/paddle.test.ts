@@ -387,7 +387,23 @@ describe("isApprovedOverageReversal", () => {
     expect(overageAdjustmentFromEvent(event)).toEqual({
       action: "refund",
       adjustmentType: "partial",
+      hasAdjustmentItems: true,
       items: [{ transactionItemId: "txnitm_123", type: "partial", amount: 1000 }],
+    });
+  });
+
+  it("marks tax-only adjustment items without treating them as overage items", () => {
+    const event = adjustment({
+      action: "credit",
+      status: "approved",
+      type: "partial",
+      items: [{ item_id: "txnitm_tax", type: "tax", amount: "450" }],
+    })!;
+    expect(overageAdjustmentFromEvent(event)).toEqual({
+      action: "credit",
+      adjustmentType: "partial",
+      hasAdjustmentItems: true,
+      items: [],
     });
   });
 });

@@ -211,6 +211,7 @@ export function quotaRecordPaddleOverageReversal(
     customerId: string | null;
     action: OverageAdjustmentAction;
     adjustmentType: string | null;
+    hasAdjustmentItems: boolean;
     items: OverageAdjustmentItem[];
   },
 ): Promise<PaddleOverageReversalResult> {

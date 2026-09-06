@@ -67,6 +67,7 @@ export interface OverageAdjustmentItem {
 export interface OverageAdjustmentSummary {
   action: OverageAdjustmentAction;
   adjustmentType: string | null;
+  hasAdjustmentItems: boolean;
   items: OverageAdjustmentItem[];
 }
 
@@ -320,6 +321,7 @@ export function overageAdjustmentFromEvent(event: PaddleEvent): OverageAdjustmen
   return {
     action,
     adjustmentType,
+    hasAdjustmentItems: items.length > 0,
     items: items.flatMap((item): OverageAdjustmentItem[] => {
       const record = asRecord(item);
       if (!record) return [];

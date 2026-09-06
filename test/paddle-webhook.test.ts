@@ -1146,6 +1146,39 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
+  it("ignores tax-only adjustment items without revoking overage credit", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 50,
+          extraDraftsWindowStart: monday,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              transactionItemId: "txnitm_1",
+              extraDrafts: 50,
+              amount: 5000,
+              windowStart: monday,
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      adjustmentBody({
+        type: "partial",
+        items: [{ item_id: "txnitm_tax", type: "tax", amount: "500" }],
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, ignored: "not_overage_reversal" });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
   it("restores credits after an approved chargeback reversal", async () => {
     const monday = mondayStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(

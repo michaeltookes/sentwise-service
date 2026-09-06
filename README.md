@@ -420,7 +420,8 @@ the Paddle transaction id and, when Paddle provides it, the transaction item id 
 Approved Paddle refund/chargeback/credit adjustments mark matching credits as reversed and subtract
 any still-current weekly extras; partial adjustments are prorated by adjusted amount. Approved
 chargeback/credit reversals restore only drafts revoked by the corresponding chargeback/credit
-action. If an approved reversal or restore arrives before the matching prerequisite event, it is
+action. Tax/proration-only adjustment items are ignored rather than treated as whole-overage
+reversals. If an approved reversal or restore arrives before the matching prerequisite event, it is
 retained in `pendingOverageReversals` and applied when the prerequisite is later delivered. Overage
 credit records are retained rather than capped at the newest 100 entries so later Paddle adjustments
 can still find the original transaction.

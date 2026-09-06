@@ -39,6 +39,7 @@ export interface PaddleOverageReversalBody {
   customerId: string | null;
   action: OverageAdjustmentAction;
   adjustmentType: string | null;
+  hasAdjustmentItems: boolean;
   items: PaddleOverageAdjustmentItemInput[];
 }
 
@@ -68,6 +69,7 @@ interface StoredPendingOverageReversal {
   transactionId: string;
   action: OverageAdjustmentAction;
   adjustmentType: string | null;
+  hasAdjustmentItems?: boolean;
   items: PaddleOverageAdjustmentItemInput[];
 }
 
@@ -140,6 +142,7 @@ export function parsePaddleOverageReversalBody(body: unknown): PaddleOverageReve
     customerId: nullableId(record.customerId),
     action,
     adjustmentType: typeof record.adjustmentType === "string" ? record.adjustmentType : null,
+    hasAdjustmentItems: record.hasAdjustmentItems === true,
     items: parseAdjustmentItems(record.items),
   };
 }
@@ -228,6 +231,9 @@ export async function revokePaddleOverageInClerk(
   const meta = user.privateMetadata ?? {};
   if (!paddleCustomerMatchesAccount(user, meta, body.customerId, env)) {
     return { mapped: false };
+  }
+  if (body.hasAdjustmentItems && body.items.length === 0) {
+    return { ignored: "not_overage_reversal" };
   }
 
   const existingQuota = asRecord(meta.quota) ?? {};
@@ -393,6 +399,7 @@ function pendingOverageReversalFromBody(
     transactionId: body.transactionId,
     action: body.action,
     adjustmentType: body.adjustmentType,
+    ...(body.hasAdjustmentItems ? { hasAdjustmentItems: true } : {}),
     items: body.items,
   };
 }
@@ -565,6 +572,9 @@ function cleanCredit(credit: StoredOverageCredit): StoredOverageCredit {
 function coversFullTransaction(
   adjustment: StoredPendingOverageReversal | PaddleOverageReversalBody,
 ): boolean {
+  if (adjustment.hasAdjustmentItems) {
+    return adjustment.adjustmentType === "full" && adjustment.items.length > 0;
+  }
   return adjustment.adjustmentType === "full" || adjustment.items.length === 0;
 }
 
@@ -737,6 +747,7 @@ function isStoredPendingOverageReversal(value: unknown): value is StoredPendingO
     (record.adjustmentType === null ||
       record.adjustmentType === undefined ||
       typeof record.adjustmentType === "string") &&
+    (record.hasAdjustmentItems === undefined || typeof record.hasAdjustmentItems === "boolean") &&
     Array.isArray(record.items)
   );
 }

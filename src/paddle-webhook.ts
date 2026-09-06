@@ -194,6 +194,7 @@ async function applyOverageReversalEvent(
       customerId: customerIdFromEvent(event),
       action: adjustment.action,
       adjustmentType: adjustment.adjustmentType,
+      hasAdjustmentItems: adjustment.hasAdjustmentItems,
       items: adjustment.items,
     });
     return ack(result);
