@@ -26,6 +26,7 @@ vi.mock("@clerk/backend", () => ({
 // Import AFTER the mock is registered.
 import worker from "../src/index";
 import { clerkUserExists } from "../src/auth";
+import { PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY } from "../src/quota-do";
 
 const env: Env = {
   ...testEnv,
@@ -52,6 +53,13 @@ async function clearAccountDeletionState(userId: string): Promise<void> {
   await runInDurableObject(stub, async (_instance, state) => {
     await state.storage.delete(ACCOUNT_DELETION_KEY);
     await state.storage.deleteAlarm();
+  });
+}
+
+async function clearPaddleSubscriptionCheckoutReservation(userId: string): Promise<void> {
+  const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
   });
 }
 
@@ -325,13 +333,14 @@ function quotaNamespaceWithDeletionFailures(options: {
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   mocks.verifyToken.mockReset();
   mocks.getUser.mockReset();
   mocks.updateUserMetadata.mockReset();
   mocks.deleteUser.mockReset();
+  await clearPaddleSubscriptionCheckoutReservation("user_123");
 });
 
 describe("GET /healthz", () => {
@@ -843,6 +852,101 @@ describe("POST /v1/paddle/checkout", () => {
     expect(body.customer_id).toBeUndefined();
     expect(body.custom_data).toMatchObject({ clerkUserId: "user_123" });
     expect(body.custom_data.sentwiseCheckoutBinding).toMatch(/^v1:[0-9a-f]{64}$/);
+  });
+
+  it("rejects a concurrent subscription checkout while one is pending", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const createStarted = deferred<void>();
+    const createDone = deferred<Response>();
+    const fetchMock = vi.fn(() => {
+      createStarted.resolve();
+      return createDone.promise;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    await createStarted.promise;
+
+    const second = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(second.status).toBe(409);
+    expect(((await second.json()) as any).error.type).toBe("billing_checkout_pending");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    createDone.resolve(
+      new Response(
+        JSON.stringify({
+          data: {
+            id: "txn_123",
+            checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_123" },
+          },
+        }),
+        { status: 201 },
+      ),
+    );
+    expect((await first).status).toBe(200);
+  });
+
+  it("releases a subscription checkout reservation when Paddle creation fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 502 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: {
+              id: "txn_retry",
+              checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_retry" },
+            },
+          }),
+          { status: 201 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    expect(first.status).toBe(502);
+    expect(((await first.json()) as any).error.type).toBe("checkout_unavailable");
+
+    const retry = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({
+      transactionId: "txn_retry",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_retry",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("rejects subscription checkout when a Paddle subscription is already active", async () => {

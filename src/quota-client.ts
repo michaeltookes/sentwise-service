@@ -67,6 +67,8 @@ export type PaddleSubscriptionResult =
   | { stale: true }
   | { ignored: "unknown_price" }
   | { mapped: false };
+export type PaddleSubscriptionCheckoutReservationResult = { reserved: true } | { pending: true };
+export type PaddleSubscriptionCheckoutReleaseResult = { released: true };
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
   const id = env.ACCOUNT_QUOTA.idFromName(userId);
@@ -225,6 +227,33 @@ export function quotaRecordPaddleSubscription(
   body: { now: number; event: PaddleEvent },
 ): Promise<PaddleSubscriptionResult> {
   return call<PaddleSubscriptionResult>(env, userId, "/paddle-subscription", body);
+}
+
+/** Reserve a short-lived per-account subscription checkout slot before creating it in Paddle. */
+export function quotaReservePaddleSubscriptionCheckout(
+  env: Env,
+  userId: string,
+  body: { now: number },
+): Promise<PaddleSubscriptionCheckoutReservationResult> {
+  return call<PaddleSubscriptionCheckoutReservationResult>(
+    env,
+    userId,
+    "/paddle-subscription-checkout-reserve",
+    body,
+  );
+}
+
+/** Release a pending subscription checkout slot after Paddle transaction creation fails. */
+export function quotaReleasePaddleSubscriptionCheckout(
+  env: Env,
+  userId: string,
+): Promise<PaddleSubscriptionCheckoutReleaseResult> {
+  return call<PaddleSubscriptionCheckoutReleaseResult>(
+    env,
+    userId,
+    "/paddle-subscription-checkout-release",
+    {},
+  );
 }
 
 /** Set a deletion barrier before attempting Clerk deletion. Does not wipe counters. */

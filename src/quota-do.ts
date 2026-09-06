@@ -9,6 +9,7 @@
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)
 //   "paddle_overage_credits" -> refundable Paddle overage credit ledger
+//   "paddle_subscription_checkout_reservation" -> short-lived pending subscription checkout lock
 //   "account_deletion" -> deletion barrier/tombstone plus retry metadata
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
@@ -19,6 +20,8 @@
 //   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
 //   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts, credits } -> serialize Paddle overage entitlement writes
 //   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, hasAdjustmentItems, items } -> revoke/restore overage credit
+//   POST /paddle-subscription-checkout-reserve { now } -> reserve one pending subscription checkout
+//   POST /paddle-subscription-checkout-release {} -> release a pending subscription checkout after failed creation
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /defer-release { now, reservationId, reservationWindowStart, estimatedTokens }
@@ -109,6 +112,10 @@ interface AccountDeletionMarker {
   attemptIds?: string[];
   attempts?: AccountDeletionAttempt[];
 }
+interface PaddleSubscriptionCheckoutReservation {
+  createdAt: number;
+  expiresAt: number;
+}
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
 }
@@ -120,6 +127,8 @@ interface AlarmScheduler {
 }
 
 const ACCOUNT_DELETION_KEY = "account_deletion";
+export const PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY =
+  "paddle_subscription_checkout_reservation";
 const LEGACY_PENDING_SETTLEMENTS_KEY = "pending_settlements";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
 const SETTLED_SETTLEMENT_KEY_PREFIX = "settled_settlement:";
@@ -128,6 +137,7 @@ const SETTLEMENT_RETRY_BASE_DELAY_MS = 60_000;
 const SETTLEMENT_RETRY_MAX_DELAY_MS = 15 * 60_000;
 const SETTLEMENT_MARKER_RETENTION_MS = RESERVATION_TTL_MS + SETTLEMENT_RETRY_MAX_DELAY_MS;
 const SETTLEMENT_MARKER_PRUNE_INTERVAL_MS = SETTLEMENT_RETRY_MAX_DELAY_MS;
+const PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_TTL_MS = 30 * 60_000;
 const ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS = 60_000;
 const LEGACY_DELETION_ATTEMPT_ID = "legacy-deletion-attempt";
 const STORAGE_BULK_OPERATION_LIMIT = 128;
@@ -192,6 +202,10 @@ export class AccountQuota {
         return this.handlePaddleOverage(await request.json<unknown>());
       case "/paddle-overage-reversal":
         return this.handlePaddleOverageReversal(await request.json<unknown>());
+      case "/paddle-subscription-checkout-reserve":
+        return this.handlePaddleSubscriptionCheckoutReserve(await request.json<unknown>());
+      case "/paddle-subscription-checkout-release":
+        return this.handlePaddleSubscriptionCheckoutRelease();
       default:
         return new Response("not found", { status: 404 });
     }
@@ -479,6 +493,7 @@ export class AccountQuota {
       const result = await this.enqueuePrivateMetadataWrite(() =>
         recordPaddleSubscriptionInClerk(userId, parsed, this.env),
       );
+      await this.clearPaddleSubscriptionCheckoutReservation();
       return Response.json(result);
     } catch (err) {
       if (err instanceof ApiError) return err.toResponse();
@@ -512,6 +527,37 @@ export class AccountQuota {
       if (err instanceof ApiError) return err.toResponse();
       throw err;
     }
+  }
+
+  private async handlePaddleSubscriptionCheckoutReserve(body: unknown): Promise<Response> {
+    const record = asRecord(body);
+    const now = normalizedNow(typeof record?.now === "number" ? record.now : undefined);
+    return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return accountDeletionResponse(deletion);
+
+      const reservation = await txn.get<unknown>(
+        PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
+      );
+      if (isActivePaddleSubscriptionCheckoutReservation(reservation, now)) {
+        return Response.json({ pending: true });
+      }
+
+      await txn.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
+        createdAt: now,
+        expiresAt: now + PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_TTL_MS,
+      });
+      return Response.json({ reserved: true });
+    });
+  }
+
+  private async handlePaddleSubscriptionCheckoutRelease(): Promise<Response> {
+    await this.clearPaddleSubscriptionCheckoutReservation();
+    return Response.json({ released: true });
+  }
+
+  private async clearPaddleSubscriptionCheckoutReservation(): Promise<void> {
+    await this.storage.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
   }
 
   private enqueuePrivateMetadataWrite<T>(operation: () => Promise<T>): Promise<T> {
@@ -925,6 +971,10 @@ function nonNegativeInt(v: number | undefined): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
 
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
+}
+
 function normalizedNow(v: number | undefined): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : Date.now();
 }
@@ -940,6 +990,19 @@ function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
   return (
     (marker.status === "deleting" || marker.status === "deleted") &&
     typeof marker.updatedAt === "number"
+  );
+}
+
+function isActivePaddleSubscriptionCheckoutReservation(
+  v: unknown,
+  now: number,
+): v is PaddleSubscriptionCheckoutReservation {
+  const reservation = asRecord(v);
+  return (
+    !!reservation &&
+    typeof reservation.expiresAt === "number" &&
+    Number.isFinite(reservation.expiresAt) &&
+    reservation.expiresAt > now
   );
 }
 

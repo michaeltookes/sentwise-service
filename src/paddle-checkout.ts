@@ -8,6 +8,10 @@ import {
   storedPaddleSubscriptionId,
 } from "./paddle-account";
 import { createPaddleCheckoutTransaction } from "./paddle-api";
+import {
+  quotaReleasePaddleSubscriptionCheckout,
+  quotaReservePaddleSubscriptionCheckout,
+} from "./quota-client";
 
 const MAX_CHECKOUT_QUANTITY = 100;
 const ACTIVE_SUBSCRIPTION_STATUSES = new Set(["active", "trialing", "past_due"]);
@@ -18,6 +22,9 @@ export async function handlePaddleCheckout(
   env: Env,
 ): Promise<Response> {
   const body = await parseCheckoutRequest(request, env);
+  if (!env.PADDLE_WEBHOOK_SECRET) {
+    throw new ApiError(503, "checkout_unavailable", "Checkout is not configured.");
+  }
   const account = await loadCheckoutAccount(userId, env);
   const customerId = storedPaddleCustomerId(account.subscription);
 
@@ -43,12 +50,34 @@ export async function handlePaddleCheckout(
     );
   }
 
-  const transaction = await createPaddleCheckoutTransaction(env, {
-    priceId: body.priceId,
-    quantity: body.quantity,
-    customData: await buildPaddleCheckoutCustomData(userId, env),
-    customerId,
-  });
+  const reserved = body.kind === "subscription";
+  if (reserved) {
+    const reservation = await quotaReservePaddleSubscriptionCheckout(env, userId, {
+      now: Date.now(),
+    });
+    if ("pending" in reservation) {
+      throw new ApiError(
+        409,
+        "billing_checkout_pending",
+        "A subscription checkout is already in progress.",
+      );
+    }
+  }
+
+  let transaction;
+  try {
+    transaction = await createPaddleCheckoutTransaction(env, {
+      priceId: body.priceId,
+      quantity: body.quantity,
+      customData: await buildPaddleCheckoutCustomData(userId, env),
+      customerId,
+    });
+  } catch (err) {
+    if (reserved) {
+      await quotaReleasePaddleSubscriptionCheckout(env, userId).catch(() => undefined);
+    }
+    throw err;
+  }
 
   const res = Response.json(transaction);
   res.headers.set("Cache-Control", "no-store");

@@ -1134,6 +1134,58 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("is idempotent when replaying an adjustment retained on the credit ledger", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 40,
+          extraDraftsWindowStart: monday,
+          processedOverageAdjustmentIds: [],
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              transactionItemId: "txnitm_1",
+              extraDrafts: 50,
+              amount: 5000,
+              windowStart: monday,
+              reversedDrafts: 10,
+              reversalAdjustmentIds: ["adj_123"],
+              reversedDraftsByAdjustment: [
+                { adjustmentId: "adj_123", action: "refund", drafts: 10 },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      adjustmentBody({
+        type: "partial",
+        items: [{ item_id: "txnitm_1", type: "partial", amount: "1000" }],
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 50,
+        amount: 5000,
+        windowStart: monday,
+        reversedDrafts: 10,
+        reversalAdjustmentIds: ["adj_123"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 10 }],
+      },
+    ]);
+  });
+
   it("retains an approved reversal that arrives before the overage transaction", async () => {
     const monday = mondayStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
@@ -1499,6 +1551,29 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     mocks.getUser.mockResolvedValue(userWith({ subscription: null, quota: {} }));
 
     const res = await signedReq(subBody({ customData, customerId: "ctm_new" }));
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(lastWrite()?.subscription.paddleCustomerId).toBe("ctm_new");
+  });
+
+  it("accepts signed checkout custom data from the previous binding secret", async () => {
+    const customData = await buildPaddleCheckoutCustomData("user_abc", {
+      ...env,
+      PADDLE_CHECKOUT_BINDING_SECRET: "old_checkout_binding_secret",
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null, quota: {} }));
+
+    const res = await signedReq(subBody({ customData, customerId: "ctm_new" }), {
+      overrideEnv: {
+        ...env,
+        PADDLE_CHECKOUT_BINDING_SECRET: "new_checkout_binding_secret",
+        PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET: "old_checkout_binding_secret",
+      },
+    });
 
     expect(res.status).toBe(200);
     expect((await res.json()) as any).toEqual({ ok: true, applied: true });

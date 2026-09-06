@@ -350,7 +350,9 @@ Subscription quantities must be `1`; omitted quantities default to `1`, explicit
 quantities must be positive integers, and overage quantities are capped. Subscription checkout is
 rejected while the account already has an active/trialing/past-due Paddle subscription, so tier
 changes must go through Paddle subscription management instead of creating a second recurring
-subscription. Overage checkout requires an active Paddle subscription with a stored
+subscription. Subscription checkout creation is also serialized per account with a short-lived
+Durable Object reservation; a second request is rejected while a checkout transaction is pending.
+Overage checkout requires an active Paddle subscription with a stored
 `paddleCustomerId`; the Worker passes that `customer_id` to Paddle so the later webhook credits the
 same bound customer.
 
@@ -427,7 +429,9 @@ reversals. If an approved reversal or restore arrives before the matching prereq
 retained in `pendingOverageReversals` and applied when the prerequisite is later delivered. The
 authoritative refundable-credit ledger is stored in the account Durable Object, not Clerk metadata,
 so later Paddle adjustments can still find older overage transactions without growing
-`privateMetadata.quota` indefinitely.
+`privateMetadata.quota` indefinitely. Per-credit reversal/restore adjustment IDs remain in that
+ledger for the refundable lifetime of the credit, so an old adjustment replay is still idempotent
+after the small processed-id ring buffer has rotated.
 
 **Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
@@ -482,12 +486,17 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   read** permission, used by `/admin/margin` to query the Analytics Engine SQL API. When unset,
   `/admin/margin` returns `503 analytics_unavailable`.
 - `PADDLE_WEBHOOK_SECRET` — **56c.** The Paddle notification-destination signing secret
-  (`pdl_ntfset_…`) that verifies `POST /v1/paddle/webhook` and signs the checkout account binding.
-  When unset, every webhook is rejected `401` and `POST /v1/paddle/checkout` is unavailable.
-- `PADDLE_API_KEY` — **56c.** A Paddle API key (`transaction.write`, `subscription.read`, and
-  `customer.read`) used by `POST /v1/paddle/checkout`, `GET /v1/paddle/manage-billing`, cross-subscription
-  replacement checks, and webhook fallback mapping. Missing credentials make those operations fail
-  closed with `5xx` instead of acknowledging paid events.
+  (`pdl_ntfset_…`) that verifies `POST /v1/paddle/webhook`. It also signs the checkout account
+  binding unless `PADDLE_CHECKOUT_BINDING_SECRET` is set. When unset, every webhook is rejected
+  `401` and `POST /v1/paddle/checkout` is unavailable.
+- `PADDLE_CHECKOUT_BINDING_SECRET` / `PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET` — **56c, optional.**
+  Stable HMAC secrets for server-minted checkout bindings; the previous secret is accepted during
+  rotations so in-flight Paddle transactions can still map their first webhook.
+- `PADDLE_API_KEY` — **56c.** A Paddle API key (`transaction.write`, `transaction.read`,
+  `subscription.read`, and `customer.read`) used by `POST /v1/paddle/checkout`,
+  `GET /v1/paddle/manage-billing`, cross-subscription replacement checks, and webhook fallback
+  mapping. Missing credentials make those operations fail closed with `5xx` instead of acknowledging
+  paid events.
 
 Push them to the Worker with (values are read from the file, never printed):
 

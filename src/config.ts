@@ -51,6 +51,8 @@ export interface Env {
   PADDLE_API_KEY?: string; // Paddle API key (pdl_…); creates checkouts, verifies mapping, reads management/current subscription state
   PADDLE_API_BASE?: string; // Paddle REST base; defaults to the SANDBOX base (PADDLE_SANDBOX_API_BASE)
   PADDLE_WEBHOOK_TOLERANCE_SEC?: string | number; // signature freshness window (seconds); default DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC
+  PADDLE_CHECKOUT_BINDING_SECRET?: string; // stable HMAC secret for server-minted checkout binding; defaults to PADDLE_WEBHOOK_SECRET
+  PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // previous checkout-binding secret accepted during rotations
 
   // 56c — per-tier weekly draft limits. Server-side placeholders (measure-first,
   // like the 56b limits): tunable per-deploy without shipping a new binary, and

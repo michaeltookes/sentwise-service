@@ -52,8 +52,11 @@ export async function paddleCheckoutBindingMatchesCustomData(
   const token = checkoutBindingFromCustomData(customData);
   if (!token) return false;
 
-  const expected = await paddleCheckoutBindingDigest(userId, env);
-  return timingSafeEqualHex(expected, token);
+  for (const secret of checkoutBindingVerificationSecrets(env)) {
+    const expected = await paddleCheckoutBindingDigest(userId, secret);
+    if (timingSafeEqualHex(expected, token)) return true;
+  }
+  return false;
 }
 
 export function storedPaddleCustomerId(rawSubscription: unknown): string | null {
@@ -77,14 +80,24 @@ export function supersededPaddleSubscriptionIds(rawSubscription: unknown): strin
 }
 
 async function paddleCheckoutBindingToken(userId: string, env: Env): Promise<string> {
-  return `v1:${await paddleCheckoutBindingDigest(userId, env)}`;
+  return `v1:${await paddleCheckoutBindingDigest(userId, currentCheckoutBindingSecret(env))}`;
 }
 
-async function paddleCheckoutBindingDigest(userId: string, env: Env): Promise<string> {
-  if (!env.PADDLE_WEBHOOK_SECRET) {
+async function paddleCheckoutBindingDigest(userId: string, secret: string): Promise<string> {
+  return computeHmacSha256Hex(secret, `sentwise:paddle-checkout:v1:${userId}`);
+}
+
+function currentCheckoutBindingSecret(env: Env): string {
+  const secret = env.PADDLE_CHECKOUT_BINDING_SECRET || env.PADDLE_WEBHOOK_SECRET;
+  if (!secret) {
     throw new ApiError(503, "checkout_unavailable", "Checkout is not configured.");
   }
-  return computeHmacSha256Hex(env.PADDLE_WEBHOOK_SECRET, `sentwise:paddle-checkout:v1:${userId}`);
+  return secret;
+}
+
+function checkoutBindingVerificationSecrets(env: Env): string[] {
+  const secrets = [currentCheckoutBindingSecret(env), env.PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET];
+  return [...new Set(secrets.filter((secret): secret is string => !!secret))];
 }
 
 function checkoutBindingFromCustomData(customData: unknown): string | null {
