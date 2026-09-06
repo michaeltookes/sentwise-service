@@ -1,10 +1,10 @@
 // Pure, I/O-free subscription derivation (backlog item 73). Deterministic and
 // trivially unit-testable — no storage, no network, no Clerk.
 //
-// PLACEHOLDER until 56c (Paddle checkout / licensing) ships. Until then the
-// subscription reported to the app is DERIVED from the 14-day trial, unless the
-// Clerk user's `privateMetadata.subscription` already carries a valid record
-// (which 56c will write on checkout). This module owns both the validation of
+// The subscription reported to the app is DERIVED from the 14-day trial, unless
+// the Clerk user's `privateMetadata.subscription` carries a valid record. 56c
+// (Paddle checkout / licensing) writes that record on checkout — see
+// src/paddle.ts + src/paddle-webhook.ts. This module owns both the validation of
 // that override and the trial-derived fallback.
 //
 // PRIVACY: handles only plan/status enums, an ISO timestamp, and a billing URL —
@@ -12,7 +12,12 @@
 
 import type { TrialState } from "./trial";
 
-export type SubscriptionPlan = "trial" | "individual" | "team" | "none";
+// Launch tiers (56c). "trial" is the pre-purchase state; the three paid tiers
+// map from Paddle price ids (see PRICE_TO_PLAN in config.ts); "team" is reserved
+// for a future seat-based plan (unused today); "none" is the no-subscription
+// terminal state. A clean pre-release break replaced the old "individual" tier —
+// no released builds existed, so there is no migration.
+export type SubscriptionPlan = "trial" | "starter" | "pro" | "unlimited" | "team" | "none";
 export type SubscriptionStatus = "trialing" | "active" | "past_due" | "canceled" | "lapsed";
 
 /** The exact `subscription` object returned on GET /v1/me. Field names are the wire contract. */
@@ -23,7 +28,7 @@ export interface Subscription {
   manageBillingUrl: string | null; // https URL, or null
 }
 
-const PLANS: readonly SubscriptionPlan[] = ["trial", "individual", "team", "none"];
+const PLANS: readonly SubscriptionPlan[] = ["trial", "starter", "pro", "unlimited", "team", "none"];
 const STATUSES: readonly SubscriptionStatus[] = [
   "trialing",
   "active",

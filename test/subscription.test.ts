@@ -46,13 +46,47 @@ describe("deriveSubscription (trial fallback, placeholder until 56c)", () => {
 describe("deriveSubscription (privateMetadata.subscription override)", () => {
   it("uses a valid override verbatim instead of the trial derivation", () => {
     const override = {
-      plan: "individual",
+      plan: "pro",
       status: "active",
       renewsAt: "2026-10-01T00:00:00.000Z",
       manageBillingUrl: "https://billing.example.com/portal/abc",
     };
     // Even with an active trial, a valid override wins.
     expect(deriveSubscription(activeTrial, override)).toEqual(override);
+  });
+
+  it("accepts each launch tier as a valid plan", () => {
+    for (const plan of ["starter", "pro", "unlimited", "team", "none"] as const) {
+      expect(deriveSubscription(activeTrial, { plan, status: "active" })).toEqual({
+        plan,
+        status: "active",
+        renewsAt: null,
+        manageBillingUrl: null,
+      });
+    }
+  });
+
+  it("ignores unknown reconciliation fields the webhook stores alongside the wire fields", () => {
+    // The 56c webhook stores paddleSubscriptionId/priceId/updatedAt/lastEventId
+    // etc.; parseSubscriptionOverride reads only the four wire fields.
+    expect(
+      deriveSubscription(activeTrial, {
+        plan: "starter",
+        status: "active",
+        renewsAt: "2026-10-01T00:00:00.000Z",
+        manageBillingUrl: "https://billing.example.com/p/1",
+        paddleSubscriptionId: "sub_123",
+        paddleCustomerId: "ctm_123",
+        priceId: "pri_01m1syd7nfarp8pggpcnvjbgyy",
+        updatedAt: "2026-09-05T00:00:00.000Z",
+        lastEventId: "evt_1",
+      }),
+    ).toEqual({
+      plan: "starter",
+      status: "active",
+      renewsAt: "2026-10-01T00:00:00.000Z",
+      manageBillingUrl: "https://billing.example.com/p/1",
+    });
   });
 
   it("accepts a minimal override (plan + status only) and nulls the optional fields", () => {
@@ -65,13 +99,19 @@ describe("deriveSubscription (privateMetadata.subscription override)", () => {
   });
 
   it("falls back to the trial derivation when the override is invalid", () => {
-    // Bad plan/status enum -> the whole override is treated as absent.
-    expect(deriveSubscription(activeTrial, { plan: "premium", status: "on" })).toEqual({
-      plan: "trial",
-      status: "trialing",
-      renewsAt: "2026-09-03T00:00:00.000Z",
-      manageBillingUrl: null,
-    });
+    // Bad plan/status enum -> the whole override is treated as absent. "individual"
+    // was the pre-56c tier and is no longer valid.
+    for (const bad of [
+      { plan: "premium", status: "on" },
+      { plan: "individual", status: "active" },
+    ]) {
+      expect(deriveSubscription(activeTrial, bad)).toEqual({
+        plan: "trial",
+        status: "trialing",
+        renewsAt: "2026-09-03T00:00:00.000Z",
+        manageBillingUrl: null,
+      });
+    }
   });
 });
 
@@ -85,15 +125,17 @@ describe("parseSubscriptionOverride", () => {
 
   it("returns null when plan or status is missing or off-enum", () => {
     expect(parseSubscriptionOverride({ status: "active" })).toBeNull();
-    expect(parseSubscriptionOverride({ plan: "individual" })).toBeNull();
-    expect(parseSubscriptionOverride({ plan: "individual", status: "bogus" })).toBeNull();
+    expect(parseSubscriptionOverride({ plan: "pro" })).toBeNull();
+    expect(parseSubscriptionOverride({ plan: "pro", status: "bogus" })).toBeNull();
     expect(parseSubscriptionOverride({ plan: "bogus", status: "active" })).toBeNull();
+    // "individual" was the pre-56c tier and is now off-enum.
+    expect(parseSubscriptionOverride({ plan: "individual", status: "active" })).toBeNull();
   });
 
   it("drops a malformed renewsAt to null but keeps a valid record", () => {
     expect(
-      parseSubscriptionOverride({ plan: "individual", status: "active", renewsAt: "not-a-date" }),
-    ).toEqual({ plan: "individual", status: "active", renewsAt: null, manageBillingUrl: null });
+      parseSubscriptionOverride({ plan: "pro", status: "active", renewsAt: "not-a-date" }),
+    ).toEqual({ plan: "pro", status: "active", renewsAt: null, manageBillingUrl: null });
   });
 
   it("drops parseable but non-canonical renewsAt values to null", () => {
@@ -104,21 +146,24 @@ describe("parseSubscriptionOverride", () => {
       "2026-12-01T00:00:00.000+00:00",
       "2026-02-30T00:00:00.000Z",
     ]) {
-      expect(parseSubscriptionOverride({ plan: "individual", status: "active", renewsAt })).toEqual(
-        { plan: "individual", status: "active", renewsAt: null, manageBillingUrl: null },
-      );
+      expect(parseSubscriptionOverride({ plan: "pro", status: "active", renewsAt })).toEqual({
+        plan: "pro",
+        status: "active",
+        renewsAt: null,
+        manageBillingUrl: null,
+      });
     }
   });
 
   it("keeps canonical ISO renewsAt values", () => {
     expect(
       parseSubscriptionOverride({
-        plan: "individual",
+        plan: "pro",
         status: "active",
         renewsAt: "2026-12-01T00:00:00.000Z",
       }),
     ).toEqual({
-      plan: "individual",
+      plan: "pro",
       status: "active",
       renewsAt: "2026-12-01T00:00:00.000Z",
       manageBillingUrl: null,
@@ -128,17 +173,17 @@ describe("parseSubscriptionOverride", () => {
   it("drops a non-https manageBillingUrl to null", () => {
     expect(
       parseSubscriptionOverride({
-        plan: "individual",
+        plan: "pro",
         status: "active",
         manageBillingUrl: "http://insecure.example.com",
       }),
-    ).toEqual({ plan: "individual", status: "active", renewsAt: null, manageBillingUrl: null });
+    ).toEqual({ plan: "pro", status: "active", renewsAt: null, manageBillingUrl: null });
     expect(
       parseSubscriptionOverride({
-        plan: "individual",
+        plan: "pro",
         status: "active",
         manageBillingUrl: "javascript:alert(1)",
       }),
-    ).toEqual({ plan: "individual", status: "active", renewsAt: null, manageBillingUrl: null });
+    ).toEqual({ plan: "pro", status: "active", renewsAt: null, manageBillingUrl: null });
   });
 });

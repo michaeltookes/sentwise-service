@@ -590,7 +590,7 @@ describe("GET /v1/me", () => {
 
   it("uses a valid privateMetadata.subscription override verbatim", async () => {
     const override = {
-      plan: "individual",
+      plan: "pro",
       status: "active",
       renewsAt: "2026-12-01T00:00:00.000Z",
       manageBillingUrl: "https://billing.example.com/p/abc",
