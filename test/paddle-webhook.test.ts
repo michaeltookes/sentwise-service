@@ -64,12 +64,31 @@ beforeEach(() => {
 });
 
 function userWith(privateMetadata: Record<string, unknown>) {
+  const metadata = withDefaultPaddleCustomer(privateMetadata);
   return {
     id: "user_abc",
     primaryEmailAddressId: "ema_1",
     emailAddresses: [{ id: "ema_1", emailAddress: "marcus@example.com" }],
-    privateMetadata,
+    privateMetadata: metadata,
   };
+}
+
+function withDefaultPaddleCustomer(
+  privateMetadata: Record<string, unknown>,
+): Record<string, unknown> {
+  if (privateMetadata.subscription === undefined) {
+    return { ...privateMetadata, subscription: { paddleCustomerId: "ctm_123" } };
+  }
+  if (typeof privateMetadata.subscription === "object" && privateMetadata.subscription !== null) {
+    const subscription = privateMetadata.subscription as Record<string, unknown>;
+    if (subscription.paddleCustomerId === undefined) {
+      return {
+        ...privateMetadata,
+        subscription: { ...subscription, paddleCustomerId: "ctm_123" },
+      };
+    }
+  }
+  return privateMetadata;
 }
 
 async function signedReq(
@@ -829,23 +848,16 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
-  it("does not trust custom_data.clerkUserId when the Paddle customer belongs to another email", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(() =>
-        Promise.resolve(
-          new Response(JSON.stringify({ data: { email: "attacker@example.com" } }), {
-            status: 200,
-          }),
-        ),
-      ),
-    );
-    mocks.getUser.mockResolvedValue(userWith({}));
+  it("does not trust custom_data.clerkUserId when the stored Paddle customer differs", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(userWith({ subscription: { paddleCustomerId: "ctm_victim" } }));
 
     const res = await signedReq(subBody({ clerkUserId: "user_abc", customerId: "ctm_attacker" }));
 
     expect(res.status).toBe(200);
     expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
@@ -902,7 +914,10 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     mocks.getUserList.mockResolvedValue({ data: [{ id: "user_matched" }] });
-    mocks.getUser.mockResolvedValue({ ...userWith({}), id: "user_matched" });
+    mocks.getUser.mockResolvedValue({
+      ...userWith({ subscription: { paddleCustomerId: "ctm_email" } }),
+      id: "user_matched",
+    });
 
     const res = await signedReq(subBody({ clerkUserId: null, customerId: "ctm_email" }), {
       overrideEnv: envWithApi,
