@@ -13,9 +13,14 @@
       "invocation_logs": false,
     },
   },
-  // Public, safe-to-commit key. Secrets (CLERK_SECRET_KEY, ANTHROPIC_API_KEY,
-  // and the 56b ADMIN_TOKEN / CF_ANALYTICS_API_TOKEN) are pushed with
-  // `wrangler secret put` and never live in this file.
+  // Public, safe-to-commit key. Secrets are pushed with `wrangler secret put` and
+  // never live in this file:
+  //   CLERK_SECRET_KEY, ANTHROPIC_API_KEY            (56a)
+  //   ADMIN_TOKEN, CF_ANALYTICS_API_TOKEN            (56b margin dashboard)
+  //   PADDLE_WEBHOOK_SECRET, PADDLE_API_KEY          (56c checkout + licensing)
+  // NOTE: `wrangler secret put` reads the value from stdin — run it from a REAL
+  // terminal (TTY). A non-interactive/piped invocation can upload an EMPTY secret
+  // silently (a known 56b gotcha), which then fails webhook verification with 401.
   "vars": {
     "CLERK_PUBLISHABLE_KEY": "pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA",
 
@@ -30,6 +35,20 @@
     // Public Cloudflare account id (already present as `account_id` above); used to
     // build the Analytics Engine SQL API URL in /admin/margin.
     "CF_ACCOUNT_ID": "313171820c15d1a8f14bed4dbcb699af",
+
+    // --- 56c checkout + licensing (Paddle) ---
+    // SANDBOX base until the owner flips to https://api.paddle.com with live creds.
+    "PADDLE_API_BASE": "https://sandbox-api.paddle.com",
+    "PADDLE_WEBHOOK_TOLERANCE_SEC": "300", // signature freshness window (seconds)
+    // Per-tier weekly draft limits — PLACEHOLDERS. The window unit (weekly vs.
+    // monthly, which the landing page implies) and the real per-tier numbers are
+    // an open owner decision; the webhook writes whichever value lives here.
+    "STARTER_DRAFT_LIMIT": "30",
+    "PRO_DRAFT_LIMIT": "120",
+    "UNLIMITED_DRAFT_LIMIT": "100000", // fair-use ceiling, not "infinite"
+    "EXTRA_DRAFTS_PER_UNIT": "1", // drafts credited per unit of the overage price
+    // EXTRA_DRAFTS_PRICE_ID: set to the one-time "buy more drafts" price id once it
+    // exists; until then an overage is recognized by custom_data.kind === "overage".
   },
 
   // 56b — per-account usage counters (weekly drafts/tokens + sliding rate-limit

@@ -30,6 +30,7 @@ import {
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
 import { recordInterest } from "./interest";
+import { handlePaddleWebhook } from "./paddle-webhook";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -43,6 +44,7 @@ export { AccountQuota } from "./quota-do";
  *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
  *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
  *   POST   /v1/interest   -> record demand for a parked capability (item 75; first click wins)
+ *   POST   /v1/paddle/webhook -> Paddle checkout/licensing events -> entitlement writes (56c; signature-auth, no bearer)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
@@ -62,6 +64,13 @@ export default {
 
       if (pathname === "/admin/margin" && request.method === "GET") {
         return await handleMargin(request, env);
+      }
+
+      // 56c — Paddle checkout/licensing webhook. Authenticated by the Paddle
+      // signature (HMAC over ts:rawBody), NOT a Clerk bearer, so it runs before
+      // authenticate(). It writes entitlements into Clerk privateMetadata.
+      if (pathname === "/v1/paddle/webhook" && request.method === "POST") {
+        return await handlePaddleWebhook(request, env);
       }
 
       if (pathname === "/v1/me" && request.method === "GET") {
@@ -215,6 +224,7 @@ export default {
         pathname === "/v1/draft" ||
         pathname === "/v1/me" ||
         pathname === "/v1/interest" ||
+        pathname === "/v1/paddle/webhook" ||
         pathname === "/healthz" ||
         (pathname === "/admin/margin" && !!env.ADMIN_TOKEN)
       ) {
