@@ -18,6 +18,11 @@ export interface PaddleSubscriptionSnapshot {
   status: string | null;
 }
 
+export interface PaddleTransactionSnapshot {
+  customerId: string | null;
+  customData: Record<string, unknown> | null;
+}
+
 export type PaddleManagementAction = "update_payment_method" | "cancel";
 
 export async function fetchPaddleCustomerEmail(
@@ -119,6 +124,42 @@ export async function fetchPaddleManagementUrl(
     return validHttpsUrl(candidate);
   } catch {
     return null;
+  }
+}
+
+export async function fetchPaddleTransactionSnapshot(
+  env: Env,
+  transactionId: string,
+): Promise<PaddleTransactionSnapshot | null> {
+  const apiKey = requirePaddleApiKey(
+    "transaction_lookup_failed",
+    "Could not confirm the transaction.",
+    env,
+  );
+  try {
+    const res = await fetch(
+      `${paddleApiBase(env)}/transactions/${encodeURIComponent(transactionId)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+      },
+    );
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
+    }
+    const body: unknown = await res.json();
+    const data = asRecord(asRecord(body)?.data);
+    const customerId = data?.customer_id;
+    return {
+      customerId: typeof customerId === "string" && customerId !== "" ? customerId : null,
+      customData: asRecord(data?.custom_data),
+    };
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
   }
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { env as testEnv } from "cloudflare:test";
+import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { computeHmacSha256Hex } from "../src/paddle";
 import { mondayStartUtc } from "../src/metering";
@@ -24,6 +24,7 @@ vi.mock("@clerk/backend", () => ({
 
 import worker from "../src/index";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
+import { PADDLE_OVERAGE_CREDITS_STORAGE_KEY } from "../src/paddle-entitlement";
 
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
@@ -44,7 +45,7 @@ const env: Env = {
   UNLIMITED_DRAFT_LIMIT: "100000",
 };
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.unstubAllGlobals();
   vi.stubGlobal(
     "fetch",
@@ -62,6 +63,7 @@ beforeEach(() => {
   mocks.updateUserMetadata.mockReset();
   mocks.getUserList.mockReset();
   mocks.updateUserMetadata.mockResolvedValue(undefined);
+  await clearPaddleOverageCredits();
 });
 
 function userWith(privateMetadata: Record<string, unknown>) {
@@ -141,6 +143,20 @@ function subBody(fields: {
 function lastWrite() {
   const call = mocks.updateUserMetadata.mock.calls.at(-1);
   return call?.[1]?.privateMetadata as { subscription?: any; quota?: any } | undefined;
+}
+
+async function clearPaddleOverageCredits(userId = "user_abc"): Promise<void> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.delete(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
+  });
+}
+
+async function storedPaddleOverageCredits(userId = "user_abc"): Promise<unknown[]> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  return runInDurableObject(stub, async (_instance, state) => {
+    return (await state.storage.get<unknown[]>(PADDLE_OVERAGE_CREDITS_STORAGE_KEY)) ?? [];
+  });
 }
 
 function deferred<T>() {
@@ -665,7 +681,8 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.weeklyDraftLimit).toBe(120); // preserved
     expect(quota.lastOverageEventId).toBe("evt_txn");
     expect(quota.processedOverageEventIds).toEqual(["evt_txn"]);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",
@@ -696,7 +713,8 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.extraDrafts).toBe(15);
     expect(quota.extraDraftsWindowStart).toBe(monday);
     expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_new"]);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_new",
         transactionId: "txn_evt_new",
@@ -820,7 +838,8 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.extraDrafts).toBe(15);
     expect(quota.extraDraftsWindowStart).toBe(monday);
     expect(quota.processedOverageEventIds).toEqual(["evt_a", "evt_b"]);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       { eventId: "evt_a", transactionId: "txn_evt_a", extraDrafts: 10, windowStart: monday },
       { eventId: "evt_b", transactionId: "txn_evt_b", extraDrafts: 5, windowStart: monday },
     ]);
@@ -857,9 +876,11 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
 
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(101);
-    expect(quota.overageCredits).toHaveLength(101);
-    expect(quota.overageCredits[0]).toEqual(existingCredits[0]);
-    expect(quota.overageCredits[quota.overageCredits.length - 1]).toEqual({
+    expect(quota.overageCredits).toBeUndefined();
+    const credits = await storedPaddleOverageCredits();
+    expect(credits).toHaveLength(101);
+    expect(credits[0]).toEqual(existingCredits[0]);
+    expect(credits[credits.length - 1]).toEqual({
       eventId: "evt_new",
       transactionId: "txn_evt_new",
       extraDrafts: 1,
@@ -916,7 +937,8 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect((storedMeta.quota as Record<string, unknown>).processedOverageEventIds).toEqual([
       "evt_overage",
     ]);
-    expect((storedMeta.quota as Record<string, unknown>).overageCredits).toEqual([
+    expect((storedMeta.quota as Record<string, unknown>).overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_overage",
         transactionId: "txn_evt_overage",
@@ -997,7 +1019,80 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(0);
     expect(quota.processedOverageAdjustmentIds).toEqual(["adj_123"]);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedDrafts: 25,
+        reversedByAdjustmentId: "adj_123",
+        reversalAdjustmentIds: ["adj_123"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
+      },
+    ]);
+  });
+
+  it("resolves adjustment owners from the original transaction checkout binding", async () => {
+    const monday = mondayStartUtc(Date.now());
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env);
+    const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/transactions/txn_evt_txn")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_evt_txn",
+                customer_id: "ctm_123",
+                custom_data: customData,
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes("/customers/")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { email: "billing-only@example.com" } }), {
+            status: 200,
+          }),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUserList.mockResolvedValue({ data: [] });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 25,
+          extraDraftsWindowStart: monday,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 25,
+              windowStart: monday,
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(adjustmentBody());
+
+    expect((await res.json()) as any).toEqual({ ok: true, revoked: true, extraDrafts: 25 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/transactions/txn_evt_txn",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer pdl_apikey" }),
+      }),
+    );
+    expect(mocks.getUserList).not.toHaveBeenCalled();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",
@@ -1085,7 +1180,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(quota.extraDrafts).toBe(0);
     expect(quota.extraDraftsWindowStart).toBe(monday);
     expect(quota.pendingOverageReversals).toEqual([]);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",
@@ -1131,7 +1227,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect((await res.json()) as any).toEqual({ ok: true, revoked: true, extraDrafts: 10 });
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(40);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",
@@ -1213,7 +1310,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(25);
     expect(quota.processedOverageAdjustmentIds).toEqual(["adj_reverse"]);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",
@@ -1258,7 +1356,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect((await res.json()) as any).toEqual({ ok: true, restored: true, extraDrafts: 40 });
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(60);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",
@@ -1337,7 +1436,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(quota.extraDrafts).toBe(25);
     expect(quota.pendingOverageReversals).toEqual([]);
     expect(quota.processedOverageAdjustmentIds).toEqual(["adj_restore", "adj_chargeback"]);
-    expect(quota.overageCredits).toEqual([
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",

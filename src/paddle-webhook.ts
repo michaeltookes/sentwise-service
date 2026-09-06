@@ -16,13 +16,15 @@ import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, type Env } from "./config";
 import { ApiError } from "./errors";
 import { numFrom } from "./metering";
 import {
+  paddleCheckoutBindingMatchesCustomData,
   paddleCheckoutBindingMatchesEvent,
   paddleCustomerMatchesStoredAccount,
 } from "./paddle-account";
-import { fetchPaddleCustomerEmail } from "./paddle-api";
+import { fetchPaddleCustomerEmail, fetchPaddleTransactionSnapshot } from "./paddle-api";
 import {
   adjustedTransactionIdFromEvent,
   adjustmentIdFromEvent,
+  clerkUserIdFromCustomData,
   clerkUserIdFromEvent,
   customerIdFromEvent,
   HANDLED_EVENT_TYPES,
@@ -236,10 +238,19 @@ async function resolveClerkUserId(
       : null;
   }
 
-  // Fallback: look the customer's email up in Clerk. The serialized writer still
-  // requires the account to have this Paddle customer id already stored.
   const customerId = customerIdFromEvent(event);
   if (!customerId) return null;
+
+  const fromTransaction = await resolveClerkUserIdFromAdjustedTransaction(
+    event,
+    customerId,
+    env,
+    clerk,
+  );
+  if (fromTransaction) return fromTransaction;
+
+  // Fallback: look the customer's email up in Clerk. The serialized writer still
+  // requires the account to have this Paddle customer id already stored.
   const email = await fetchPaddleCustomerEmail(env, customerId);
   if (!email) return null;
   try {
@@ -251,6 +262,37 @@ async function resolveClerkUserId(
   } catch {
     throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
   }
+}
+
+async function resolveClerkUserIdFromAdjustedTransaction(
+  event: PaddleEvent,
+  customerId: string,
+  env: Env,
+  clerk: ReturnType<typeof createClerkClient>,
+): Promise<string | null> {
+  const transactionId = adjustedTransactionIdFromEvent(event);
+  if (!transactionId) return null;
+
+  const transaction = await fetchPaddleTransactionSnapshot(env, transactionId);
+  if (!transaction || transaction.customerId !== customerId || !transaction.customData) {
+    return null;
+  }
+
+  const userId = clerkUserIdFromCustomData(transaction.customData);
+  if (!userId) return null;
+  if (!(await paddleCheckoutBindingMatchesCustomData(transaction.customData, userId, env))) {
+    return null;
+  }
+
+  let user;
+  try {
+    user = await clerk.users.getUser(userId);
+  } catch (err) {
+    if (isClerkNotFoundError(err)) return null;
+    throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
+  }
+  const meta = user.privateMetadata ?? {};
+  return paddleCustomerMatchesStoredAccount(meta, customerId) ? userId : null;
 }
 
 // ---------------------------------------------------------------------------

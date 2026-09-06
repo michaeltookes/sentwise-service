@@ -1,7 +1,7 @@
 import { type Env } from "./config";
 import { ApiError } from "./errors";
 import {
-  clerkUserIdFromEvent,
+  clerkUserIdFromCustomData,
   computeHmacSha256Hex,
   timingSafeEqualHex,
   type PaddleEvent,
@@ -39,9 +39,17 @@ export async function paddleCheckoutBindingMatchesEvent(
   userId: string,
   env: Env,
 ): Promise<boolean> {
-  if (clerkUserIdFromEvent(event) !== userId) return false;
+  return paddleCheckoutBindingMatchesCustomData(event.data.custom_data, userId, env);
+}
 
-  const token = checkoutBindingFromEvent(event);
+export async function paddleCheckoutBindingMatchesCustomData(
+  customData: unknown,
+  userId: string,
+  env: Env,
+): Promise<boolean> {
+  if (clerkUserIdFromCustomData(customData) !== userId) return false;
+
+  const token = checkoutBindingFromCustomData(customData);
   if (!token) return false;
 
   const expected = await paddleCheckoutBindingDigest(userId, env);
@@ -79,8 +87,8 @@ async function paddleCheckoutBindingDigest(userId: string, env: Env): Promise<st
   return computeHmacSha256Hex(env.PADDLE_WEBHOOK_SECRET, `sentwise:paddle-checkout:v1:${userId}`);
 }
 
-function checkoutBindingFromEvent(event: PaddleEvent): string | null {
-  const custom = asRecord(event.data.custom_data);
+function checkoutBindingFromCustomData(customData: unknown): string | null {
+  const custom = asRecord(customData);
   const token = custom?.sentwiseCheckoutBinding;
   if (typeof token !== "string" || !token.startsWith("v1:")) return null;
 

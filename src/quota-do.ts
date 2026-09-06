@@ -8,6 +8,7 @@
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)
+//   "paddle_overage_credits" -> refundable Paddle overage credit ledger
 //   "account_deletion" -> deletion barrier/tombstone plus retry metadata
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
@@ -490,7 +491,7 @@ export class AccountQuota {
       const parsed = parsePaddleOverageBody(body);
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(() =>
-        recordPaddleOverageInClerk(userId, parsed, this.env),
+        recordPaddleOverageInClerk(userId, parsed, this.env, this.storage),
       );
       return Response.json(result);
     } catch (err) {
@@ -504,7 +505,7 @@ export class AccountQuota {
       const parsed = parsePaddleOverageReversalBody(body);
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(() =>
-        revokePaddleOverageInClerk(userId, parsed, this.env),
+        revokePaddleOverageInClerk(userId, parsed, this.env, this.storage),
       );
       return Response.json(result);
     } catch (err) {

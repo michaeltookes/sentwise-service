@@ -196,11 +196,15 @@ function asRecord(v: unknown): Record<string, unknown> | null {
   return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
 }
 
-/** `data.custom_data.clerkUserId` — the app's checkout attaches this. */
-export function clerkUserIdFromEvent(event: PaddleEvent): string | null {
-  const custom = asRecord(event.data.custom_data);
+export function clerkUserIdFromCustomData(customData: unknown): string | null {
+  const custom = asRecord(customData);
   const id = custom?.clerkUserId;
   return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** `data.custom_data.clerkUserId` — the app's checkout attaches this. */
+export function clerkUserIdFromEvent(event: PaddleEvent): string | null {
+  return clerkUserIdFromCustomData(event.data.custom_data);
 }
 
 /** `data.customer_id` on a subscription/transaction. */

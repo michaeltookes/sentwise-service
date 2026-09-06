@@ -388,9 +388,11 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 **Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
 is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or
 when the Paddle `customer_id` already matches the account's stored `paddleCustomerId`. Events without
-custom data may use Paddle customer-email lookup (`GET /customers/{id}` → `getUserList`) only to
-locate a previously-bound account; email equality alone never creates a first-time binding. If no
-account matches, or if the candidate user does not match the Paddle customer, the event is
+custom data first load the original transaction (`GET /transactions/{id}`) and validate its signed
+checkout binding when Paddle provides a `transaction_id`; otherwise, they may use Paddle
+customer-email lookup (`GET /customers/{id}` → `getUserList`) only to locate a previously-bound
+account. Email equality alone never creates a first-time binding. If no account matches, or if the
+candidate user does not match the Paddle customer, the event is
 acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help. Transient Paddle/Clerk lookup
 failures and missing Paddle API credentials return `502` so Paddle retries.
 
@@ -422,9 +424,10 @@ any still-current weekly extras; partial adjustments are prorated by adjusted am
 chargeback/credit reversals restore only drafts revoked by the corresponding chargeback/credit
 action. Tax/proration-only adjustment items are ignored rather than treated as whole-overage
 reversals. If an approved reversal or restore arrives before the matching prerequisite event, it is
-retained in `pendingOverageReversals` and applied when the prerequisite is later delivered. Overage
-credit records are retained rather than capped at the newest 100 entries so later Paddle adjustments
-can still find the original transaction.
+retained in `pendingOverageReversals` and applied when the prerequisite is later delivered. The
+authoritative refundable-credit ledger is stored in the account Durable Object, not Clerk metadata,
+so later Paddle adjustments can still find older overage transactions without growing
+`privateMetadata.quota` indefinitely.
 
 **Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and

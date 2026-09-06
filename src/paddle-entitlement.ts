@@ -9,6 +9,12 @@ import type { OverageAdjustmentAction } from "./paddle";
 const PROCESSED_OVERAGE_EVENT_ID_LIMIT = 100;
 const PROCESSED_OVERAGE_ADJUSTMENT_ID_LIMIT = 100;
 const PENDING_OVERAGE_REVERSAL_LIMIT = 100;
+export const PADDLE_OVERAGE_CREDITS_STORAGE_KEY = "paddle_overage_credits";
+
+export interface PaddleOverageLedgerStore {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put<T = unknown>(key: string, value: T): Promise<void>;
+}
 
 export interface PaddleOverageCreditInput {
   transactionItemId: string | null;
@@ -151,6 +157,7 @@ export async function recordPaddleOverageInClerk(
   userId: string,
   body: PaddleOverageBody,
   env: Env,
+  ledgerStore?: PaddleOverageLedgerStore,
 ): Promise<PaddleOverageResult> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
@@ -170,6 +177,19 @@ export async function recordPaddleOverageInClerk(
   const existingQuota = asRecord(meta.quota) ?? {};
   const processedIds = processedOverageEventIds(existingQuota);
   if (processedIds.includes(body.eventId)) {
+    const repairWindowStart =
+      typeof existingQuota.extraDraftsWindowStart === "number"
+        ? existingQuota.extraDraftsWindowStart
+        : mondayStartUtc(body.now);
+    await saveOverageCredits(
+      ledgerStore,
+      mergeOverageCredits([
+        ...(await loadOverageCredits(existingQuota, ledgerStore)),
+        ...body.credits.map((credit) =>
+          storedCreditFromInput(body.eventId, body.transactionId, credit, repairWindowStart),
+        ),
+      ]),
+    );
     return { idempotent: true };
   }
 
@@ -180,6 +200,7 @@ export async function recordPaddleOverageInClerk(
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
       : 0;
   const pending = pendingOverageReversals(existingQuota);
+  const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
   let newCredits = body.credits.map((credit) =>
     storedCreditFromInput(body.eventId, body.transactionId, credit, windowStart),
   );
@@ -192,15 +213,16 @@ export async function recordPaddleOverageInClerk(
   );
   newCredits = replayed.credits;
   const effectiveExtraDrafts = newCredits.reduce((sum, credit) => sum + availableDrafts(credit), 0);
+  const allCredits = mergeOverageCredits([...existingCredits, ...newCredits]);
 
   const quota = {
-    ...existingQuota,
+    ...quotaWithoutOverageCredits(existingQuota),
     extraDrafts: prevExtras + effectiveExtraDrafts,
     extraDraftsWindowStart: windowStart,
     lastOverageEventId: body.eventId,
     processedOverageEventIds: boundedProcessedOverageEventIds([...processedIds, body.eventId]),
     pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
-    overageCredits: boundedOverageCredits([...overageCredits(existingQuota), ...newCredits]),
+    ...fallbackOverageCredits(ledgerStore, allCredits),
   };
 
   try {
@@ -209,6 +231,7 @@ export async function recordPaddleOverageInClerk(
     if (isClerkNotFoundError(err)) return { mapped: false };
     throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase.");
   }
+  await saveOverageCredits(ledgerStore, allCredits);
 
   return { applied: true, extraDrafts: effectiveExtraDrafts };
 }
@@ -217,6 +240,7 @@ export async function revokePaddleOverageInClerk(
   userId: string,
   body: PaddleOverageReversalBody,
   env: Env,
+  ledgerStore?: PaddleOverageLedgerStore,
 ): Promise<PaddleOverageReversalResult> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
@@ -239,10 +263,19 @@ export async function revokePaddleOverageInClerk(
   const existingQuota = asRecord(meta.quota) ?? {};
   const processedAdjustmentIds = processedOverageAdjustmentIds(existingQuota);
   if (processedAdjustmentIds.includes(body.adjustmentId)) {
+    const currentWindowStart =
+      typeof existingQuota.extraDraftsWindowStart === "number"
+        ? existingQuota.extraDraftsWindowStart
+        : null;
+    const credits = await loadOverageCredits(existingQuota, ledgerStore);
+    const applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
+    if (applied.extraDrafts > 0) {
+      await saveOverageCredits(ledgerStore, applied.credits);
+    }
     return { idempotent: true };
   }
 
-  const credits = overageCredits(existingQuota);
+  const credits = await loadOverageCredits(existingQuota, ledgerStore);
   const currentWindowStart =
     typeof existingQuota.extraDraftsWindowStart === "number"
       ? existingQuota.extraDraftsWindowStart
@@ -255,8 +288,9 @@ export async function revokePaddleOverageInClerk(
   let applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
 
   if (applied.extraDrafts === 0) {
+    await saveOverageCredits(ledgerStore, credits);
     const quota = {
-      ...existingQuota,
+      ...quotaWithoutOverageCredits(existingQuota),
       processedOverageAdjustmentIds: boundedProcessedOverageAdjustmentIds([
         ...processedAdjustmentIds,
         body.adjustmentId,
@@ -265,6 +299,7 @@ export async function revokePaddleOverageInClerk(
         ...pending,
         pendingOverageReversalFromBody(body),
       ]),
+      ...fallbackOverageCredits(ledgerStore, credits),
     };
     try {
       await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
@@ -299,14 +334,14 @@ export async function revokePaddleOverageInClerk(
   nextExtras = replayed.currentExtras ?? nextExtras;
 
   const quota = {
-    ...existingQuota,
+    ...quotaWithoutOverageCredits(existingQuota),
     extraDrafts: nextExtras,
     processedOverageAdjustmentIds: boundedProcessedOverageAdjustmentIds([
       ...processedAdjustmentIds,
       body.adjustmentId,
     ]),
     pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
-    overageCredits: boundedOverageCredits(applied.credits),
+    ...fallbackOverageCredits(ledgerStore, applied.credits),
   };
 
   try {
@@ -315,6 +350,7 @@ export async function revokePaddleOverageInClerk(
     if (isClerkNotFoundError(err)) return { mapped: false };
     throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase reversal.");
   }
+  await saveOverageCredits(ledgerStore, applied.credits);
 
   return isRestoreAction(body.action)
     ? { restored: true, extraDrafts: applied.extraDrafts }
@@ -687,6 +723,51 @@ function boundedIdList(ids: string[]): string[] {
   return [...new Set(ids.filter((id) => id !== ""))].slice(-10);
 }
 
+async function loadOverageCredits(
+  quota: Record<string, unknown>,
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+): Promise<StoredOverageCredit[]> {
+  const legacyCredits = overageCreditsFromValue(quota.overageCredits);
+  if (!ledgerStore) return mergeOverageCredits(legacyCredits);
+  const storedCredits = overageCreditsFromValue(
+    await ledgerStore.get<unknown>(PADDLE_OVERAGE_CREDITS_STORAGE_KEY),
+  );
+  return mergeOverageCredits([...legacyCredits, ...storedCredits]);
+}
+
+async function saveOverageCredits(
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+  credits: StoredOverageCredit[],
+): Promise<void> {
+  if (!ledgerStore) return;
+  await ledgerStore.put(PADDLE_OVERAGE_CREDITS_STORAGE_KEY, mergeOverageCredits(credits));
+}
+
+function fallbackOverageCredits(
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+  credits: StoredOverageCredit[],
+): { overageCredits?: StoredOverageCredit[] } {
+  return ledgerStore ? {} : { overageCredits: mergeOverageCredits(credits) };
+}
+
+function quotaWithoutOverageCredits(quota: Record<string, unknown>): Record<string, unknown> {
+  const rest = { ...quota };
+  delete rest.overageCredits;
+  return rest;
+}
+
+function mergeOverageCredits(credits: StoredOverageCredit[]): StoredOverageCredit[] {
+  const byCredit = new Map<string, StoredOverageCredit>();
+  for (const credit of credits) {
+    byCredit.set(overageCreditKey(credit), credit);
+  }
+  return [...byCredit.values()];
+}
+
+function overageCreditKey(credit: StoredOverageCredit): string {
+  return `${credit.eventId}:${credit.transactionId}:${credit.transactionItemId ?? ""}`;
+}
+
 function processedOverageEventIds(quota: Record<string, unknown>): string[] {
   const ids = Array.isArray(quota.processedOverageEventIds)
     ? quota.processedOverageEventIds.filter(
@@ -752,13 +833,9 @@ function isStoredPendingOverageReversal(value: unknown): value is StoredPendingO
   );
 }
 
-function overageCredits(quota: Record<string, unknown>): StoredOverageCredit[] {
-  const credits = Array.isArray(quota.overageCredits) ? quota.overageCredits : [];
-  return boundedOverageCredits(credits.filter(isStoredOverageCredit));
-}
-
-function boundedOverageCredits(credits: StoredOverageCredit[]): StoredOverageCredit[] {
-  return credits;
+function overageCreditsFromValue(value: unknown): StoredOverageCredit[] {
+  const credits = Array.isArray(value) ? value : [];
+  return credits.filter(isStoredOverageCredit);
 }
 
 function isStoredOverageCredit(value: unknown): value is StoredOverageCredit {
