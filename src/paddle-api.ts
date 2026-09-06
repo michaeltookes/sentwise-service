@@ -13,6 +13,13 @@ export interface PaddleCheckoutTransaction {
   checkoutUrl: string | null;
 }
 
+export class PaddleCheckoutCreationOutcomeUnknownError extends ApiError {
+  constructor() {
+    super(502, "checkout_unavailable", "Could not start checkout.");
+    this.name = "PaddleCheckoutCreationOutcomeUnknownError";
+  }
+}
+
 export interface PaddleSubscriptionSnapshot {
   customerId: string | null;
   status: string | null;
@@ -88,6 +95,7 @@ export async function createPaddleCheckoutTransaction(
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
+      if (res.status >= 500) throw new PaddleCheckoutCreationOutcomeUnknownError();
       throw new ApiError(502, "checkout_unavailable", "Could not start checkout.");
     }
 
@@ -95,7 +103,7 @@ export async function createPaddleCheckoutTransaction(
     const data = asRecord(asRecord(body)?.data);
     const transactionId = data?.id;
     if (typeof transactionId !== "string" || transactionId === "") {
-      throw new ApiError(502, "checkout_unavailable", "Could not start checkout.");
+      throw new PaddleCheckoutCreationOutcomeUnknownError();
     }
 
     return {
@@ -104,7 +112,7 @@ export async function createPaddleCheckoutTransaction(
     };
   } catch (err) {
     if (err instanceof ApiError) throw err;
-    throw new ApiError(502, "checkout_unavailable", "Could not start checkout.");
+    throw new PaddleCheckoutCreationOutcomeUnknownError();
   }
 }
 

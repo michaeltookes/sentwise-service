@@ -49,7 +49,7 @@ export { AccountQuota } from "./quota-do";
  *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
  *   POST   /v1/interest   -> record demand for a parked capability (item 75; first click wins)
  *   POST   /v1/paddle/checkout -> authenticated server-side Paddle transaction checkout
- *   GET    /v1/paddle/manage-billing -> redirect to a fresh Paddle billing-management URL
+ *   GET    /v1/paddle/manage-billing -> JSON fresh Paddle billing-management URL
  *   POST   /v1/paddle/webhook -> Paddle checkout/licensing events -> entitlement writes (56c; signature-auth, no bearer)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *

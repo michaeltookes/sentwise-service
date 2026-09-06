@@ -29,10 +29,9 @@ export async function handlePaddleManageBilling(
     );
   }
 
-  return new Response(null, {
-    status: 303,
-    headers: { Location: url, "Cache-Control": "no-store" },
-  });
+  const res = Response.json({ managementUrl: url });
+  res.headers.set("Cache-Control", "no-store");
+  return res;
 }
 
 function parseManagementAction(request: Request): PaddleManagementAction {

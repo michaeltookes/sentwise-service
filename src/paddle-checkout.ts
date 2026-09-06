@@ -11,6 +11,7 @@ import {
   cancelPaddleTransaction,
   createPaddleCheckoutTransaction,
   fetchPaddleTransactionSnapshot,
+  PaddleCheckoutCreationOutcomeUnknownError,
 } from "./paddle-api";
 import {
   quotaPeekPaddleOverageCheckout,
@@ -89,9 +90,11 @@ export async function handlePaddleCheckout(
       customerId,
     });
   } catch (err) {
-    await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
-      () => undefined,
-    );
+    if (!(err instanceof PaddleCheckoutCreationOutcomeUnknownError)) {
+      await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
+        () => undefined,
+      );
+    }
     throw err;
   }
 

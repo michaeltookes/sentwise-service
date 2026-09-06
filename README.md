@@ -149,8 +149,9 @@ above are returned.
 ### `GET /v1/paddle/manage-billing`
 
 Requires `Authorization: Bearer <clerk-session-token>`. Reads the account's stored
-`paddleSubscriptionId`, fetches a fresh Paddle `management_urls` link, and returns **`303`** with
-`Location: <fresh Paddle URL>` and `Cache-Control: no-store`.
+`paddleSubscriptionId`, fetches a fresh Paddle `management_urls` link, and returns **`200`** with
+`{ "managementUrl": "<fresh Paddle URL>" }` and `Cache-Control: no-store`. The app should navigate
+the browser to the returned URL.
 
 Returns **`404 billing_subscription_not_found`** when the account has no Paddle subscription id, and
 **`502 billing_portal_unavailable`** when Paddle does not return a valid temporary management URL.
@@ -423,8 +424,8 @@ var holds and stamps overage to the 56b Monday window); it does not encode a fin
 **Billing management.** Paddle portal URLs are temporary authenticated links, so the webhook never
 persists them. The app should open `GET /v1/paddle/manage-billing` for payment-method changes or
 `GET /v1/paddle/manage-billing?action=cancel` for cancellation, which fetches
-`GET /subscriptions/{id}` → `data.management_urls` on demand and redirects to the requested fresh
-URL.
+`GET /subscriptions/{id}` → `data.management_urls` on demand and returns the requested fresh URL in
+JSON for the app to navigate to.
 
 **Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
 `EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
@@ -501,6 +502,8 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
 - `PADDLE_CHECKOUT_BINDING_SECRET` / `PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET` — **56c, optional.**
   Stable HMAC secrets for server-minted checkout bindings; the previous secret is accepted during
   rotations so in-flight Paddle transactions can still map their first webhook.
+- `PADDLE_WEBHOOK_MAX_BODY_BYTES` — **56c, optional.** Max Paddle webhook payload size before
+  signature verification; defaults to 128 KiB.
 - `PADDLE_API_KEY` — **56c.** A Paddle API key (`transaction.write`, `transaction.read`,
   `subscription.read`, and `customer.read`) used by `POST /v1/paddle/checkout`,
   `GET /v1/paddle/manage-billing`, cross-subscription replacement checks, and webhook fallback

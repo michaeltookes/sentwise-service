@@ -51,6 +51,7 @@ export interface Env {
   PADDLE_API_KEY?: string; // Paddle API key (pdl_…); creates checkouts, verifies mapping, reads management/current subscription state
   PADDLE_API_BASE?: string; // Paddle REST base; defaults to the SANDBOX base (PADDLE_SANDBOX_API_BASE)
   PADDLE_WEBHOOK_TOLERANCE_SEC?: string | number; // signature freshness window (seconds); default DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC
+  PADDLE_WEBHOOK_MAX_BODY_BYTES?: string | number; // max signed webhook payload bytes; default DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES
   PADDLE_CHECKOUT_BINDING_SECRET?: string; // stable HMAC secret for server-minted checkout binding; defaults to PADDLE_WEBHOOK_SECRET
   PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // previous checkout-binding secret accepted during rotations
 
@@ -155,6 +156,10 @@ export const PADDLE_LIVE_API_BASE = "https://api.paddle.com";
 // needs more headroom, and idempotency guards (not the clock) are our real replay
 // defense. Tunable via PADDLE_WEBHOOK_TOLERANCE_SEC.
 export const DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC = 300;
+
+// Paddle webhooks are small JSON payloads. Keep the public unauthenticated
+// endpoint from buffering arbitrarily large bodies before signature verification.
+export const DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES = 128 * 1024;
 
 // The three paid launch tiers. "team" is reserved (no price mapped yet).
 export type PaidPlan = "starter" | "pro" | "unlimited";

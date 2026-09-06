@@ -12,7 +12,11 @@
 
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
-import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, type Env } from "./config";
+import {
+  DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES,
+  DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC,
+  type Env,
+} from "./config";
 import { ApiError } from "./errors";
 import { mondayStartUtc, numFrom } from "./metering";
 import {
@@ -54,7 +58,10 @@ const HANDLED = new Set<string>(HANDLED_EVENT_TYPES);
  * not retry pointlessly. Transient Clerk failures surface as 5xx so Paddle retries.
  */
 export async function handlePaddleWebhook(request: Request, env: Env): Promise<Response> {
-  const rawBody = await request.text();
+  const rawBody = await readWebhookBody(
+    request,
+    positiveIntFrom(env.PADDLE_WEBHOOK_MAX_BODY_BYTES, DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES),
+  );
 
   const toleranceSec = numFrom(
     env.PADDLE_WEBHOOK_TOLERANCE_SEC,
@@ -307,6 +314,40 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 /** Acknowledge a verified event. The body carries only a coarse outcome tag. */
 function ack(extra: Record<string, unknown>): Response {
   return Response.json({ ok: true, ...extra });
+}
+
+async function readWebhookBody(request: Request, maxBytes: number): Promise<string> {
+  if (!request.body) return "";
+
+  const reader = (request.body as ReadableStream<Uint8Array>).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  for (;;) {
+    const result: ReadableStreamReadResult<Uint8Array> = await reader.read();
+    if (result.done) break;
+    const value = result.value;
+
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new ApiError(413, "payload_too_large", "Webhook payload is too large.");
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function positiveIntFrom(v: string | number | undefined, fallback: number): number {
+  const n = Math.floor(numFrom(v, fallback));
+  return n > 0 ? n : fallback;
 }
 
 function overageEventWindowStart(event: PaddleEvent): number | undefined {

@@ -280,6 +280,22 @@ describe("POST /v1/paddle/webhook — signature", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("rejects an oversized body before signature verification", async () => {
+    const res = await worker.fetch(
+      new Request("https://sentwise-inference.test/v1/paddle/webhook", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Paddle-Signature": "ts=1;h1=deadbeef" },
+        body: "0123456789",
+      }),
+      { ...env, PADDLE_WEBHOOK_MAX_BODY_BYTES: 8 },
+    );
+
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as any).error.type).toBe("payload_too_large");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
   it("405s a GET on the webhook path", async () => {
     const res = await worker.fetch(
       new Request("https://sentwise-inference.test/v1/paddle/webhook", { method: "GET" }),

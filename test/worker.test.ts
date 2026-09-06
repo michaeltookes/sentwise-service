@@ -682,7 +682,7 @@ describe("GET /v1/paddle/manage-billing", () => {
     PADDLE_API_BASE: "https://sandbox-api.paddle.com",
   };
 
-  it("redirects to a fresh Paddle management URL", async () => {
+  it("returns a fresh Paddle management URL", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(
       userWith({
@@ -715,8 +715,11 @@ describe("GET /v1/paddle/manage-billing", () => {
       paddleEnv,
     );
 
-    expect(res.status).toBe(303);
-    expect(res.headers.get("Location")).toBe("https://portal.paddle.com/manage/sub_123");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      managementUrl: "https://portal.paddle.com/manage/sub_123",
+    });
+    expect(res.headers.get("Location")).toBeNull();
     expect(res.headers.get("Cache-Control")).toBe("no-store");
     expect(fetchMock).toHaveBeenCalledWith(
       "https://sandbox-api.paddle.com/subscriptions/sub_123",
@@ -726,7 +729,7 @@ describe("GET /v1/paddle/manage-billing", () => {
     );
   });
 
-  it("redirects to Paddle's cancellation management URL when requested", async () => {
+  it("returns Paddle's cancellation management URL when requested", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(
       userWith({
@@ -761,8 +764,11 @@ describe("GET /v1/paddle/manage-billing", () => {
       paddleEnv,
     );
 
-    expect(res.status).toBe(303);
-    expect(res.headers.get("Location")).toBe("https://portal.paddle.com/cancel/sub_123");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      managementUrl: "https://portal.paddle.com/cancel/sub_123",
+    });
+    expect(res.headers.get("Location")).toBeNull();
     expect(res.headers.get("Cache-Control")).toBe("no-store");
   });
 
@@ -1320,12 +1326,56 @@ describe("POST /v1/paddle/checkout", () => {
     expect(transactionCreates).toHaveLength(2);
   });
 
-  it("releases a subscription checkout reservation when Paddle creation fails", async () => {
+  it("keeps a subscription checkout reservation when Paddle creation outcome is unknown", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(new Response("{}", { status: 502 }))
+      .mockRejectedValueOnce(new TypeError("network failed after request"))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: {
+              id: "txn_retry",
+              checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_retry" },
+            },
+          }),
+          { status: 201 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    expect(first.status).toBe(502);
+    expect(((await first.json()) as any).error.type).toBe("checkout_unavailable");
+
+    const retry = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(retry.status).toBe(409);
+    expect(((await retry.json()) as any).error.type).toBe("billing_checkout_pending");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases a subscription checkout reservation when Paddle rejects creation", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 400 }))
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
