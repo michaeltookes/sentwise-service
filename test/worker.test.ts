@@ -26,6 +26,7 @@ vi.mock("@clerk/backend", () => ({
 // Import AFTER the mock is registered.
 import worker from "../src/index";
 import { clerkUserExists } from "../src/auth";
+import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 import {
   PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
   PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
@@ -43,6 +44,7 @@ const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
 const OVERAGE_PRICE = "pri_overage";
 const PADDLE_SECRET = "pdl_ntfset_testsecret";
 const ACCOUNT_DELETION_KEY = "account_deletion";
+const MON = Date.parse("2024-01-01T00:00:00.000Z");
 
 function usageAnalytics() {
   const writeDataPoint = vi.fn();
@@ -1370,6 +1372,224 @@ describe("POST /v1/paddle/checkout", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("releases an expired unrecorded subscription checkout reservation when Paddle has no matching transaction", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const releaseBodies: Array<{ reservationId?: string }> = [];
+    let pendingReservation:
+      | {
+          reservationId: string;
+          createdAt: number;
+          expiresAt: number;
+          priceId: string;
+          quantity: number;
+        }
+      | undefined = {
+      reservationId: "checkout-lost",
+      createdAt: MON,
+      expiresAt: MON + RESERVATION_TTL_MS,
+      priceId: PRO_PRICE,
+      quantity: 1,
+    };
+    const quotaStub = {
+      fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = requestUrl(input).replace("https://account-quota.internal", "");
+        const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+        if (path === "/paddle-subscription-checkout-reserve") {
+          if (pendingReservation) {
+            return Promise.resolve(
+              Response.json({ pending: true, checkoutUrl: null, ...pendingReservation }),
+            );
+          }
+          return Promise.resolve(
+            Response.json({ reserved: true, reservationId: body.reservationId }),
+          );
+        }
+        if (path === "/paddle-subscription-checkout-release") {
+          releaseBodies.push(body);
+          if (pendingReservation?.reservationId === body.reservationId) {
+            pendingReservation = undefined;
+          }
+          return Promise.resolve(Response.json({ released: true }));
+        }
+        if (path === "/paddle-subscription-checkout-record") {
+          return Promise.resolve(Response.json({ recorded: true }));
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    };
+    const quotaEnv: Env = {
+      ...paddleEnv,
+      ACCOUNT_QUOTA: {
+        idFromName: vi.fn(() => ({}) as DurableObjectId),
+        get: vi.fn(() => quotaStub as unknown as DurableObjectStub),
+      } as unknown as DurableObjectNamespace,
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url.startsWith("https://sandbox-api.paddle.com/transactions?")) {
+        return Promise.resolve(
+          Response.json({ data: [], meta: { pagination: { has_more: false, next: null } } }),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_retry",
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_retry" },
+              },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      quotaEnv,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      transactionId: "txn_retry",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_retry",
+    });
+    expect(releaseBodies).toEqual([{ reservationId: "checkout-lost" }]);
+    const transactionLookups = fetchMock.mock.calls.filter(([input]) =>
+      requestUrl(input).startsWith("https://sandbox-api.paddle.com/transactions?"),
+    );
+    const transactionCreates = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
+        init?.method === "POST",
+    );
+    expect(transactionLookups).toHaveLength(1);
+    const lookupParams = new URL(requestUrl(transactionLookups[0][0])).searchParams;
+    expect(lookupParams.get("origin")).toBe("api");
+    expect(lookupParams.get("created_at[LTE]")).toBe(
+      new Date(MON + RESERVATION_TTL_MS + 60_000).toISOString(),
+    );
+    expect(transactionCreates).toHaveLength(1);
+  });
+
+  it("recovers an expired unrecorded subscription checkout reservation when Paddle has a matching transaction", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const customData = await buildPaddleCheckoutCustomData("user_123", paddleEnv, "checkout-lost");
+    const recordBodies: Array<{ reservationId?: string; transactionId?: string }> = [];
+    let pendingReservation:
+      | {
+          reservationId: string;
+          createdAt: number;
+          expiresAt: number;
+          priceId: string;
+          quantity: number;
+        }
+      | undefined = {
+      reservationId: "checkout-lost",
+      createdAt: MON,
+      expiresAt: MON + RESERVATION_TTL_MS,
+      priceId: PRO_PRICE,
+      quantity: 1,
+    };
+    const quotaStub = {
+      fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = requestUrl(input).replace("https://account-quota.internal", "");
+        const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+        if (path === "/paddle-subscription-checkout-reserve") {
+          if (pendingReservation) {
+            return Promise.resolve(
+              Response.json({ pending: true, checkoutUrl: null, ...pendingReservation }),
+            );
+          }
+          return Promise.resolve(
+            Response.json({ reserved: true, reservationId: body.reservationId }),
+          );
+        }
+        if (path === "/paddle-subscription-checkout-record") {
+          recordBodies.push(body);
+          return Promise.resolve(Response.json({ recorded: true }));
+        }
+        if (path === "/paddle-subscription-checkout-release") {
+          pendingReservation = undefined;
+          return Promise.resolve(Response.json({ released: true }));
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    };
+    const quotaEnv: Env = {
+      ...paddleEnv,
+      ACCOUNT_QUOTA: {
+        idFromName: vi.fn(() => ({}) as DurableObjectId),
+        get: vi.fn(() => quotaStub as unknown as DurableObjectStub),
+      } as unknown as DurableObjectNamespace,
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url.startsWith("https://sandbox-api.paddle.com/transactions?")) {
+        return Promise.resolve(
+          Response.json({
+            data: [
+              {
+                id: "txn_found",
+                status: "draft",
+                customer_id: null,
+                custom_data: customData,
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_found" },
+                items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+              },
+            ],
+            meta: { pagination: { has_more: false, next: null } },
+          }),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        return Promise.resolve(new Response("should not create", { status: 500 }));
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      quotaEnv,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      transactionId: "txn_found",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_found",
+    });
+    expect(recordBodies).toEqual([
+      {
+        reservationId: "checkout-lost",
+        transactionId: "txn_found",
+        checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_found",
+        priceId: PRO_PRICE,
+        quantity: 1,
+      },
+    ]);
+    const transactionCreates = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
+        init?.method === "POST",
+    );
+    expect(transactionCreates).toHaveLength(0);
+  });
+
   it("releases a subscription checkout reservation when Paddle rejects creation", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
@@ -1730,6 +1950,55 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(fetchMock.mock.calls.filter(([input, init]) => isClerkDelete(input, init))).toHaveLength(
       0,
     );
+  });
+
+  it("releases an expired unrecorded subscription checkout with no Paddle match before deleting the account", async () => {
+    const uid = "u-del-expired-unrecorded-checkout";
+    mocks.verifyToken.mockResolvedValue({ sub: uid });
+    mocks.getUser.mockResolvedValue({ ...userWith({ subscription: null }), id: uid });
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
+        reservationId: "checkout-lost",
+        createdAt: MON,
+        expiresAt: MON + RESERVATION_TTL_MS,
+        priceId: PRO_PRICE,
+        quantity: 1,
+      });
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url.startsWith("https://sandbox-api.paddle.com/transactions?")) {
+        return Promise.resolve(
+          Response.json({ data: [], meta: { pagination: { has_more: false, next: null } } }),
+        );
+      }
+      if (isClerkDelete(input, init)) return Promise.resolve(clerkDeleteResponse());
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), {
+      ...env,
+      PADDLE_API_KEY: "pdl_apikey",
+      PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+      PADDLE_WEBHOOK_SECRET: PADDLE_SECRET,
+    });
+
+    expect(del.status).toBe(204);
+    expect(
+      fetchMock.mock.calls.filter(([input]) =>
+        requestUrl(input).startsWith("https://sandbox-api.paddle.com/transactions?"),
+      ),
+    ).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([input, init]) => isClerkDelete(input, init))).toHaveLength(
+      1,
+    );
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY)).toBe(
+        undefined,
+      );
+    });
   });
 
   it("rejects account deletion while an overage checkout transaction is pending", async () => {

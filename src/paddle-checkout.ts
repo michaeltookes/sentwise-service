@@ -4,6 +4,7 @@ import { PRICE_TO_PLAN, type Env } from "./config";
 import { ApiError } from "./errors";
 import {
   buildPaddleCheckoutCustomData,
+  paddleCheckoutBindingMatchesCustomData,
   storedPaddleCustomerId,
   storedPaddleSubscriptionId,
 } from "./paddle-account";
@@ -11,6 +12,8 @@ import {
   cancelPaddleTransaction,
   createPaddleCheckoutTransaction,
   fetchPaddleTransactionSnapshot,
+  findPaddleCheckoutTransactionByReservationId,
+  type PaddleCheckoutReservationTransactionSnapshot,
   PaddleCheckoutCreationOutcomeUnknownError,
 } from "./paddle-api";
 import {
@@ -31,6 +34,18 @@ interface PendingCheckoutTransaction {
   reservationId: string;
   transactionId: string;
   checkoutUrl: string | null;
+}
+
+interface PendingCheckoutReservation {
+  pending: true;
+  reservationId?: string;
+  createdAt?: number;
+  expiresAt?: number;
+  transactionId?: string;
+  checkoutUrl?: string | null;
+  priceId?: string;
+  quantity?: number;
+  customerId?: string;
 }
 
 export async function handlePaddleCheckout(
@@ -169,18 +184,21 @@ async function hasOpenCheckoutReservation(
   env: Env,
   userId: string,
   kind: CheckoutRequestBody["kind"],
-  reservation: {
-    pending: boolean;
-    reservationId?: string;
-    transactionId?: string;
-  },
+  reservation: { pending: false } | PendingCheckoutReservation,
 ): Promise<boolean> {
   if (!reservation.pending) return false;
-  if (!reservation.reservationId || !reservation.transactionId) return true;
+  const reservationId = reservation.reservationId;
+  if (!reservationId) return true;
+  if (!reservation.transactionId) {
+    return await hasOpenUnrecordedCheckoutReservation(env, userId, kind, {
+      ...reservation,
+      reservationId,
+    });
+  }
 
   const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
   if (!snapshot || snapshot.status === "canceled") {
-    await releaseCheckoutReservation(env, userId, kind, reservation.reservationId);
+    await releaseCheckoutReservation(env, userId, kind, reservationId);
     return false;
   }
 
@@ -262,22 +280,25 @@ function releaseCheckoutReservation(
 async function recoverOrReleasePendingCheckout(
   env: Env,
   userId: string,
-  reservation: {
-    reservationId?: string;
-    transactionId?: string;
-    checkoutUrl?: string | null;
-    priceId?: string;
-    quantity?: number;
-  },
+  reservation: PendingCheckoutReservation,
   request: CheckoutRequestBody,
 ): Promise<PendingCheckoutTransaction | null> {
-  if (!reservation.reservationId || !reservation.transactionId) {
+  const reservationId = reservation.reservationId;
+  if (!reservationId) {
     throw pendingCheckoutError();
+  }
+  if (!reservation.transactionId) {
+    return await recoverOrReleaseUnrecordedCheckout(
+      env,
+      userId,
+      { ...reservation, reservationId },
+      request,
+    );
   }
 
   const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
   if (!snapshot || snapshot.status === "canceled") {
-    await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
+    await releaseCheckoutReservation(env, userId, request.kind, reservationId);
     return null;
   }
   const checkoutUrl = snapshot.checkoutUrl ?? reservation.checkoutUrl ?? null;
@@ -286,12 +307,81 @@ async function recoverOrReleasePendingCheckout(
       throw checkoutConflictError();
     }
     return {
-      reservationId: reservation.reservationId,
+      reservationId,
       transactionId: reservation.transactionId,
       checkoutUrl,
     };
   }
   throw pendingCheckoutError();
+}
+
+async function recoverOrReleaseUnrecordedCheckout(
+  env: Env,
+  userId: string,
+  reservation: PendingCheckoutReservation & { reservationId: string },
+  request: CheckoutRequestBody,
+): Promise<PendingCheckoutTransaction | null> {
+  if (!reservationExpired(reservation)) throw pendingCheckoutError();
+
+  const snapshot = await unrecordedCheckoutTransactionSnapshot(env, userId, reservation);
+  if (!snapshot || snapshot.status === "canceled") {
+    await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
+    return null;
+  }
+
+  const checkoutUrl = snapshot.checkoutUrl ?? reservation.checkoutUrl ?? null;
+  if (!isRecoverableCheckoutTransaction(snapshot.status, checkoutUrl)) {
+    throw pendingCheckoutError();
+  }
+  if (!checkoutMatchesRequest(reservation, snapshot, request)) {
+    throw checkoutConflictError();
+  }
+
+  const recordResult = await recordCheckoutReservation(
+    env,
+    userId,
+    request,
+    reservation.reservationId,
+    {
+      transactionId: snapshot.transactionId,
+      checkoutUrl,
+      customerId: snapshot.customerId ?? reservation.customerId ?? null,
+    },
+  );
+  if ("recorded" in recordResult) {
+    return {
+      reservationId: reservation.reservationId,
+      transactionId: snapshot.transactionId,
+      checkoutUrl,
+    };
+  }
+  if ("unusable" in recordResult) {
+    await cancelPaddleTransaction(env, snapshot.transactionId);
+    await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
+    throw subscriptionRequiredError();
+  }
+  throw pendingCheckoutError();
+}
+
+async function hasOpenUnrecordedCheckoutReservation(
+  env: Env,
+  userId: string,
+  kind: CheckoutRequestBody["kind"],
+  reservation: PendingCheckoutReservation & { reservationId: string },
+): Promise<boolean> {
+  if (!reservationExpired(reservation)) return true;
+  let snapshot: PaddleCheckoutReservationTransactionSnapshot | null;
+  try {
+    snapshot = await unrecordedCheckoutTransactionSnapshot(env, userId, reservation);
+  } catch (err) {
+    if (err instanceof ApiError) return true;
+    throw err;
+  }
+  if (!snapshot || snapshot.status === "canceled") {
+    await releaseCheckoutReservation(env, userId, kind, reservation.reservationId);
+    return false;
+  }
+  return true;
 }
 
 async function pendingCheckoutTransactionSnapshot(
@@ -304,6 +394,34 @@ async function pendingCheckoutTransactionSnapshot(
 } | null> {
   try {
     return await fetchPaddleTransactionSnapshot(env, transactionId);
+  } catch (err) {
+    if (err instanceof ApiError) throw pendingCheckoutError();
+    throw err;
+  }
+}
+
+async function unrecordedCheckoutTransactionSnapshot(
+  env: Env,
+  userId: string,
+  reservation: PendingCheckoutReservation & { reservationId: string },
+): Promise<PaddleCheckoutReservationTransactionSnapshot | null> {
+  if (typeof reservation.createdAt !== "number" || !Number.isFinite(reservation.createdAt)) {
+    throw pendingCheckoutError();
+  }
+  try {
+    const snapshot = await findPaddleCheckoutTransactionByReservationId(env, {
+      reservationId: reservation.reservationId,
+      createdAt: reservation.createdAt,
+      expiresAt: reservation.expiresAt,
+      customerId: reservation.customerId,
+    });
+    if (
+      snapshot &&
+      !(await paddleCheckoutBindingMatchesCustomData(snapshot.customData, userId, env))
+    ) {
+      throw pendingCheckoutError();
+    }
+    return snapshot;
   } catch (err) {
     if (err instanceof ApiError) throw pendingCheckoutError();
     throw err;
@@ -323,6 +441,12 @@ function checkoutMatchesRequest(
     snapshot.items[0].priceId === request.priceId &&
     snapshot.items[0].quantity === request.quantity
   );
+}
+
+function reservationExpired(reservation: { expiresAt?: number }): boolean {
+  return typeof reservation.expiresAt === "number" && Number.isFinite(reservation.expiresAt)
+    ? Date.now() > reservation.expiresAt
+    : false;
 }
 
 function isRecoverableCheckoutTransaction(

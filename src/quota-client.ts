@@ -72,10 +72,13 @@ export type PaddleSubscriptionCheckoutReservationResult =
   | {
       pending: true;
       reservationId?: string;
+      createdAt?: number;
+      expiresAt?: number;
       transactionId?: string;
       checkoutUrl?: string | null;
       priceId?: string;
       quantity?: number;
+      customerId?: string;
     };
 export type PaddleOverageCheckoutReservationResult = PaddleSubscriptionCheckoutReservationResult;
 export type PaddleSubscriptionCheckoutPeekResult =

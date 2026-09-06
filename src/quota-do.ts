@@ -1355,24 +1355,27 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
   };
 }
 
-function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation):
-  | { pending: true }
-  | {
-      pending: true;
-      reservationId: string;
-      transactionId: string;
-      checkoutUrl: string | null;
-      priceId?: string;
-      quantity?: number;
-    } {
-  if (!reservation.transactionId) return { pending: true };
+function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation): {
+  pending: true;
+  reservationId: string;
+  createdAt: number;
+  expiresAt?: number;
+  transactionId?: string;
+  checkoutUrl: string | null;
+  priceId?: string;
+  quantity?: number;
+  customerId?: string;
+} {
   return {
     pending: true,
     reservationId: reservation.reservationId,
-    transactionId: reservation.transactionId,
+    createdAt: reservation.createdAt,
+    ...(reservation.expiresAt ? { expiresAt: reservation.expiresAt } : {}),
+    ...(reservation.transactionId ? { transactionId: reservation.transactionId } : {}),
     checkoutUrl: reservation.checkoutUrl ?? null,
     ...(reservation.priceId ? { priceId: reservation.priceId } : {}),
     ...(reservation.quantity ? { quantity: reservation.quantity } : {}),
+    ...(reservation.customerId ? { customerId: reservation.customerId } : {}),
   };
 }
 

@@ -52,10 +52,13 @@ type CheckoutReservationResult =
   | {
       pending: true;
       reservationId?: string;
+      createdAt?: number;
+      expiresAt?: number;
       transactionId?: string;
       checkoutUrl?: string | null;
       priceId?: string;
       quantity?: number;
+      customerId?: string;
     };
 type CheckoutReservationRecordResult = { recorded: true } | { stale: true } | { unusable: true };
 interface ReserveResult {
@@ -813,7 +816,14 @@ describe("AccountQuota Durable Object", () => {
         ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
-    expect(stillPending).toEqual({ pending: true });
+    expect(stillPending).toEqual({
+      pending: true,
+      reservationId: "checkout-current",
+      createdAt: MON,
+      expiresAt: MON + RESERVATION_TTL_MS,
+      checkoutUrl: null,
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
 
     clerkMocks.getUser.mockResolvedValue({
       id: uid,
@@ -956,6 +966,7 @@ describe("AccountQuota Durable Object", () => {
     expect(second).toEqual({
       pending: true,
       reservationId: "checkout-open",
+      createdAt: MON,
       transactionId: "txn_open",
       checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
       ...SUBSCRIPTION_CHECKOUT_REQUEST,
@@ -984,7 +995,14 @@ describe("AccountQuota Durable Object", () => {
         ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
-    expect(second).toEqual({ pending: true });
+    expect(second).toEqual({
+      pending: true,
+      reservationId: "checkout-open",
+      createdAt: MON,
+      expiresAt: MON + RESERVATION_TTL_MS,
+      checkoutUrl: null,
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
   });
 
   it("rejects begin-delete while a subscription checkout reservation is pending", async () => {
@@ -1135,6 +1153,7 @@ describe("AccountQuota Durable Object", () => {
     expect(pending).toEqual({
       pending: true,
       reservationId: "checkout-open",
+      createdAt: MON,
       transactionId: "txn_open",
       checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
       ...SUBSCRIPTION_CHECKOUT_REQUEST,

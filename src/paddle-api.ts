@@ -13,6 +13,13 @@ export interface PaddleCheckoutTransaction {
   checkoutUrl: string | null;
 }
 
+export interface PaddleCheckoutReservationLookupInput {
+  reservationId: string;
+  createdAt: number;
+  expiresAt?: number;
+  customerId?: string | null;
+}
+
 export class PaddleCheckoutCreationOutcomeUnknownError extends ApiError {
   constructor() {
     super(502, "checkout_unavailable", "Could not start checkout.");
@@ -31,6 +38,10 @@ export interface PaddleTransactionSnapshot {
   status: string | null;
   checkoutUrl: string | null;
   items: PaddleTransactionItemSnapshot[];
+}
+
+export interface PaddleCheckoutReservationTransactionSnapshot extends PaddleTransactionSnapshot {
+  transactionId: string;
 }
 
 export interface PaddleTransactionItemSnapshot {
@@ -144,6 +155,61 @@ export async function cancelPaddleTransaction(env: Env, transactionId: string): 
   }
 }
 
+export async function findPaddleCheckoutTransactionByReservationId(
+  env: Env,
+  input: PaddleCheckoutReservationLookupInput,
+): Promise<PaddleCheckoutReservationTransactionSnapshot | null> {
+  const apiKey = requirePaddleApiKey(
+    "transaction_lookup_failed",
+    "Could not confirm the transaction.",
+    env,
+  );
+  try {
+    let nextUrl: string | null = checkoutTransactionLookupUrl(env, input);
+    for (let page = 0; nextUrl && page < 3; page++) {
+      const res = await fetch(nextUrl, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "Skip-Count": "true",
+        },
+      });
+      if (!res.ok) {
+        throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
+      }
+      const body: unknown = await res.json();
+      const data = asRecord(body)?.data;
+      if (Array.isArray(data)) {
+        for (const transaction of data) {
+          const record = asRecord(transaction);
+          const transactionId = record?.id;
+          const customData = asRecord(record?.custom_data);
+          if (
+            typeof transactionId === "string" &&
+            transactionId !== "" &&
+            customData?.sentwiseCheckoutReservationId === input.reservationId
+          ) {
+            const snapshot = parsePaddleTransactionSnapshot(record);
+            if (input.customerId && snapshot.customerId !== input.customerId) continue;
+            return { transactionId, ...snapshot };
+          }
+        }
+      }
+      const pagination = asRecord(asRecord(body)?.meta)?.pagination;
+      const pageInfo = asRecord(pagination);
+      const next = pageInfo?.next;
+      nextUrl = pageInfo?.has_more === true && typeof next === "string" && next ? next : null;
+    }
+    if (nextUrl) {
+      throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
+    }
+    return null;
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
+  }
+}
+
 export async function fetchPaddleManagementUrl(
   env: Env,
   subscriptionId: string,
@@ -196,15 +262,7 @@ export async function fetchPaddleTransactionSnapshot(
     }
     const body: unknown = await res.json();
     const data = asRecord(asRecord(body)?.data);
-    const customerId = data?.customer_id;
-    const status = data?.status;
-    return {
-      customerId: typeof customerId === "string" && customerId !== "" ? customerId : null,
-      customData: asRecord(data?.custom_data),
-      status: typeof status === "string" && status !== "" ? status : null,
-      checkoutUrl: validHttpsUrl(data ? asRecord(data.checkout)?.url : undefined),
-      items: parseTransactionItems(data?.items),
-    };
+    return parsePaddleTransactionSnapshot(data);
   } catch (err) {
     if (err instanceof ApiError) throw err;
     throw new ApiError(502, "transaction_lookup_failed", "Could not confirm the transaction.");
@@ -257,6 +315,42 @@ function paddleApiBase(env: Env): string {
 function requirePaddleApiKey(type: string, message: string, env: Env): string {
   if (env.PADDLE_API_KEY) return env.PADDLE_API_KEY;
   throw new ApiError(502, type, message);
+}
+
+function checkoutTransactionLookupUrl(
+  env: Env,
+  input: PaddleCheckoutReservationLookupInput,
+): string {
+  const url = new URL(`${paddleApiBase(env)}/transactions`);
+  url.searchParams.set("collection_mode", "automatic");
+  url.searchParams.set("origin", "api");
+  url.searchParams.set(
+    "created_at[GTE]",
+    new Date(Math.max(0, input.createdAt - 60_000)).toISOString(),
+  );
+  if (typeof input.expiresAt === "number" && Number.isFinite(input.expiresAt)) {
+    url.searchParams.set("created_at[LTE]", new Date(input.expiresAt + 60_000).toISOString());
+  }
+  url.searchParams.set("order_by", "created_at[DESC]");
+  url.searchParams.set("per_page", "30");
+  if (input.customerId) {
+    url.searchParams.set("customer_id", input.customerId);
+  }
+  return url.toString();
+}
+
+function parsePaddleTransactionSnapshot(
+  data: Record<string, unknown> | null,
+): PaddleTransactionSnapshot {
+  const customerId = data?.customer_id;
+  const status = data?.status;
+  return {
+    customerId: typeof customerId === "string" && customerId !== "" ? customerId : null,
+    customData: asRecord(data?.custom_data),
+    status: typeof status === "string" && status !== "" ? status : null,
+    checkoutUrl: validHttpsUrl(data ? asRecord(data.checkout)?.url : undefined),
+    items: parseTransactionItems(data?.items),
+  };
 }
 
 function validHttpsUrl(v: unknown): string | null {
