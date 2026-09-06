@@ -503,7 +503,7 @@ export class AccountQuota {
       const result = await this.enqueuePrivateMetadataWrite(() =>
         recordPaddleSubscriptionInClerk(userId, parsed, this.env),
       );
-      if ("applied" in result) {
+      if ("applied" in result || "idempotent" in result) {
         await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
       }
       return Response.json(result);
@@ -723,6 +723,20 @@ export class AccountQuota {
         return { deleting: true, alreadyDeleted: true, attemptId };
       }
 
+      const reservation = parsePaddleSubscriptionCheckoutReservation(
+        await txn.get<unknown>(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY),
+      );
+      if (reservation) {
+        if (
+          !reservation.transactionId &&
+          (reservation.expiresAt === undefined || reservation.expiresAt <= now)
+        ) {
+          await txn.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
+        } else {
+          return { checkoutPending: true };
+        }
+      }
+
       const expiresAt = now + ACCOUNT_DELETION_BARRIER_TIMEOUT_MS;
       const attempts = current?.status === "deleting" ? activeDeletionAttempts(current) : [];
       const existingAttempt = attempts.find((attempt) => attempt.id === attemptId);
@@ -741,6 +755,13 @@ export class AccountQuota {
       await scheduleAccountDeletionAlarmOn(txn, nextAttemptAt);
       return { deleting: true, alreadyDeleted: false, attemptId, expiresAt };
     });
+    if ("checkoutPending" in result) {
+      return jsonError(
+        409,
+        "billing_checkout_pending",
+        "Complete or cancel your pending Paddle checkout before deleting your account.",
+      );
+    }
     return Response.json(result);
   }
 

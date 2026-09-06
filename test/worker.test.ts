@@ -1653,6 +1653,51 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     );
   });
 
+  it("does not delete when begin-delete sees a checkout created after the preflight", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-checkout-race" });
+    const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const quotaStub = {
+      fetch: vi.fn((input: RequestInfo | URL) => {
+        const path = internalUrl(input).pathname;
+        if (path === "/paddle-subscription-checkout-peek") {
+          return Promise.resolve(Response.json({ pending: false }));
+        }
+        if (path === "/begin-delete") {
+          return Promise.resolve(
+            Response.json(
+              {
+                error: {
+                  type: "billing_checkout_pending",
+                  message:
+                    "Complete or cancel your pending Paddle checkout before deleting your account.",
+                },
+              },
+              { status: 409 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    };
+    const quotaEnv: Env = {
+      ...deletePaddleEnv,
+      ACCOUNT_QUOTA: {
+        idFromName: vi.fn(() => ({}) as DurableObjectId),
+        get: vi.fn(() => quotaStub as unknown as DurableObjectStub),
+      } as unknown as DurableObjectNamespace,
+    };
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      quotaEnv,
+    );
+
+    expect(del.status).toBe(409);
+    expect(((await del.json()) as any).error.type).toBe("billing_checkout_pending");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("is idempotent — a Clerk user already gone still returns 204", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-gone" });
     mocks.getUser.mockRejectedValueOnce({ status: 404 });

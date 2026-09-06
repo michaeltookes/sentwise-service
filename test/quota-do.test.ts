@@ -631,6 +631,69 @@ describe("AccountQuota Durable Object", () => {
     expect(next).toEqual({ reserved: true, reservationId: "checkout-next" });
   });
 
+  it("clears checkout reservations for matching idempotent subscription events", async () => {
+    const uid = "checkout-reservation-idempotent-webhook";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-current",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+    expect(
+      await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+        reservationId: "checkout-current",
+        transactionId: "txn_checkout",
+        checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_checkout",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      }),
+    ).toEqual({ recorded: true });
+
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          lastEventId: "evt_checkout",
+          updatedAt: "2024-01-01T00:00:03.000Z",
+        },
+        quota: {},
+      },
+    });
+
+    const idempotent = await callDO<{ idempotent: true }>(uid, "/paddle-subscription", {
+      now: MON + 1,
+      event: {
+        eventId: "evt_checkout",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:03.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: {
+            clerkUserId: uid,
+            sentwiseCheckoutReservationId: "checkout-current",
+          },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    expect(idempotent).toEqual({ idempotent: true });
+
+    const next = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 2,
+        reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(next).toEqual({ reserved: true, reservationId: "checkout-next" });
+  });
+
   it("keeps a recorded subscription checkout reservation after the former timeout window", async () => {
     const uid = "checkout-reservation-no-timeout";
     const first = await callDO<CheckoutReservationResult>(
@@ -691,6 +754,51 @@ describe("AccountQuota Durable Object", () => {
       },
     );
     expect(second).toEqual({ reserved: true, reservationId: "checkout-later" });
+  });
+
+  it("rejects begin-delete while a subscription checkout reservation is pending", async () => {
+    const uid = "checkout-reservation-blocks-delete";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+    await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+      reservationId: "checkout-open",
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    const begin = await callDOResponse(uid, "/begin-delete", {
+      now: MON + 1,
+      attemptId: "delete-attempt",
+    });
+
+    expect(begin.status).toBe(409);
+    expect(((await begin.json()) as any).error.type).toBe("billing_checkout_pending");
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+    expect(peek.status).toBe(200);
+  });
+
+  it("expires an unrecorded checkout reservation before begin-delete", async () => {
+    const uid = "checkout-reservation-expired-delete";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    const begin = await callDO<{ deleting: true; alreadyDeleted: false }>(uid, "/begin-delete", {
+      now: MON + RESERVATION_TTL_MS + 1,
+      attemptId: "delete-attempt",
+    });
+
+    expect(begin).toMatchObject({
+      deleting: true,
+      alreadyDeleted: false,
+      attemptId: "delete-attempt",
+    });
   });
 
   it("returns pending subscription checkout transaction details for recovery", async () => {

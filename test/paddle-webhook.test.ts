@@ -1726,6 +1726,100 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
+  it("removes restored partial adjustment amounts before later cumulative proration", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {
+        extraDrafts: 5,
+        extraDraftsWindowStart: monday,
+        overageCredits: [
+          {
+            eventId: "evt_txn",
+            transactionId: "txn_evt_txn",
+            transactionItemId: "txnitm_1",
+            extraDrafts: 10,
+            amount: 10000,
+            windowStart: monday,
+            reversedDrafts: 5,
+            reversalAdjustmentIds: ["adj_chargeback"],
+            reversedDraftsByAdjustment: [
+              { adjustmentId: "adj_chargeback", action: "chargeback", drafts: 5 },
+            ],
+            adjustedAmountsByAdjustment: [
+              { adjustmentId: "adj_chargeback", action: "chargeback", amount: 5000 },
+            ],
+          },
+        ],
+      },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const restored = await signedReq(
+      adjustmentBody({ id: "adj_reverse", action: "chargeback_reverse", type: "full" }, "evt_rev"),
+    );
+
+    expect((await restored.json()) as any).toEqual({
+      ok: true,
+      restored: true,
+      extraDrafts: 5,
+    });
+    expect((storedMeta.quota as Record<string, unknown>).extraDrafts).toBe(10);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 10,
+        amount: 10000,
+        windowStart: monday,
+        reversalAdjustmentIds: ["adj_chargeback"],
+        restoredByAdjustmentIds: ["adj_reverse"],
+      },
+    ]);
+
+    const chargedBackAgain = await signedReq(
+      adjustmentBody(
+        {
+          id: "adj_new",
+          action: "chargeback",
+          type: "partial",
+          items: [{ item_id: "txnitm_1", type: "partial", amount: "1000" }],
+        },
+        "evt_new",
+      ),
+    );
+
+    expect((await chargedBackAgain.json()) as any).toEqual({
+      ok: true,
+      revoked: true,
+      extraDrafts: 1,
+    });
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(9);
+    expect(quota.processedOverageAdjustmentIds).toEqual(["adj_reverse", "adj_new"]);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 10,
+        amount: 10000,
+        windowStart: monday,
+        reversedDrafts: 1,
+        reversalAdjustmentIds: ["adj_chargeback", "adj_new"],
+        restoredByAdjustmentIds: ["adj_reverse"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_new", action: "chargeback", drafts: 1 }],
+        adjustedAmountsByAdjustment: [
+          { adjustmentId: "adj_new", action: "chargeback", amount: 1000 },
+        ],
+      },
+    ]);
+  });
+
   it("restores only drafts revoked by the matching adjustment action", async () => {
     const monday = mondayStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(

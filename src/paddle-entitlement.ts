@@ -80,6 +80,13 @@ interface StoredOverageCreditAdjustmentAmount {
   amount: number;
 }
 
+interface RestoredDraftConsumption {
+  adjustmentId: string;
+  action: StoredOverageCreditReversal["action"];
+  drafts: number;
+  originalDrafts: number;
+}
+
 interface StoredPendingOverageReversal {
   eventId: string;
   adjustmentId: string;
@@ -515,7 +522,13 @@ function applyAdjustmentToCredits(
     }
 
     return isRestoreAction(adjustment.action)
-      ? restoreCredit(credit, application.drafts, adjustment.action, adjustment.adjustmentId)
+      ? restoreCredit(
+          credit,
+          application.drafts,
+          adjustment.action,
+          adjustment.adjustmentId,
+          application.adjustedAmount,
+        )
       : reverseCredit(
           credit,
           application.drafts,
@@ -672,12 +685,18 @@ function restoreCredit(
   amount: number,
   action: OverageAdjustmentAction,
   adjustmentId: string,
+  adjustedAmount?: number,
 ): StoredOverageCredit {
   const consumed = consumeRestorableDrafts(reversedDraftEntries(credit), action, amount);
   return cleanCredit({
     ...credit,
     reversedDrafts: Math.max(0, reversedDrafts(credit) - consumed.restoredDrafts),
     reversedDraftsByAdjustment: consumed.entries,
+    adjustedAmountsByAdjustment: consumeRestoredAdjustedAmounts(
+      adjustedAmountEntries(credit),
+      consumed.consumed,
+      adjustedAmount,
+    ),
     restoredByAdjustmentIds: uniqueIdList([
       ...(credit.restoredByAdjustmentIds ?? []),
       adjustmentId,
@@ -812,13 +831,18 @@ function consumeRestorableDrafts(
   entries: StoredOverageCreditReversal[],
   action: OverageAdjustmentAction,
   amount: number,
-): { entries: StoredOverageCreditReversal[]; restoredDrafts: number } {
+): {
+  entries: StoredOverageCreditReversal[];
+  restoredDrafts: number;
+  consumed: RestoredDraftConsumption[];
+} {
   const target = restoredReversalAction(action);
-  if (!target || amount <= 0) return { entries, restoredDrafts: 0 };
+  if (!target || amount <= 0) return { entries, restoredDrafts: 0, consumed: [] };
 
   let remaining = amount;
   let restoredDrafts = 0;
   const next: StoredOverageCreditReversal[] = [];
+  const consumed: RestoredDraftConsumption[] = [];
   for (const entry of entries) {
     if (entry.action !== target || remaining <= 0) {
       next.push(entry);
@@ -827,13 +851,52 @@ function consumeRestorableDrafts(
     const restored = Math.min(entry.drafts, remaining);
     remaining -= restored;
     restoredDrafts += restored;
+    consumed.push({
+      adjustmentId: entry.adjustmentId,
+      action: entry.action,
+      drafts: restored,
+      originalDrafts: entry.drafts,
+    });
     const drafts = entry.drafts - restored;
     if (drafts > 0) {
       next.push({ ...entry, drafts });
     }
   }
 
-  return { entries: next, restoredDrafts };
+  return { entries: next, restoredDrafts, consumed };
+}
+
+function consumeRestoredAdjustedAmounts(
+  entries: StoredOverageCreditAdjustmentAmount[],
+  consumedDrafts: RestoredDraftConsumption[],
+  adjustedAmount: number | undefined,
+): StoredOverageCreditAdjustmentAmount[] {
+  const consumedByEntry = new Map(
+    consumedDrafts.map((entry) => [`${entry.adjustmentId}:${entry.action}`, entry] as const),
+  );
+  let remainingAmount =
+    adjustedAmount !== undefined && adjustedAmount > 0 ? Math.floor(adjustedAmount) : null;
+
+  return entries.flatMap((entry): StoredOverageCreditAdjustmentAmount[] => {
+    const consumed = consumedByEntry.get(`${entry.adjustmentId}:${entry.action}`);
+    if (!consumed) return [entry];
+
+    let amountToRemove: number;
+    if (consumed.drafts >= consumed.originalDrafts) {
+      amountToRemove = entry.amount;
+      if (remainingAmount !== null) {
+        remainingAmount = Math.max(0, remainingAmount - amountToRemove);
+      }
+    } else if (remainingAmount !== null) {
+      amountToRemove = Math.min(entry.amount, remainingAmount);
+      remainingAmount -= amountToRemove;
+    } else {
+      amountToRemove = Math.ceil((entry.amount * consumed.drafts) / consumed.originalDrafts);
+    }
+
+    const amount = entry.amount - amountToRemove;
+    return amount > 0 ? [{ ...entry, amount }] : [];
+  });
 }
 
 function isStoredReversalAction(value: unknown): value is StoredOverageCreditReversal["action"] {
