@@ -2,8 +2,10 @@ import {
   authenticate,
   ClerkDeletionOutcomeUnknownError,
   deleteClerkUser,
+  hasPaidAccess,
   requireActiveTrial,
   resolveAccount,
+  resolveAccountIfExists,
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
@@ -104,6 +106,14 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "DELETE") {
         const { userId } = await authenticate(request, env);
+        const account = await resolveAccountIfExists(userId, env, { initialize: false });
+        if (account && hasPaidAccess(account.subscription)) {
+          throw new ApiError(
+            409,
+            "billing_subscription_active",
+            "Cancel your Paddle subscription before deleting your account.",
+          );
+        }
         const deletionAttemptId = crypto.randomUUID();
         await quotaBeginAccountDeletion(env, userId, deletionAttemptId);
         try {

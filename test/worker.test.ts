@@ -1476,6 +1476,10 @@ describe("POST /v1/paddle/checkout", () => {
 });
 
 describe("DELETE /v1/me (73 — account deletion)", () => {
+  beforeEach(() => {
+    mocks.getUser.mockResolvedValue(activeTrial());
+  });
+
   it("deletes the Clerk user and tombstones the usage DO, returning 204", async () => {
     // Seed some usage first so the wipe is observable.
     mocks.verifyToken.mockResolvedValue({ sub: "u-del" });
@@ -1502,8 +1506,34 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     expect(((await me.json()) as any).error.type).toBe("account_deleted");
   });
 
+  it("rejects account deletion while a paid Paddle subscription is active", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-paid" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+        },
+      }),
+    );
+    const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+
+    expect(del.status).toBe(409);
+    expect(((await del.json()) as any).error.type).toBe("billing_subscription_active");
+    expect(fetchMock).not.toHaveBeenCalled();
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-paid"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get(ACCOUNT_DELETION_KEY)).toBeUndefined();
+    });
+  });
+
   it("is idempotent — a Clerk user already gone still returns 204", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-gone" });
+    mocks.getUser.mockRejectedValueOnce({ status: 404 });
     const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse(404));
     vi.stubGlobal("fetch", fetchMock);
     const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);

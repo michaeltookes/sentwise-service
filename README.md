@@ -158,7 +158,8 @@ Returns **`404 billing_subscription_not_found`** when the account has no Paddle 
 ### `DELETE /v1/me` (item 73)
 
 Requires `Authorization: Bearer <clerk-session-token>`. **Deletes the account.** Returns **`204`** with
-no body on success.
+no body on success. Accounts with an active, trialing, or past-due paid Paddle subscription must cancel
+the subscription first; deletion returns **`409 billing_subscription_active`** until then.
 
 What is deleted:
 

@@ -80,12 +80,27 @@ export async function resolveAccount(
   env: Env,
   options: { initialize: boolean },
 ): Promise<AccountInfo> {
+  const account = await resolveAccountIfExists(userId, env, options);
+  if (account) return account;
+  throw new ApiError(
+    502,
+    "account_lookup_failed",
+    "Could not load your account. Please try again.",
+  );
+}
+
+export async function resolveAccountIfExists(
+  userId: string,
+  env: Env,
+  options: { initialize: boolean },
+): Promise<AccountInfo | null> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
   let user;
   try {
     user = await clerk.users.getUser(userId);
-  } catch {
+  } catch (err) {
+    if (isClerkNotFoundError(err)) return null;
     throw new ApiError(
       502,
       "account_lookup_failed",
@@ -93,7 +108,16 @@ export async function resolveAccount(
     );
   }
 
-  const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
+  return accountInfoFromUser(userId, clerk, user, options);
+}
+
+async function accountInfoFromUser(
+  userId: string,
+  clerk: ClerkClientLike,
+  user: ClerkUserLike,
+  options: { initialize: boolean },
+): Promise<AccountInfo> {
+  const meta = user.privateMetadata ?? {};
   let startedAt = typeof meta[TRIAL_METADATA_KEY] === "string" ? meta[TRIAL_METADATA_KEY] : null;
   // A corrupt/unparseable timestamp must not permanently expire the trial —
   // treat it as not-started so it re-initializes below.
@@ -192,7 +216,7 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
  * good while `active`/`trialing`/`past_due` (past_due is a short billing grace);
  * `canceled`/`lapsed`, and the pre-purchase `trial`/`none` plans, are not.
  */
-function hasPaidAccess(subscription: Subscription): boolean {
+export function hasPaidAccess(subscription: Subscription): boolean {
   const paidPlan =
     subscription.plan === "starter" ||
     subscription.plan === "pro" ||
@@ -242,8 +266,18 @@ export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
 }
 
 interface ClerkUserLike {
+  privateMetadata?: Record<string, unknown> | null;
   primaryEmailAddressId?: string | null;
   emailAddresses?: Array<{ id: string; emailAddress: string }>;
+}
+
+interface ClerkClientLike {
+  users: {
+    updateUserMetadata(
+      userId: string,
+      params: { privateMetadata: Record<string, unknown> },
+    ): Promise<unknown>;
+  };
 }
 
 function primaryEmail(user: ClerkUserLike): string | null {
