@@ -262,7 +262,6 @@ export async function recordPaddleOverageInClerk(
         ...fallbackOverageCredits(ledgerStore, replayed.credits),
       };
       try {
-        await savePendingOverageReversals(ledgerStore, replayed.remainingPending);
         await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
       } catch (err) {
         if (isClerkNotFoundError(err)) return { mapped: false };
@@ -270,6 +269,7 @@ export async function recordPaddleOverageInClerk(
       }
     }
     await saveOverageCredits(ledgerStore, replayed.credits);
+    await savePendingOverageReversals(ledgerStore, replayed.remainingPending);
     return { idempotent: true };
   }
 
@@ -321,13 +321,13 @@ export async function recordPaddleOverageInClerk(
   };
 
   try {
-    await savePendingOverageReversals(ledgerStore, replayed.remainingPending);
     await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
   } catch (err) {
     if (isClerkNotFoundError(err)) return { mapped: false };
     throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase.");
   }
   await saveOverageCredits(ledgerStore, allCredits);
+  await savePendingOverageReversals(ledgerStore, replayed.remainingPending);
 
   return { applied: true, extraDrafts: effectiveExtraDrafts };
 }

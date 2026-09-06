@@ -1583,6 +1583,80 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
+  it("keeps pending reversals when purchase replay metadata writes fail", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let failPurchaseWrite = true;
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {},
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      const quota = update.privateMetadata.quota as Record<string, unknown> | undefined;
+      if (quota?.lastOverageEventId === "evt_txn" && failPurchaseWrite) {
+        failPurchaseWrite = false;
+        throw new Error("clerk write failed");
+      }
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const reversalRes = await signedReq(adjustmentBody());
+
+    expect((await reversalRes.json()) as any).toEqual({ ok: true, pending: true });
+    expect(await storedPaddlePendingOverageReversals()).toHaveLength(1);
+
+    const failedPurchaseRes = await signedReq(
+      overageTxnBody(
+        {
+          id: "txn_evt_txn",
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 25 }],
+        },
+        "evt_txn",
+      ),
+      { overrideEnv: { ...env, EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE } },
+    );
+
+    expect(failedPurchaseRes.status).toBe(502);
+    expect(await storedPaddlePendingOverageReversals()).toHaveLength(1);
+    expect(await storedPaddleOverageCredits()).toEqual([]);
+
+    const retryRes = await signedReq(
+      overageTxnBody(
+        {
+          id: "txn_evt_txn",
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 25 }],
+        },
+        "evt_txn",
+      ),
+      { overrideEnv: { ...env, EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE } },
+    );
+
+    expect((await retryRes.json()) as any).toEqual({
+      ok: true,
+      applied: true,
+      extraDrafts: 0,
+    });
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(0);
+    expect(quota.extraDraftsWindowStart).toBe(monday);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([]);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedDrafts: 25,
+        reversedByAdjustmentId: "adj_123",
+        reversalAdjustmentIds: ["adj_123"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
+      },
+    ]);
+  });
+
   it("replays pending adjustments when repairing a processed overage purchase credit", async () => {
     const monday = mondayStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
