@@ -900,7 +900,9 @@ async function saveOverageCredits(
   });
 
   for (const [key, credit] of nextByStorageKey) {
-    await ledgerStore.put(key, credit);
+    if (!storedCreditEquals(stored.get(key), credit)) {
+      await ledgerStore.put(key, credit);
+    }
   }
 
   const staleKeys = [...stored.keys()].filter((key) => !nextByStorageKey.has(key));
@@ -957,6 +959,10 @@ async function loadShardedOverageCredits(
 
 function overageCreditStorageKey(credit: StoredOverageCredit): string {
   return `${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}${encodeURIComponent(overageCreditKey(credit))}`;
+}
+
+function storedCreditEquals(value: unknown, credit: StoredOverageCredit): boolean {
+  return isStoredOverageCredit(value) && JSON.stringify(value) === JSON.stringify(credit);
 }
 
 async function deleteStorageKeys(

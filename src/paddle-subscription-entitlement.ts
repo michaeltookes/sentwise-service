@@ -110,6 +110,9 @@ export async function recordPaddleSubscriptionInClerk(
   const isDifferentSubscription =
     !!existingSubscriptionId &&
     (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
+  if (isDifferentSubscription && isActiveStoredSubscription(existingSub)) {
+    return { stale: true };
+  }
   if (
     isDifferentSubscription &&
     !(await isCurrentSubscriptionReplacement(body.event, userId, env))
@@ -200,6 +203,11 @@ async function isCurrentSubscriptionReplacement(
   const incomingCustomerId = customerIdFromEvent(event);
   if (incomingCustomerId && snapshot.customerId !== incomingCustomerId) return false;
   return snapshot.status !== null && snapshot.status === paddleSubscriptionStatusFromEvent(event);
+}
+
+function isActiveStoredSubscription(existingSub: Record<string, unknown> | null): boolean {
+  const status = existingSub?.status;
+  return status === "active" || status === "trialing" || status === "past_due";
 }
 
 function paddleSubscriptionStatusFromEvent(event: PaddleEvent): string | null {

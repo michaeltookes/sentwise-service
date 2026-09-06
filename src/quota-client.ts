@@ -68,7 +68,14 @@ export type PaddleSubscriptionResult =
   | { ignored: "unknown_price" }
   | { mapped: false };
 export type PaddleSubscriptionCheckoutReservationResult =
-  { reserved: true; reservationId: string } | { pending: true };
+  | { reserved: true; reservationId: string }
+  | {
+      pending: true;
+      reservationId?: string;
+      transactionId?: string;
+      checkoutUrl?: string | null;
+    };
+export type PaddleSubscriptionCheckoutRecordResult = { recorded: true } | { stale: true };
 export type PaddleSubscriptionCheckoutReleaseResult = { released: true };
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
@@ -230,7 +237,7 @@ export function quotaRecordPaddleSubscription(
   return call<PaddleSubscriptionResult>(env, userId, "/paddle-subscription", body);
 }
 
-/** Reserve a short-lived per-account subscription checkout slot before creating it in Paddle. */
+/** Reserve a per-account subscription checkout slot before creating it in Paddle. */
 export function quotaReservePaddleSubscriptionCheckout(
   env: Env,
   userId: string,
@@ -240,6 +247,20 @@ export function quotaReservePaddleSubscriptionCheckout(
     env,
     userId,
     "/paddle-subscription-checkout-reserve",
+    body,
+  );
+}
+
+/** Attach the created Paddle transaction to a pending subscription checkout slot. */
+export function quotaRecordPaddleSubscriptionCheckout(
+  env: Env,
+  userId: string,
+  body: { reservationId: string; transactionId: string; checkoutUrl: string | null },
+): Promise<PaddleSubscriptionCheckoutRecordResult> {
+  return call<PaddleSubscriptionCheckoutRecordResult>(
+    env,
+    userId,
+    "/paddle-subscription-checkout-record",
     body,
   );
 }

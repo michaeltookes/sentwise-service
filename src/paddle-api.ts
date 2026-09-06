@@ -21,6 +21,8 @@ export interface PaddleSubscriptionSnapshot {
 export interface PaddleTransactionSnapshot {
   customerId: string | null;
   customData: Record<string, unknown> | null;
+  status: string | null;
+  checkoutUrl: string | null;
 }
 
 export type PaddleManagementAction = "update_payment_method" | "cancel";
@@ -153,9 +155,12 @@ export async function fetchPaddleTransactionSnapshot(
     const body: unknown = await res.json();
     const data = asRecord(asRecord(body)?.data);
     const customerId = data?.customer_id;
+    const status = data?.status;
     return {
       customerId: typeof customerId === "string" && customerId !== "" ? customerId : null,
       customData: asRecord(data?.custom_data),
+      status: typeof status === "string" && status !== "" ? status : null,
+      checkoutUrl: validHttpsUrl(data ? asRecord(data.checkout)?.url : undefined),
     };
   } catch (err) {
     if (err instanceof ApiError) throw err;

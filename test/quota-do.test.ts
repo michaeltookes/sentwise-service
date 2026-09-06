@@ -46,7 +46,15 @@ interface CheckResult {
 interface WindowResult {
   window: WindowState;
 }
-type CheckoutReservationResult = { reserved: true; reservationId: string } | { pending: true };
+type CheckoutReservationResult =
+  | { reserved: true; reservationId: string }
+  | {
+      pending: true;
+      reservationId?: string;
+      transactionId?: string;
+      checkoutUrl?: string | null;
+    };
+type CheckoutReservationRecordResult = { recorded: true } | { stale: true };
 interface ReserveResult {
   reserved: boolean;
   blockedByQuota: boolean;
@@ -638,6 +646,37 @@ describe("AccountQuota Durable Object", () => {
       },
     );
     expect(second).toEqual({ pending: true });
+  });
+
+  it("returns pending subscription checkout transaction details for recovery", async () => {
+    const uid = "checkout-reservation-transaction";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-open",
+    });
+    expect(
+      await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+        reservationId: "checkout-open",
+        transactionId: "txn_open",
+        checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      }),
+    ).toEqual({ recorded: true });
+
+    const pending = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 1,
+        reservationId: "checkout-next",
+      },
+    );
+
+    expect(pending).toEqual({
+      pending: true,
+      reservationId: "checkout-open",
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+    });
   });
 
   it("persists the deletion tombstone before scheduling cleanup retry", async () => {

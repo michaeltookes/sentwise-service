@@ -27,6 +27,8 @@ import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 import {
   PADDLE_OVERAGE_CREDITS_STORAGE_KEY,
   PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+  recordPaddleOverageInClerk,
+  type PaddleOverageLedgerStore,
 } from "../src/paddle-entitlement";
 
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
@@ -621,23 +623,10 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     });
   });
 
-  it("allows a terminal replacement subscription event when Paddle reports the same current status", async () => {
+  it("skips a terminal event from another subscription while the stored one is active", async () => {
     const customData = await buildPaddleCheckoutCustomData("user_abc", env);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((input: RequestInfo | URL): Promise<Response> => {
-        const url =
-          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-        if (url.includes("/subscriptions/sub_current")) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "canceled" } }), {
-              status: 200,
-            }),
-          );
-        }
-        return Promise.resolve(new Response("{}", { status: 404 }));
-      }),
-    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: {
@@ -662,13 +651,9 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
       }),
     );
 
-    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
-    expect(lastWrite()?.subscription).toMatchObject({
-      paddleSubscriptionId: "sub_current",
-      status: "canceled",
-      lastEventId: "evt_new_sub_canceled",
-      supersededPaddleSubscriptionIds: ["sub_old"],
-    });
+    expect((await res.json()) as any).toEqual({ ok: true, stale: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
   it("serializes overlapping subscription writes before the ordering check", async () => {
@@ -1046,6 +1031,64 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(await storedPaddleOverageCreditKeys()).toHaveLength(101);
   });
 
+  it("writes only changed overage ledger shards", async () => {
+    const monday = mondayStartUtc(Date.now());
+    const existingCredits = [
+      { eventId: "evt_a", transactionId: "txn_a", extraDrafts: 1, windowStart: monday },
+      { eventId: "evt_b", transactionId: "txn_b", extraDrafts: 1, windowStart: monday },
+    ];
+    const values = new Map<string, unknown>(
+      existingCredits.map((credit) => [testOverageCreditStorageKey(credit), credit]),
+    );
+    const putKeys: string[] = [];
+    const ledgerStore: PaddleOverageLedgerStore = {
+      get: <T = unknown>(key: string) => Promise.resolve(values.get(key) as T | undefined),
+      put: (key, value) => {
+        putKeys.push(key);
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      list: <T = unknown>(options?: { prefix?: string }) =>
+        Promise.resolve(
+          new Map(
+            [...values].filter(([key]) => !options?.prefix || key.startsWith(options.prefix)),
+          ) as Map<string, T>,
+        ),
+      delete: (keyOrKeys) => {
+        for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+          values.delete(key);
+        }
+        return Promise.resolve();
+      },
+    };
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 2,
+          extraDraftsWindowStart: monday,
+          processedOverageEventIds: ["evt_a", "evt_b"],
+        },
+      }),
+    );
+
+    await recordPaddleOverageInClerk(
+      "user_abc",
+      {
+        now: Date.now(),
+        eventId: "evt_c",
+        transactionId: "txn_c",
+        customerId: "ctm_123",
+        extraDrafts: 1,
+        credits: [{ transactionItemId: null, extraDrafts: 1, amount: null }],
+      },
+      env,
+      ledgerStore,
+    );
+
+    expect(putKeys).toEqual([expect.stringContaining(encodeURIComponent("evt_c:txn_c:"))]);
+  });
+
   it("serializes overlapping subscription and overage writes through the account Durable Object", async () => {
     const monday = mondayStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
@@ -1114,6 +1157,16 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 });
+
+function testOverageCreditStorageKey(credit: {
+  eventId: string;
+  transactionId: string;
+  transactionItemId?: string;
+}): string {
+  return `${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}${encodeURIComponent(
+    `${credit.eventId}:${credit.transactionId}:${credit.transactionItemId ?? ""}`,
+  )}`;
+}
 
 describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   beforeEach(() => {

@@ -9,7 +9,7 @@
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)
 //   "paddle_overage_credits" -> refundable Paddle overage credit ledger
-//   "paddle_subscription_checkout_reservation" -> short-lived pending subscription checkout lock
+//   "paddle_subscription_checkout_reservation" -> pending subscription checkout lock
 //   "account_deletion" -> deletion barrier/tombstone plus retry metadata
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
@@ -21,6 +21,7 @@
 //   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts, credits } -> serialize Paddle overage entitlement writes
 //   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, hasAdjustmentItems, items } -> revoke/restore overage credit
 //   POST /paddle-subscription-checkout-reserve { now, reservationId } -> reserve one pending subscription checkout
+//   POST /paddle-subscription-checkout-record { reservationId, transactionId, checkoutUrl } -> attach the Paddle transaction to a reservation
 //   POST /paddle-subscription-checkout-release { reservationId } -> release a matching pending subscription checkout after failed creation
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
@@ -115,7 +116,9 @@ interface AccountDeletionMarker {
 interface PaddleSubscriptionCheckoutReservation {
   reservationId: string;
   createdAt: number;
-  expiresAt: number;
+  expiresAt?: number;
+  transactionId?: string;
+  checkoutUrl?: string | null;
 }
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -204,6 +207,8 @@ export class AccountQuota {
         return this.handlePaddleOverageReversal(await request.json<unknown>());
       case "/paddle-subscription-checkout-reserve":
         return this.handlePaddleSubscriptionCheckoutReserve(await request.json<unknown>());
+      case "/paddle-subscription-checkout-record":
+        return this.handlePaddleSubscriptionCheckoutRecord(await request.json<unknown>());
       case "/paddle-subscription-checkout-release":
         return this.handlePaddleSubscriptionCheckoutRelease(await request.json<unknown>());
       default:
@@ -548,8 +553,9 @@ export class AccountQuota {
       const reservation = await txn.get<unknown>(
         PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
       );
-      if (isPaddleSubscriptionCheckoutReservation(reservation)) {
-        return Response.json({ pending: true });
+      const parsedReservation = parsePaddleSubscriptionCheckoutReservation(reservation);
+      if (parsedReservation) {
+        return Response.json(pendingPaddleSubscriptionCheckoutReservation(parsedReservation));
       }
 
       await txn.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
@@ -557,6 +563,39 @@ export class AccountQuota {
         createdAt: now,
       });
       return Response.json({ reserved: true, reservationId });
+    });
+  }
+
+  private async handlePaddleSubscriptionCheckoutRecord(body: unknown): Promise<Response> {
+    const record = asRecord(body);
+    const reservationId = normalizedId(
+      typeof record?.reservationId === "string" ? record.reservationId : undefined,
+    );
+    const transactionId = normalizedId(
+      typeof record?.transactionId === "string" ? record.transactionId : undefined,
+    );
+    if (!reservationId || !transactionId) {
+      return jsonError(
+        400,
+        "invalid_request",
+        "A checkout reservation id and transaction id are required.",
+      );
+    }
+    const checkoutUrl = validHttpsUrl(record?.checkoutUrl);
+
+    return this.storage.transaction(async (txn) => {
+      const reservation = parsePaddleSubscriptionCheckoutReservation(
+        await txn.get<unknown>(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY),
+      );
+      if (reservation?.reservationId !== reservationId) {
+        return Response.json({ stale: true });
+      }
+      await txn.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
+        ...reservation,
+        transactionId,
+        checkoutUrl,
+      });
+      return Response.json({ recorded: true });
     });
   }
 
@@ -1030,17 +1069,6 @@ function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
   );
 }
 
-function isPaddleSubscriptionCheckoutReservation(v: unknown): boolean {
-  const reservation = asRecord(v);
-  return (
-    !!reservation &&
-    typeof reservation.reservationId === "string" &&
-    reservation.reservationId !== "" &&
-    typeof reservation.createdAt === "number" &&
-    Number.isFinite(reservation.createdAt)
-  );
-}
-
 function parsePaddleSubscriptionCheckoutReservation(
   v: unknown,
 ): PaddleSubscriptionCheckoutReservation | null {
@@ -1057,14 +1085,46 @@ function parsePaddleSubscriptionCheckoutReservation(
   ) {
     return null;
   }
+  const checkoutUrl = validHttpsUrl(reservation.checkoutUrl);
   return {
     reservationId,
     createdAt: reservation.createdAt,
-    expiresAt:
-      typeof reservation.expiresAt === "number" && Number.isFinite(reservation.expiresAt)
-        ? reservation.expiresAt
-        : Number.POSITIVE_INFINITY,
+    ...(typeof reservation.expiresAt === "number" && Number.isFinite(reservation.expiresAt)
+      ? { expiresAt: reservation.expiresAt }
+      : {}),
+    ...(typeof reservation.transactionId === "string" && reservation.transactionId !== ""
+      ? { transactionId: reservation.transactionId }
+      : {}),
+    ...(checkoutUrl ? { checkoutUrl } : {}),
   };
+}
+
+function pendingPaddleSubscriptionCheckoutReservation(
+  reservation: PaddleSubscriptionCheckoutReservation,
+):
+  | { pending: true }
+  | {
+      pending: true;
+      reservationId: string;
+      transactionId: string;
+      checkoutUrl: string | null;
+    } {
+  if (!reservation.transactionId) return { pending: true };
+  return {
+    pending: true,
+    reservationId: reservation.reservationId,
+    transactionId: reservation.transactionId,
+    checkoutUrl: reservation.checkoutUrl ?? null,
+  };
+}
+
+function validHttpsUrl(v: unknown): string | null {
+  if (typeof v !== "string" || v === "") return null;
+  try {
+    return new URL(v).protocol === "https:" ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 function activeDeletionAttempts(marker: AccountDeletionMarker): AccountDeletionAttempt[] {
