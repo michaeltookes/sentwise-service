@@ -150,16 +150,38 @@ export async function clerkUserExists(userId: string, env: Env): Promise<boolean
   }
 }
 
-/** Enforce the trial: throw 402 when expired. Returns the resolved account. */
+/**
+ * Gate drafting access. Returns the resolved account when access is granted, else
+ * throws 402. Access is granted by an active trial OR (56c) an active paid
+ * subscription written by the Paddle webhook — so a paying customer is not blocked
+ * when the 14-day trial clock runs out.
+ */
 export async function requireActiveTrial(userId: string, env: Env): Promise<AccountInfo> {
   const account = await resolveAccount(userId, env, { initialize: true });
-  if (!account.trial.active) {
-    // TODO(56c): once checkout ships, allow paid accounts past this gate.
-    throw new ApiError(402, "trial_expired", "Your 14-day free trial has ended.", {
-      trialEndsAt: account.trial.endsAt,
-    });
+  if (account.trial.active || hasPaidAccess(account.subscription)) {
+    return account;
   }
-  return account;
+  throw new ApiError(402, "trial_expired", "Your 14-day free trial has ended.", {
+    trialEndsAt: account.trial.endsAt,
+  });
+}
+
+/**
+ * Whether a resolved subscription grants drafting access (56c). A paid tier is
+ * good while `active`/`trialing`/`past_due` (past_due is a short billing grace);
+ * `canceled`/`lapsed`, and the pre-purchase `trial`/`none` plans, are not.
+ */
+function hasPaidAccess(subscription: Subscription): boolean {
+  const paidPlan =
+    subscription.plan === "starter" ||
+    subscription.plan === "pro" ||
+    subscription.plan === "unlimited" ||
+    subscription.plan === "team";
+  const activeStatus =
+    subscription.status === "active" ||
+    subscription.status === "trialing" ||
+    subscription.status === "past_due";
+  return paidPlan && activeStatus;
 }
 
 /**

@@ -500,6 +500,50 @@ describe("POST /v1/draft trial handling", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("lets an active paid subscription draft after the trial has expired (56c)", async () => {
+    const started = new Date(Date.now() - TRIAL_MS - 1000).toISOString();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({ trialStartedAt: started, subscription: { plan: "pro", status: "active" } }),
+    );
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("paid draft"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).text).toBe("paid draft");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("still 402s an expired trial whose subscription is canceled (56c)", async () => {
+    const started = new Date(Date.now() - TRIAL_MS - 1000).toISOString();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({ trialStartedAt: started, subscription: { plan: "pro", status: "canceled" } }),
+    );
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(402);
+    expect(((await res.json()) as any).error.type).toBe("trial_expired");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("maps an Anthropic error to a clean JSON error", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ trialStartedAt: new Date().toISOString() }));
