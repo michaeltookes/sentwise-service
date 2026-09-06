@@ -409,9 +409,9 @@ persists them. The app should open `GET /v1/paddle/manage-billing`, which fetche
 the Paddle transaction id and, when Paddle provides it, the transaction item id and item total.
 Approved Paddle refund/chargeback/credit adjustments mark matching credits as reversed and subtract
 any still-current weekly extras; partial adjustments are prorated by adjusted amount. Approved
-chargeback/credit reversals restore previously reversed credits. If an approved reversal arrives
-before the matching `transaction.completed`, it is retained in `pendingOverageReversals` and applied
-when that transaction is later delivered.
+chargeback/credit reversals restore previously reversed credits. If an approved reversal or restore
+arrives before the matching prerequisite event, it is retained in `pendingOverageReversals` and
+applied when the prerequisite is later delivered.
 
 **Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
@@ -422,13 +422,14 @@ the stored one only with a signed checkout binding and a live Paddle subscriptio
 that it is still active/trialing for the same customer. Overage writes are skipped when the `event_id`
 is in the bounded `processedOverageEventIds` list (the legacy
 `lastOverageEventId` is still honored). Approved adjustment reversals/restores are skipped when the
-`adjustment_id` is in the bounded `processedOverageAdjustmentIds` list; unmatched approved reversals
-are retained in a bounded `pendingOverageReversals` list by transaction id. A transient Clerk failure
-returns **`502`** so Paddle retries.
+`adjustment_id` is in the bounded `processedOverageAdjustmentIds` list; unmatched approved
+reversals/restores are retained in a bounded `pendingOverageReversals` list by transaction id. A
+transient Clerk failure returns **`502`** so Paddle retries.
 
 **Privacy.** This endpoint handles only plan/status/timestamps and price/subscription/customer ids
-(plus a customer email used solely to match an account). It never sees prompt or draft content and
-**never logs the raw webhook body** (enforced by `scripts/check-no-body-logging.sh`).
+(plus a customer email used solely to locate a previously-bound account). It never sees prompt or
+draft content and **never logs the raw webhook body** (enforced by
+`scripts/check-no-body-logging.sh`).
 
 **Going live (owner, after the app half lands).** Nothing is live until the owner: (1) sets the two
 Paddle secrets (below); (2) in the Paddle dashboard creates a **notification destination** pointing at

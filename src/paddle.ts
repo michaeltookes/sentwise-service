@@ -493,6 +493,7 @@ export interface StoredSubscriptionRecord {
   paddleCustomerId: string | null;
   priceId: string | null;
   updatedAt: string;
+  paddleOccurredAt: string | null;
   lastEventId: string; // idempotency guard
 }
 
@@ -516,6 +517,7 @@ export function buildSubscriptionRecord(
     paddleCustomerId: customerIdFromEvent(event),
     priceId,
     updatedAt: normalizeIso(event.occurredAt) ?? new Date(now).toISOString(),
+    paddleOccurredAt: event.occurredAt,
     lastEventId: event.eventId,
   };
 }

@@ -515,6 +515,7 @@ describe("buildSubscriptionRecord", () => {
       paddleCustomerId: "ctm_123",
       priceId: PRO_PRICE,
       updatedAt: "2026-09-05T10:00:00.000Z", // from occurred_at
+      paddleOccurredAt: "2026-09-05T10:00:00.000Z",
       lastEventId: "evt_sub_1",
     });
   });

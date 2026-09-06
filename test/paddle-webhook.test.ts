@@ -327,6 +327,30 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("skips an older event whose Paddle timestamp differs below one millisecond", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+          lastEventId: "evt_new",
+          updatedAt: "2026-09-05T10:00:00.123Z",
+          paddleOccurredAt: "2026-09-05T10:00:00.123456Z",
+        },
+      }),
+    );
+    const res = await signedReq(
+      subBody({
+        eventId: "evt_old_subms",
+        occurredAt: "2026-09-05T10:00:00.123123Z",
+      }),
+    );
+    expect((await res.json()) as any).toEqual({ ok: true, stale: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
   it("applies a newer event over an older stored record", async () => {
     mocks.getUser.mockResolvedValue(
       userWith({
@@ -1081,15 +1105,67 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
-  it("ignores approved restore adjustments when no credit was previously reversed", async () => {
-    mocks.getUser.mockResolvedValue(
-      userWith({ subscription: { paddleCustomerId: "ctm_123" }, quota: {} }),
+  it("retains a restore adjustment that arrives before its reversal", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {
+        extraDrafts: 25,
+        extraDraftsWindowStart: monday,
+        overageCredits: [
+          {
+            eventId: "evt_txn",
+            transactionId: "txn_evt_txn",
+            extraDrafts: 25,
+            windowStart: monday,
+          },
+        ],
+      },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const restoreRes = await signedReq(
+      adjustmentBody({ id: "adj_restore", action: "chargeback_reverse" }, "evt_restore"),
     );
 
-    const res = await signedReq(adjustmentBody({ action: "chargeback_reverse" }));
+    expect((await restoreRes.json()) as any).toEqual({ ok: true, pending: true });
+    expect((storedMeta.quota as Record<string, unknown>).pendingOverageReversals).toEqual([
+      {
+        eventId: "evt_restore",
+        adjustmentId: "adj_restore",
+        transactionId: "txn_evt_txn",
+        action: "chargeback_reverse",
+        adjustmentType: null,
+        items: [],
+      },
+    ]);
 
-    expect((await res.json()) as any).toEqual({ ok: true, ignored: "not_overage_reversal" });
-    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    const chargebackRes = await signedReq(
+      adjustmentBody({ id: "adj_chargeback", action: "chargeback" }, "evt_chargeback"),
+    );
+
+    expect((await chargebackRes.json()) as any).toEqual({
+      ok: true,
+      revoked: true,
+      extraDrafts: 25,
+    });
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(25);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(quota.processedOverageAdjustmentIds).toEqual(["adj_restore", "adj_chargeback"]);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversalAdjustmentIds: ["adj_chargeback"],
+        restoredByAdjustmentIds: ["adj_restore"],
+      },
+    ]);
   });
 });
 

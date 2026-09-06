@@ -174,14 +174,14 @@ export async function recordPaddleOverageInClerk(
   let newCredits = body.credits.map((credit) =>
     storedCreditFromInput(body.eventId, body.transactionId, credit, windowStart),
   );
-  const remainingPending: StoredPendingOverageReversal[] = [];
-  for (const pendingReversal of pending) {
-    if (pendingReversal.transactionId !== body.transactionId) {
-      remainingPending.push(pendingReversal);
-      continue;
-    }
-    newCredits = applyAdjustmentToCredits(newCredits, pendingReversal, windowStart).credits;
-  }
+  const replayed = replayPendingAdjustments(
+    newCredits,
+    pending,
+    body.transactionId,
+    windowStart,
+    null,
+  );
+  newCredits = replayed.credits;
   const effectiveExtraDrafts = newCredits.reduce((sum, credit) => sum + availableDrafts(credit), 0);
 
   const quota = {
@@ -190,7 +190,7 @@ export async function recordPaddleOverageInClerk(
     extraDraftsWindowStart: windowStart,
     lastOverageEventId: body.eventId,
     processedOverageEventIds: boundedProcessedOverageEventIds([...processedIds, body.eventId]),
-    pendingOverageReversals: boundedPendingOverageReversals(remainingPending),
+    pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
     overageCredits: boundedOverageCredits([...overageCredits(existingQuota), ...newCredits]),
   };
 
@@ -239,39 +239,52 @@ export async function revokePaddleOverageInClerk(
     typeof existingQuota.extraDrafts === "number"
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
       : 0;
-  const applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
+  const pending = pendingOverageReversals(existingQuota);
+  let applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
 
   if (applied.extraDrafts === 0) {
-    if (isReversalAction(body.action)) {
-      const quota = {
-        ...existingQuota,
-        processedOverageAdjustmentIds: boundedProcessedOverageAdjustmentIds([
-          ...processedAdjustmentIds,
-          body.adjustmentId,
-        ]),
-        pendingOverageReversals: boundedPendingOverageReversals([
-          ...pendingOverageReversals(existingQuota),
-          pendingOverageReversalFromBody(body),
-        ]),
-      };
-      try {
-        await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
-      } catch (err) {
-        if (isClerkNotFoundError(err)) return { mapped: false };
-        throw new ApiError(
-          502,
-          "entitlement_write_failed",
-          "Could not record the purchase reversal.",
-        );
-      }
-      return { pending: true };
+    const quota = {
+      ...existingQuota,
+      processedOverageAdjustmentIds: boundedProcessedOverageAdjustmentIds([
+        ...processedAdjustmentIds,
+        body.adjustmentId,
+      ]),
+      pendingOverageReversals: boundedPendingOverageReversals([
+        ...pending,
+        pendingOverageReversalFromBody(body),
+      ]),
+    };
+    try {
+      await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
+    } catch (err) {
+      if (isClerkNotFoundError(err)) return { mapped: false };
+      throw new ApiError(
+        502,
+        "entitlement_write_failed",
+        "Could not record the purchase reversal.",
+      );
     }
-    return { ignored: "not_overage_reversal" };
+    return { pending: true };
   }
 
-  const nextExtras = isRestoreAction(body.action)
-    ? previousExtras + applied.currentWindowExtraDrafts
-    : Math.max(0, previousExtras - applied.currentWindowExtraDrafts);
+  let nextExtras = applyCurrentWindowAdjustment(
+    previousExtras,
+    body.action,
+    applied.currentWindowExtraDrafts,
+  );
+  const replayed = replayPendingAdjustments(
+    applied.credits,
+    pending,
+    body.transactionId,
+    currentWindowStart,
+    nextExtras,
+  );
+  applied = {
+    credits: replayed.credits,
+    extraDrafts: applied.extraDrafts,
+    currentWindowExtraDrafts: applied.currentWindowExtraDrafts,
+  };
+  nextExtras = replayed.currentExtras ?? nextExtras;
 
   const quota = {
     ...existingQuota,
@@ -280,6 +293,7 @@ export async function revokePaddleOverageInClerk(
       ...processedAdjustmentIds,
       body.adjustmentId,
     ]),
+    pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
     overageCredits: boundedOverageCredits(applied.credits),
   };
 
@@ -404,6 +418,53 @@ function applyAdjustmentToCredits(
   return { credits: adjustedCredits, extraDrafts, currentWindowExtraDrafts };
 }
 
+function replayPendingAdjustments(
+  credits: StoredOverageCredit[],
+  pending: StoredPendingOverageReversal[],
+  transactionId: string,
+  currentWindowStart: number | null,
+  currentExtras: number | null,
+): {
+  credits: StoredOverageCredit[];
+  remainingPending: StoredPendingOverageReversal[];
+  currentExtras: number | null;
+} {
+  let nextCredits = credits;
+  let nextCurrentExtras = currentExtras;
+  const remaining = pending.filter((item) => item.transactionId !== transactionId);
+  let candidates = pending.filter((item) => item.transactionId === transactionId);
+
+  let madeProgress = true;
+  while (candidates.length > 0 && madeProgress) {
+    madeProgress = false;
+    const deferred: StoredPendingOverageReversal[] = [];
+    for (const candidate of candidates) {
+      const applied = applyAdjustmentToCredits(nextCredits, candidate, currentWindowStart);
+      if (applied.extraDrafts <= 0) {
+        deferred.push(candidate);
+        continue;
+      }
+
+      nextCredits = applied.credits;
+      if (nextCurrentExtras !== null) {
+        nextCurrentExtras = applyCurrentWindowAdjustment(
+          nextCurrentExtras,
+          candidate.action,
+          applied.currentWindowExtraDrafts,
+        );
+      }
+      madeProgress = true;
+    }
+    candidates = deferred;
+  }
+
+  return {
+    credits: nextCredits,
+    remainingPending: [...remaining, ...candidates],
+    currentExtras: nextCurrentExtras,
+  };
+}
+
 function adjustmentDraftsForCredit(
   credit: StoredOverageCredit,
   adjustment: StoredPendingOverageReversal | PaddleOverageReversalBody,
@@ -482,12 +543,16 @@ function coversFullTransaction(
   return adjustment.adjustmentType === "full" || adjustment.items.length === 0;
 }
 
-function isReversalAction(action: OverageAdjustmentAction): boolean {
-  return action === "refund" || action === "chargeback" || action === "credit";
-}
-
 function isRestoreAction(action: OverageAdjustmentAction): boolean {
   return action === "chargeback_reverse" || action === "credit_reverse";
+}
+
+function applyCurrentWindowAdjustment(
+  currentExtras: number,
+  action: OverageAdjustmentAction,
+  amount: number,
+): number {
+  return isRestoreAction(action) ? currentExtras + amount : Math.max(0, currentExtras - amount);
 }
 
 function availableDrafts(credit: StoredOverageCredit): number {

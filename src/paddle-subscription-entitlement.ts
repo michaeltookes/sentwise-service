@@ -117,14 +117,10 @@ export async function recordPaddleSubscriptionInClerk(
     return { stale: true };
   }
 
-  const incomingUpdatedAt = body.event.occurredAt ? Date.parse(body.event.occurredAt) : body.now;
-  if (!isDifferentSubscription && existingSub && typeof existingSub.updatedAt === "string") {
-    const existingUpdatedAt = Date.parse(existingSub.updatedAt);
-    if (
-      !Number.isNaN(existingUpdatedAt) &&
-      !Number.isNaN(incomingUpdatedAt) &&
-      existingUpdatedAt > incomingUpdatedAt
-    ) {
+  const incomingOrder = subscriptionEventOrderKey(body.event.occurredAt, body.now);
+  if (!isDifferentSubscription && existingSub) {
+    const existingOrder = storedSubscriptionOrderKey(existingSub);
+    if (existingOrder !== null && incomingOrder !== null && existingOrder > incomingOrder) {
       return { stale: true };
     }
   }
@@ -200,6 +196,34 @@ function supersededSubscriptionHistory(
     -SUPERSEDED_SUBSCRIPTION_ID_LIMIT,
   );
   return unique.length > 0 ? { supersededPaddleSubscriptionIds: unique } : {};
+}
+
+function storedSubscriptionOrderKey(existingSub: Record<string, unknown>): bigint | null {
+  const exact =
+    typeof existingSub.paddleOccurredAt === "string" ? existingSub.paddleOccurredAt : null;
+  const fallback = typeof existingSub.updatedAt === "string" ? existingSub.updatedAt : null;
+  return subscriptionTimestampOrderKey(exact) ?? subscriptionTimestampOrderKey(fallback);
+}
+
+function subscriptionEventOrderKey(occurredAt: string | null, now: number): bigint | null {
+  return subscriptionTimestampOrderKey(occurredAt ?? new Date(now).toISOString());
+}
+
+function subscriptionTimestampOrderKey(value: string | null): bigint | null {
+  if (!value) return null;
+
+  const precise = value.match(
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/,
+  );
+  if (!precise) {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? null : BigInt(ms) * 1_000_000n;
+  }
+
+  const secondsMs = Date.parse(`${precise[1]}.000${precise[3]}`);
+  if (Number.isNaN(secondsMs)) return null;
+  const nanos = BigInt((precise[2] ?? "").slice(0, 9).padEnd(9, "0"));
+  return BigInt(Math.floor(secondsMs / 1000)) * 1_000_000_000n + nanos;
 }
 
 function positiveInt(value: unknown): number | null {
