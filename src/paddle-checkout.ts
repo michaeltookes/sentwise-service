@@ -9,6 +9,7 @@ import {
 } from "./paddle-account";
 import { createPaddleCheckoutTransaction, fetchPaddleTransactionSnapshot } from "./paddle-api";
 import {
+  quotaPeekPaddleSubscriptionCheckout,
   quotaRecordPaddleSubscriptionCheckout,
   quotaReleasePaddleSubscriptionCheckout,
   quotaReservePaddleSubscriptionCheckout,
@@ -117,6 +118,23 @@ export async function handlePaddleCheckout(
   }
 
   return checkoutResponse(transaction);
+}
+
+export async function hasOpenPaddleSubscriptionCheckout(
+  userId: string,
+  env: Env,
+): Promise<boolean> {
+  const reservation = await quotaPeekPaddleSubscriptionCheckout(env, userId, { now: Date.now() });
+  if (!reservation.pending) return false;
+  if (!reservation.reservationId || !reservation.transactionId) return true;
+
+  const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
+  if (!snapshot || snapshot.status === "canceled") {
+    await quotaReleasePaddleSubscriptionCheckout(env, userId, reservation.reservationId);
+    return false;
+  }
+
+  return true;
 }
 
 async function reserveSubscriptionCheckout(

@@ -22,6 +22,7 @@
 //   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, hasAdjustmentItems, items } -> revoke/restore overage credit
 //   POST /paddle-subscription-checkout-reserve { now, reservationId, priceId, quantity } -> reserve one pending subscription checkout
 //   POST /paddle-subscription-checkout-record { reservationId, transactionId, checkoutUrl, priceId, quantity } -> attach the Paddle transaction to a reservation
+//   POST /paddle-subscription-checkout-peek { now } -> read the pending subscription checkout without reserving
 //   POST /paddle-subscription-checkout-release { reservationId } -> release a matching pending subscription checkout after failed creation
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
@@ -211,6 +212,8 @@ export class AccountQuota {
         return this.handlePaddleSubscriptionCheckoutReserve(await request.json<unknown>());
       case "/paddle-subscription-checkout-record":
         return this.handlePaddleSubscriptionCheckoutRecord(await request.json<unknown>());
+      case "/paddle-subscription-checkout-peek":
+        return this.handlePaddleSubscriptionCheckoutPeek(await request.json<unknown>());
       case "/paddle-subscription-checkout-release":
         return this.handlePaddleSubscriptionCheckoutRelease(await request.json<unknown>());
       default:
@@ -630,6 +633,26 @@ export class AccountQuota {
         quantity,
       });
       return Response.json({ recorded: true });
+    });
+  }
+
+  private async handlePaddleSubscriptionCheckoutPeek(body: unknown): Promise<Response> {
+    const record = asRecord(body);
+    const now = normalizedNow(typeof record?.now === "number" ? record.now : undefined);
+
+    return this.storage.transaction(async (txn) => {
+      const reservation = parsePaddleSubscriptionCheckoutReservation(
+        await txn.get<unknown>(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY),
+      );
+      if (!reservation) return Response.json({ pending: false });
+      if (
+        !reservation.transactionId &&
+        (reservation.expiresAt === undefined || reservation.expiresAt <= now)
+      ) {
+        await txn.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
+        return Response.json({ pending: false });
+      }
+      return Response.json(pendingPaddleSubscriptionCheckoutReservation(reservation));
     });
   }
 

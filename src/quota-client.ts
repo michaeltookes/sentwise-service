@@ -77,6 +77,8 @@ export type PaddleSubscriptionCheckoutReservationResult =
       priceId?: string;
       quantity?: number;
     };
+export type PaddleSubscriptionCheckoutPeekResult =
+  { pending: false } | Extract<PaddleSubscriptionCheckoutReservationResult, { pending: true }>;
 export type PaddleSubscriptionCheckoutRecordResult = { recorded: true } | { stale: true };
 export type PaddleSubscriptionCheckoutReleaseResult = { released: true };
 
@@ -269,6 +271,20 @@ export function quotaRecordPaddleSubscriptionCheckout(
     env,
     userId,
     "/paddle-subscription-checkout-record",
+    body,
+  );
+}
+
+/** Read the current per-account subscription checkout slot without creating one. */
+export function quotaPeekPaddleSubscriptionCheckout(
+  env: Env,
+  userId: string,
+  body: { now: number },
+): Promise<PaddleSubscriptionCheckoutPeekResult> {
+  return call<PaddleSubscriptionCheckoutPeekResult>(
+    env,
+    userId,
+    "/paddle-subscription-checkout-peek",
     body,
   );
 }

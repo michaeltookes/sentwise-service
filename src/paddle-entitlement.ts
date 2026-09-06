@@ -192,16 +192,43 @@ export async function recordPaddleOverageInClerk(
       typeof existingQuota.extraDraftsWindowStart === "number"
         ? existingQuota.extraDraftsWindowStart
         : mondayStartUtc(body.now);
+    const currentExtras =
+      typeof existingQuota.extraDrafts === "number"
+        ? Math.max(0, Math.floor(existingQuota.extraDrafts))
+        : null;
+    const pending = pendingOverageReversals(existingQuota);
     const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
-    await saveOverageCredits(
-      ledgerStore,
-      mergeOverageCredits([
-        ...body.credits.map((credit) =>
-          storedCreditFromInput(body.eventId, body.transactionId, credit, repairWindowStart),
-        ),
-        ...existingCredits,
-      ]),
+    const repairedCredits = body.credits.map((credit) =>
+      storedCreditFromInput(body.eventId, body.transactionId, credit, repairWindowStart),
     );
+    const repairedLedger = mergeOverageCredits([
+      ...existingCredits,
+      ...creditsMissingFromLedger(repairedCredits, existingCredits),
+    ]);
+    const replayed = replayPendingAdjustments(
+      repairedLedger,
+      pending,
+      body.transactionId,
+      repairWindowStart,
+      currentExtras,
+    );
+    const pendingChanged = JSON.stringify(replayed.remainingPending) !== JSON.stringify(pending);
+    const currentExtrasChanged = replayed.currentExtras !== currentExtras;
+    if (pendingChanged || currentExtrasChanged) {
+      const quota = {
+        ...quotaWithoutOverageCredits(existingQuota),
+        ...(replayed.currentExtras !== null ? { extraDrafts: replayed.currentExtras } : {}),
+        pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
+        ...fallbackOverageCredits(ledgerStore, replayed.credits),
+      };
+      try {
+        await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
+      } catch (err) {
+        if (isClerkNotFoundError(err)) return { mapped: false };
+        throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase.");
+      }
+    }
+    await saveOverageCredits(ledgerStore, replayed.credits);
     return { idempotent: true };
   }
 

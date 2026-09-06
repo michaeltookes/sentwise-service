@@ -1458,6 +1458,64 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
+  it("replays pending adjustments when repairing a processed overage purchase credit", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {
+        extraDrafts: 25,
+        extraDraftsWindowStart: monday,
+        processedOverageEventIds: ["evt_txn"],
+        processedOverageAdjustmentIds: ["adj_123"],
+        pendingOverageReversals: [
+          {
+            eventId: "evt_adj",
+            adjustmentId: "adj_123",
+            transactionId: "txn_evt_txn",
+            action: "refund",
+            adjustmentType: null,
+            items: [],
+          },
+        ],
+      },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const res = await signedReq(
+      overageTxnBody(
+        {
+          id: "txn_evt_txn",
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 25 }],
+        },
+        "evt_txn",
+      ),
+      { overrideEnv: { ...env, EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE } },
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(0);
+    expect(quota.extraDraftsWindowStart).toBe(monday);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedDrafts: 25,
+        reversedByAdjustmentId: "adj_123",
+        reversalAdjustmentIds: ["adj_123"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
+      },
+    ]);
+  });
+
   it("prorates a partial adjustment for one transaction item", async () => {
     const monday = mondayStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(

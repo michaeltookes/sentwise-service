@@ -32,7 +32,7 @@ import {
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
 import { recordInterest } from "./interest";
-import { handlePaddleCheckout } from "./paddle-checkout";
+import { handlePaddleCheckout, hasOpenPaddleSubscriptionCheckout } from "./paddle-checkout";
 import { handlePaddleManageBilling } from "./paddle-management";
 import { handlePaddleWebhook } from "./paddle-webhook";
 
@@ -112,6 +112,13 @@ export default {
             409,
             "billing_subscription_active",
             "Cancel your Paddle subscription before deleting your account.",
+          );
+        }
+        if (account && (await hasOpenPaddleSubscriptionCheckout(userId, env))) {
+          throw new ApiError(
+            409,
+            "billing_checkout_pending",
+            "Complete or cancel your pending Paddle checkout before deleting your account.",
           );
         }
         const deletionAttemptId = crypto.randomUUID();

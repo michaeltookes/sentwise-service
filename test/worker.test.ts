@@ -297,6 +297,9 @@ function quotaNamespaceWithDeletionFailures(options: {
         attemptIds.clear();
         return Promise.resolve(Response.json({ deleted: true, cleanupPending: false }));
       }
+      if (path === "/paddle-subscription-checkout-peek") {
+        return Promise.resolve(Response.json({ pending: false }));
+      }
       if (path === "/peek") {
         if (deleted) {
           return Promise.resolve(
@@ -1476,6 +1479,14 @@ describe("POST /v1/paddle/checkout", () => {
 });
 
 describe("DELETE /v1/me (73 — account deletion)", () => {
+  const deletePaddleEnv: Env = {
+    ...env,
+    PADDLE_WEBHOOK_SECRET: PADDLE_SECRET,
+    PADDLE_API_KEY: "pdl_apikey",
+    PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+    EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE,
+  };
+
   beforeEach(() => {
     mocks.getUser.mockResolvedValue(activeTrial());
   });
@@ -1529,6 +1540,117 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       expect(await state.storage.get(ACCOUNT_DELETION_KEY)).toBeUndefined();
     });
+  });
+
+  it("rejects account deletion while a subscription checkout transaction is pending", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-pending-checkout" });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_pending_delete",
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_pending_delete" },
+              },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_pending_delete") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_pending_delete",
+                status: "draft",
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_pending_delete" },
+                items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const checkout = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      deletePaddleEnv,
+    );
+    expect(checkout.status).toBe(200);
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      deletePaddleEnv,
+    );
+
+    expect(del.status).toBe(409);
+    expect(((await del.json()) as any).error.type).toBe("billing_checkout_pending");
+    expect(fetchMock.mock.calls.filter(([input, init]) => isClerkDelete(input, init))).toHaveLength(
+      0,
+    );
+  });
+
+  it("releases a canceled subscription checkout before deleting the account", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-canceled-checkout" });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_canceled_delete",
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_canceled_delete" },
+              },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_canceled_delete") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ data: { id: "txn_canceled_delete", status: "canceled" } }),
+            {
+              status: 200,
+            },
+          ),
+        );
+      }
+      if (isClerkDelete(input, init)) return Promise.resolve(clerkDeleteResponse());
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const checkout = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      deletePaddleEnv,
+    );
+    expect(checkout.status).toBe(200);
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      deletePaddleEnv,
+    );
+
+    expect(del.status).toBe(204);
+    expect(fetchMock.mock.calls.filter(([input, init]) => isClerkDelete(input, init))).toHaveLength(
+      1,
+    );
   });
 
   it("is idempotent — a Clerk user already gone still returns 204", async () => {
