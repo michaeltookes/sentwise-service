@@ -36,6 +36,8 @@ vi.mock("../src/auth", () => ({
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 const OLD_BOUNDED_ARRAY_SIZE = 128;
+const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
+const OVERAGE_PRICE = "pri_overage";
 
 interface CheckResult {
   allowed: boolean;
@@ -45,6 +47,21 @@ interface CheckResult {
 interface WindowResult {
   window: WindowState;
 }
+type CheckoutReservationResult =
+  | { reserved: true; reservationId: string }
+  | {
+      pending: true;
+      reservationId?: string;
+      createdAt?: number;
+      expiresAt?: number;
+      transactionId?: string;
+      checkoutUrl?: string | null;
+      priceId?: string;
+      quantity?: number;
+      extraDrafts?: number;
+      customerId?: string;
+    };
+type CheckoutReservationRecordResult = { recorded: true } | { stale: true } | { unusable: true };
 interface ReserveResult {
   reserved: boolean;
   blockedByQuota: boolean;
@@ -69,6 +86,13 @@ interface TestStorage {
 
 const ACCOUNT_DELETION_KEY = "account_deletion";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
+const SUBSCRIPTION_CHECKOUT_REQUEST = { priceId: PRO_PRICE, quantity: 1 };
+const OVERAGE_CHECKOUT_REQUEST = {
+  priceId: OVERAGE_PRICE,
+  quantity: 2,
+  extraDrafts: 2,
+  customerId: "ctm_123",
+};
 
 beforeEach(() => {
   clerkMocks.verifyToken.mockReset();
@@ -103,6 +127,16 @@ async function callDOResponse(userId: string, op: string, body: unknown): Promis
 async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> {
   const res = await callDOResponse(userId, op, body);
   return res.json<T>();
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 async function pendingSettlements(stub: DurableObjectStub): Promise<PendingSettlementRecord[]> {
@@ -145,6 +179,24 @@ function fakeStorage(values: Map<string, unknown>): TestStorage {
     transaction: async <T>(closure: (txn: ReturnType<typeof fakeStorage>) => Promise<T>) =>
       closure(fakeStorage(values)),
   };
+}
+
+function delayedJsonRequest(op: string, body: unknown, release: Promise<void>): Request {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      await release;
+      controller.enqueue(encoder.encode(JSON.stringify(body)));
+      controller.close();
+    },
+  });
+  const init: RequestInit & { duplex: "half" } = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: stream,
+    duplex: "half",
+  };
+  return new Request(`https://account-quota.internal${op}`, init);
 }
 
 describe("AccountQuota Durable Object", () => {
@@ -444,6 +496,670 @@ describe("AccountQuota Durable Object", () => {
     expect(check.status).toBe(410);
     expect(((await check.json()) as any).error.type).toBe("account_deleted");
     expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
+  it("waits for in-flight entitlement writes before final deletion cleanup", async () => {
+    const uid = "delete-waits-entitlement";
+    const values = new Map<string, unknown>();
+    const storage = fakeStorage(values);
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockImplementation(async () => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+    });
+
+    const fetchQuota = <T>(op: string, body: unknown) =>
+      quota
+        .fetch(
+          new Request(`https://account-quota.internal${op}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+        )
+        .then((res) => res.json<T>());
+
+    const overage = fetchQuota<{ applied: boolean; extraDrafts: number }>("/paddle-overage", {
+      now: MON,
+      eventId: "evt_overage",
+      transactionId: "txn_overage",
+      customerId: "ctm_123",
+      extraDrafts: 1,
+      credits: [{ transactionItemId: null, extraDrafts: 1, amount: null }],
+    });
+    await writeStarted.promise;
+
+    let deletionFinished = false;
+    const finish = fetchQuota<{ deleted: boolean; cleanupPending: boolean }>("/finish-delete", {
+      now: MON + 1,
+      attemptId: "delete",
+    }).then((result) => {
+      deletionFinished = true;
+      return result;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(deletionFinished).toBe(false);
+
+    releaseWrite.resolve();
+    expect(await overage).toEqual({ applied: true, extraDrafts: 1 });
+    expect(await finish).toEqual({ deleted: true, cleanupPending: false });
+    expect([...values.keys()].sort()).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
+  it("waits for in-flight subscription entitlement writes before begin-delete returns", async () => {
+    const uid = "delete-begin-waits-subscription";
+    const storage = fakeStorage(new Map<string, unknown>());
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockImplementation(async () => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+    });
+
+    const fetchQuota = <T>(op: string, body: unknown) =>
+      quota
+        .fetch(
+          new Request(`https://account-quota.internal${op}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+        )
+        .then((res) => res.json<T>());
+
+    const subscription = fetchQuota<{ applied: true }>("/paddle-subscription", {
+      now: MON,
+      event: {
+        eventId: "evt_subscription",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:01.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: { clerkUserId: uid },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    await writeStarted.promise;
+
+    let beginFinished = false;
+    const begin = fetchQuota<{ deleting: true; alreadyDeleted: false }>("/begin-delete", {
+      now: MON + 1,
+      attemptId: "delete",
+    }).then((result) => {
+      beginFinished = true;
+      return result;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(beginFinished).toBe(false);
+
+    releaseWrite.resolve();
+    expect(await subscription).toEqual({ applied: true });
+    expect(await begin).toMatchObject({
+      deleting: true,
+      alreadyDeleted: false,
+      attemptId: "delete",
+    });
+  });
+
+  it("blocks a subscription entitlement that passed preflight before deletion began", async () => {
+    const uid = "delete-blocks-preflighted-subscription";
+    const values = new Map<string, unknown>();
+    const baseStorage = fakeStorage(values);
+    const preflightRead = deferred<void>();
+    let deletionReads = 0;
+    const storage: TestStorage = {
+      ...baseStorage,
+      get: <T = unknown>(key: string) => {
+        if (key === ACCOUNT_DELETION_KEY && deletionReads++ === 0) {
+          preflightRead.resolve();
+        }
+        return baseStorage.get<T>(key);
+      },
+    };
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockResolvedValue(undefined);
+    const bodyReleased = deferred<void>();
+
+    const subscription = quota.fetch(
+      delayedJsonRequest(
+        "/paddle-subscription",
+        {
+          now: MON,
+          event: {
+            eventId: "evt_subscription",
+            eventType: "subscription.updated",
+            occurredAt: "2024-01-01T00:00:01.000Z",
+            data: {
+              id: "sub_current",
+              status: "active",
+              customer_id: "ctm_123",
+              custom_data: { clerkUserId: uid },
+              items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+            },
+          },
+        },
+        bodyReleased.promise,
+      ),
+    );
+    await preflightRead.promise;
+
+    const begin = await quota
+      .fetch(
+        new Request("https://account-quota.internal/begin-delete", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ now: MON + 1, attemptId: "delete" }),
+        }),
+      )
+      .then((res) => res.json<{ deleting: true; alreadyDeleted: false }>());
+    expect(begin).toMatchObject({ deleting: true, alreadyDeleted: false });
+
+    bodyReleased.resolve();
+    const response = await subscription;
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(clerkMocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("waits for in-flight subscription entitlement writes before reserving checkout", async () => {
+    const uid = "checkout-reserve-waits-subscription";
+    const storage = fakeStorage(new Map<string, unknown>());
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockImplementation(async () => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+    });
+
+    const fetchQuota = <T>(op: string, body: unknown) =>
+      quota
+        .fetch(
+          new Request(`https://account-quota.internal${op}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+        )
+        .then((res) => res.json<T>());
+
+    const subscription = fetchQuota<{ applied: true }>("/paddle-subscription", {
+      now: MON,
+      event: {
+        eventId: "evt_subscription",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:01.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: { clerkUserId: uid },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    await writeStarted.promise;
+
+    let reserveFinished = false;
+    const reserve = fetchQuota<CheckoutReservationResult>("/paddle-subscription-checkout-reserve", {
+      now: MON + 1,
+      reservationId: "checkout-next",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    }).then((result) => {
+      reserveFinished = true;
+      return result;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(reserveFinished).toBe(false);
+
+    releaseWrite.resolve();
+    expect(await subscription).toEqual({ applied: true });
+    expect(await reserve).toEqual({ reserved: true, reservationId: "checkout-next" });
+  });
+
+  it("only clears checkout reservations for matching applied subscription events", async () => {
+    const uid = "checkout-reservation-correlated-webhook";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-current",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          supersededPaddleSubscriptionIds: ["sub_old"],
+          lastEventId: "evt_current",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+        },
+        quota: {},
+      },
+    });
+    const stale = await callDO<{ stale: true }>(uid, "/paddle-subscription", {
+      now: MON + 1,
+      event: {
+        eventId: "evt_old_retry",
+        eventType: "subscription.activated",
+        occurredAt: "2024-01-01T00:00:01.000Z",
+        data: {
+          id: "sub_old",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: {
+            clerkUserId: uid,
+            sentwiseCheckoutReservationId: "checkout-old",
+          },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    expect(stale).toEqual({ stale: true });
+
+    const stillPending = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 2,
+        reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(stillPending).toEqual({
+      pending: true,
+      reservationId: "checkout-current",
+      createdAt: MON,
+      expiresAt: MON + RESERVATION_TTL_MS,
+      checkoutUrl: null,
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          lastEventId: "evt_current",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+        },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockResolvedValue(undefined);
+    const applied = await callDO<{ applied: true }>(uid, "/paddle-subscription", {
+      now: MON + 3,
+      event: {
+        eventId: "evt_checkout",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:03.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: {
+            clerkUserId: uid,
+            sentwiseCheckoutReservationId: "checkout-current",
+          },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    expect(applied).toEqual({ applied: true });
+
+    const next = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 4,
+        reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(next).toEqual({ reserved: true, reservationId: "checkout-next" });
+  });
+
+  it("clears checkout reservations for matching idempotent subscription events", async () => {
+    const uid = "checkout-reservation-idempotent-webhook";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-current",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+    expect(
+      await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+        reservationId: "checkout-current",
+        transactionId: "txn_checkout",
+        checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_checkout",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      }),
+    ).toEqual({ recorded: true });
+
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          lastEventId: "evt_checkout",
+          updatedAt: "2024-01-01T00:00:03.000Z",
+        },
+        quota: {},
+      },
+    });
+
+    const idempotent = await callDO<{ idempotent: true }>(uid, "/paddle-subscription", {
+      now: MON + 1,
+      event: {
+        eventId: "evt_checkout",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:03.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: {
+            clerkUserId: uid,
+            sentwiseCheckoutReservationId: "checkout-current",
+          },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    expect(idempotent).toEqual({ idempotent: true });
+
+    const next = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 2,
+        reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(next).toEqual({ reserved: true, reservationId: "checkout-next" });
+  });
+
+  it("keeps a recorded subscription checkout reservation after the former timeout window", async () => {
+    const uid = "checkout-reservation-no-timeout";
+    const first = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON,
+        reservationId: "checkout-open",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(first).toEqual({ reserved: true, reservationId: "checkout-open" });
+    await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+      reservationId: "checkout-open",
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    const second = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 31 * 60_000,
+        reservationId: "checkout-later",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(second).toEqual({
+      pending: true,
+      reservationId: "checkout-open",
+      createdAt: MON,
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+  });
+
+  it("keeps an unrecorded subscription checkout reservation pending after the former timeout", async () => {
+    const uid = "checkout-reservation-creation-timeout";
+    const first = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON,
+        reservationId: "checkout-open",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(first).toEqual({ reserved: true, reservationId: "checkout-open" });
+
+    const second = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + RESERVATION_TTL_MS + 1,
+        reservationId: "checkout-later",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(second).toEqual({
+      pending: true,
+      reservationId: "checkout-open",
+      createdAt: MON,
+      expiresAt: MON + RESERVATION_TTL_MS,
+      checkoutUrl: null,
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+  });
+
+  it("rejects begin-delete while a subscription checkout reservation is pending", async () => {
+    const uid = "checkout-reservation-blocks-delete";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+    await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+      reservationId: "checkout-open",
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    const begin = await callDOResponse(uid, "/begin-delete", {
+      now: MON + 1,
+      attemptId: "delete-attempt",
+    });
+
+    expect(begin.status).toBe(409);
+    expect(((await begin.json()) as any).error.type).toBe("billing_checkout_pending");
+    const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
+    expect(peek.status).toBe(200);
+  });
+
+  it("rejects begin-delete while an overage checkout reservation is pending", async () => {
+    const uid = "overage-checkout-reservation-blocks-delete";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-overage-checkout-reserve", {
+      now: MON,
+      reservationId: "overage-open",
+      ...OVERAGE_CHECKOUT_REQUEST,
+    });
+    await callDO<CheckoutReservationRecordResult>(uid, "/paddle-overage-checkout-record", {
+      reservationId: "overage-open",
+      transactionId: "txn_overage_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_overage_open",
+      ...OVERAGE_CHECKOUT_REQUEST,
+    });
+
+    const begin = await callDOResponse(uid, "/begin-delete", {
+      now: MON + 1,
+      attemptId: "delete-attempt",
+    });
+
+    expect(begin.status).toBe(409);
+    expect(((await begin.json()) as any).error.type).toBe("billing_checkout_pending");
+  });
+
+  it("marks an unrecorded overage checkout unusable when the subscription is canceled", async () => {
+    const uid = "overage-checkout-unusable-on-cancel";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-overage-checkout-reserve", {
+      now: MON,
+      reservationId: "overage-open",
+      ...OVERAGE_CHECKOUT_REQUEST,
+    });
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          lastEventId: "evt_current",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+        },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockResolvedValue(undefined);
+
+    expect(
+      await callDO<{ applied: true }>(uid, "/paddle-subscription", {
+        now: MON + 1,
+        event: {
+          eventId: "evt_cancel",
+          eventType: "subscription.canceled",
+          occurredAt: "2024-01-01T00:00:01.000Z",
+          data: {
+            id: "sub_current",
+            status: "canceled",
+            customer_id: "ctm_123",
+            custom_data: { clerkUserId: uid },
+            items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+          },
+        },
+      }),
+    ).toEqual({ applied: true });
+
+    const record = await callDO<CheckoutReservationRecordResult>(
+      uid,
+      "/paddle-overage-checkout-record",
+      {
+        reservationId: "overage-open",
+        transactionId: "txn_overage_open",
+        checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_overage_open",
+        ...OVERAGE_CHECKOUT_REQUEST,
+      },
+    );
+    expect(record).toEqual({ unusable: true });
+  });
+
+  it("rejects begin-delete while an unrecorded checkout reservation is pending", async () => {
+    const uid = "checkout-reservation-expired-delete";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    const begin = await callDOResponse(uid, "/begin-delete", {
+      now: MON + RESERVATION_TTL_MS + 1,
+      attemptId: "delete-attempt",
+    });
+
+    expect(begin.status).toBe(409);
+    expect(((await begin.json()) as any).error.type).toBe("billing_checkout_pending");
+  });
+
+  it("returns pending subscription checkout transaction details for recovery", async () => {
+    const uid = "checkout-reservation-transaction";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+    expect(
+      await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+        reservationId: "checkout-open",
+        transactionId: "txn_open",
+        checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      }),
+    ).toEqual({ recorded: true });
+
+    const pending = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 1,
+        reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+
+    expect(pending).toEqual({
+      pending: true,
+      reservationId: "checkout-open",
+      createdAt: MON,
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
   });
 
   it("persists the deletion tombstone before scheduling cleanup retry", async () => {
@@ -1177,25 +1893,37 @@ describe("AccountQuota Durable Object", () => {
 
   it("settle markers dedupe older retries after many newer settlements", async () => {
     const uid = "do-settle-marker-dedupe";
-    let last!: WindowResult;
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
     const count = OLD_BOUNDED_ARRAY_SIZE + 5;
-    for (let i = 0; i < count; i++) {
-      const reserved = await callDO<ReserveResult>(uid, "/reserve", {
-        now: MON + i,
-        reservationId: `settled-${i}`,
-        estimatedTokens: 1,
-        limits: { ...hardLimits, weeklyDraftLimit: 1_000, weeklyTokenLimit: 1_000 },
-      });
-      last = await callDO<WindowResult>(uid, "/settle", {
-        now: MON + i,
-        reservationId: reserved.reservationId,
-        reservationWindowStart: reserved.window.windowStart,
-        estimatedTokens: reserved.estimatedTokens,
-        tokensDelta: 1,
-      });
-    }
-    expect(last.window.draftsUsed).toBe(count);
-    expect(last.window.tokensUsed).toBe(count);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("window", {
+        windowStart: MON,
+        resetsAt: MON + WEEK_MS,
+        draftsUsed: count,
+        tokensUsed: count,
+        tokensReserved: 0,
+        activeReservations: [],
+        settledReservationIds: [],
+      } satisfies WindowState);
+      for (let i = 0; i < count; i++) {
+        await state.storage.put(`settled_settlement:settled-${i}`, {
+          settledAt: MON + i,
+        });
+      }
+    });
+
+    const markerKeys = await runInDurableObject(stub, async (_instance, state) => {
+      return [
+        ...(
+          await state.storage.list({
+            prefix: "settled_settlement:",
+          })
+        ).keys(),
+      ];
+    });
+    expect(markerKeys).toHaveLength(count);
+    expect(markerKeys).toContain("settled_settlement:settled-0");
 
     const retryOldSettlement = await callDO<WindowResult>(uid, "/settle", {
       now: MON + 10_000,

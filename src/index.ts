@@ -2,8 +2,10 @@ import {
   authenticate,
   ClerkDeletionOutcomeUnknownError,
   deleteClerkUser,
+  hasPaidAccess,
   requireActiveTrial,
   resolveAccount,
+  resolveAccountIfExists,
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
@@ -30,6 +32,9 @@ import {
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
 import { recordInterest } from "./interest";
+import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
+import { handlePaddleManageBilling } from "./paddle-management";
+import { handlePaddleWebhook } from "./paddle-webhook";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -43,6 +48,9 @@ export { AccountQuota } from "./quota-do";
  *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
  *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
  *   POST   /v1/interest   -> record demand for a parked capability (item 75; first click wins)
+ *   POST   /v1/paddle/checkout -> authenticated server-side Paddle transaction checkout
+ *   GET    /v1/paddle/manage-billing -> JSON fresh Paddle billing-management URL
+ *   POST   /v1/paddle/webhook -> Paddle checkout/licensing events -> entitlement writes (56c; signature-auth, no bearer)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
@@ -64,6 +72,23 @@ export default {
         return await handleMargin(request, env);
       }
 
+      // 56c — Paddle checkout/licensing webhook. Authenticated by the Paddle
+      // signature (HMAC over ts:rawBody), NOT a Clerk bearer, so it runs before
+      // authenticate(). It writes entitlements into Clerk privateMetadata.
+      if (pathname === "/v1/paddle/webhook" && request.method === "POST") {
+        return await handlePaddleWebhook(request, env);
+      }
+
+      if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
+        const { userId } = await authenticate(request, env);
+        return await handlePaddleManageBilling(userId, request, env);
+      }
+
+      if (pathname === "/v1/paddle/checkout" && request.method === "POST") {
+        const { userId } = await authenticate(request, env);
+        return await handlePaddleCheckout(userId, request, env);
+      }
+
       if (pathname === "/v1/me" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
         const account = await resolveAccount(userId, env, { initialize: false });
@@ -81,8 +106,30 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "DELETE") {
         const { userId } = await authenticate(request, env);
+        const account = await resolveAccountIfExists(userId, env, { initialize: false });
+        if (account && hasPaidAccess(account.subscription)) {
+          throw activeSubscriptionDeletionError();
+        }
+        if (account && (await hasOpenPaddleCheckout(userId, env))) {
+          throw new ApiError(
+            409,
+            "billing_checkout_pending",
+            "Complete or cancel your pending Paddle checkout before deleting your account.",
+          );
+        }
         const deletionAttemptId = crypto.randomUUID();
         await quotaBeginAccountDeletion(env, userId, deletionAttemptId);
+        if (account) {
+          try {
+            const latestAccount = await resolveAccountIfExists(userId, env, { initialize: false });
+            if (latestAccount && hasPaidAccess(latestAccount.subscription)) {
+              throw activeSubscriptionDeletionError();
+            }
+          } catch (err) {
+            await cancelAccountDeletionBarrier(env, userId, deletionAttemptId, ctx);
+            throw err;
+          }
+        }
         try {
           await deleteClerkUser(userId, env);
         } catch (err) {
@@ -215,6 +262,9 @@ export default {
         pathname === "/v1/draft" ||
         pathname === "/v1/me" ||
         pathname === "/v1/interest" ||
+        pathname === "/v1/paddle/checkout" ||
+        pathname === "/v1/paddle/manage-billing" ||
+        pathname === "/v1/paddle/webhook" ||
         pathname === "/healthz" ||
         (pathname === "/admin/margin" && !!env.ADMIN_TOKEN)
       ) {
@@ -436,4 +486,12 @@ function isAccountDeletionError(err: unknown): err is ApiError {
 
 function isAccountDeletionInProgressError(err: unknown): err is ApiError {
   return err instanceof ApiError && err.type === "account_deletion_in_progress";
+}
+
+function activeSubscriptionDeletionError(): ApiError {
+  return new ApiError(
+    409,
+    "billing_subscription_active",
+    "Cancel your Paddle subscription before deleting your account.",
+  );
 }

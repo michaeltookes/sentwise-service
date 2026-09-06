@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Privacy guard (backlog 56a/56b): fail if any console.* call appears anywhere in
-# src/ — it could carry user content (request bodies, messages, drafts, prompts).
+# Privacy guard (backlog 56a/56b/56c): fail if any console.* call appears anywhere
+# in src/ — it could carry user content (request bodies, messages, drafts, prompts).
 # This backstops the "nothing logged" claim; run in CI. The check is a recursive
 # scan of the whole src/ tree, so it automatically covers the 56b metering
-# modules (metering.ts, quota-do.ts, quota-client.ts, analytics.ts, admin.ts) —
-# none of which may log content either (they handle only counters + hashed ids).
+# modules (metering.ts, quota-do.ts, quota-client.ts, analytics.ts, admin.ts) and
+# the 56c checkout/licensing modules (paddle.ts, paddle-webhook.ts) — none of
+# which may log content either (they handle only counters, ids, and billing
+# metadata; the webhook must never log the raw request body).
 set -euo pipefail
 
 # Any console.* usage at all in src/ is suspect — we log nothing by policy.

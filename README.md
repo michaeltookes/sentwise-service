@@ -3,8 +3,9 @@
 The managed-inference service for **[Sentwise](https://github.com/michaeltookes/sentwise)** — a
 stateless [Cloudflare Worker](https://workers.cloudflare.com/) that lets a signed-in Sentwise user
 draft email through the model provider **without ever holding an API key**. It is the server half of
-backlog items **56a** (account + proxy), **56b** (metering + limits), and the account-management
-half of **73** (subscription display + account deletion).
+backlog items **56a** (account + proxy), **56b** (metering + limits), **56c** (checkout + licensing —
+the Paddle webhook + entitlement writes), and the account-management half of **73** (subscription
+display + account deletion).
 
 **Deployed:** `https://sentwise-inference.sentwise-service.workers.dev`
 
@@ -24,7 +25,9 @@ reply to) to this Worker with a short-lived Clerk session token. The Worker:
 4. Returns the drafted text and token usage.
 
 Metering, weekly caps, and rate-limiting ship in **56b** (see [Metering](#metering-56b) below).
-Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)` in the source.
+Checkout / licensing (**56c**) is handled by the Paddle webhook that writes the account's entitlement
+(see [Checkout & licensing](#checkout--licensing-56c)); an active paid subscription grants drafting
+access past the 14-day trial.
 
 ## Privacy design — content-stateless by construction
 
@@ -37,8 +40,8 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
   `console.*` call appears in `src/`.
 - **The only persisted state is counters, timestamps, random reservation IDs, and one hash — never
   content:**
-  1. `trialStartedAt` (and, once 56c ships, `subscription`) in the user's Clerk `privateMetadata`
-     (trial enforcement, 56a; subscription display, 73).
+  1. `trialStartedAt` and `subscription` in the user's Clerk `privateMetadata` (trial enforcement,
+     56a; subscription/licensing written by the Paddle webhook, 56c; subscription display, 73).
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
      weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
      reservation IDs keyed by Clerk userId. No prompts, no drafts, no emails.
@@ -65,13 +68,16 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, /admin/margin
-  -> src/auth.ts          verify Clerk JWT, check/init the trial + read quota/subscription; delete user
-  -> src/subscription.ts  derive the account's subscription (trial placeholder until 56c) — pure
-  -> src/anthropic.ts     forward to Anthropic, map the response — no logging, no storage
-  -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only; deletion tombstone
-  -> src/analytics.ts     one aggregate hashed metric per draft — no content
-  -> src/interest.ts      record demand for a parked capability — a topic key + timestamp, no content
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin
+  -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
+  -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
+  -> src/anthropic.ts       forward to Anthropic, map the response — no logging, no storage
+  -> src/quota-do.ts        per-account usage counters + serialized metadata writes (Durable Object)
+  -> src/analytics.ts       one aggregate hashed metric per draft — no content
+  -> src/interest.ts        record demand for a parked capability — a topic key + timestamp, no content
+  -> src/paddle.ts          verify Paddle signature + map billing event -> entitlement (56c) — pure
+  -> src/paddle-management.ts  fresh Paddle billing-management redirects — no URL persistence
+  -> src/paddle-webhook.ts  dispatch signed events to serialized entitlement writes (56c) — no body logging
 ```
 
 ## API
@@ -115,13 +121,14 @@ Viewing your account never starts the trial — the trial begins on your first r
 
 The account's plan for the Settings account pane:
 
-- `plan`: `"trial" | "individual" | "team" | "none"`
+- `plan`: `"trial" | "starter" | "pro" | "unlimited" | "team" | "none"`
 - `status`: `"trialing" | "active" | "past_due" | "canceled" | "lapsed"`
 - `renewsAt`: ISO 8601 timestamp, or `null`
-- `manageBillingUrl`: an `https` URL to the billing portal, or `null`
+- `manageBillingUrl`: compatibility field; always `null` because Paddle billing portal URLs are
+  temporary and fetched on demand
 
-**Placeholder until 56c.** Checkout / licensing (56c) is not built yet, so today the field is
-**derived from the trial** on the same Clerk `getUser` as `trial`/`quota` (no extra round-trip):
+**Trial fallback.** Before checkout, the field is **derived from the trial** on the same Clerk
+`getUser` as `trial`/`quota` (no extra round-trip):
 
 | Trial state     | `plan`  | `status`   | `renewsAt`     | `manageBillingUrl` |
 | --------------- | ------- | ---------- | -------------- | ------------------ |
@@ -129,17 +136,31 @@ The account's plan for the Settings account pane:
 | Active          | `trial` | `trialing` | trial `endsAt` | `null`             |
 | Expired         | `trial` | `lapsed`   | trial `endsAt` | `null`             |
 
-**Override.** When 56c ships it will write a `subscription` record into the Clerk user's
-`privateMetadata`, shaped `{ plan, status, renewsAt?, manageBillingUrl? }`. If a **valid** record is
-present it is used verbatim (and wins over the trial derivation). Validation is strict: `plan` and
-`status` must each match the enums above or the whole record is ignored (the trial fallback applies);
-a malformed `renewsAt` or a non-`https` `manageBillingUrl` is dropped to `null` rather than poisoning
-an otherwise-valid record.
+**Override (written by 56c).** After checkout, the Paddle webhook (see
+[Checkout & licensing](#checkout--licensing-56c)) writes a `subscription` record into the Clerk
+user's `privateMetadata`. When a **valid** record is present it wins over the trial derivation.
+Validation is strict: `plan` and `status` must each match the enums above or the whole record is
+ignored (the trial fallback applies); a malformed `renewsAt` is dropped to `null` rather than
+poisoning an otherwise-valid record. Any legacy stored `manageBillingUrl` is ignored. The stored
+record carries extra reconciliation/idempotency fields (`paddleSubscriptionId`, `paddleCustomerId`,
+`priceId`, `updatedAt`, `lastEventId`) that this endpoint reads past — only the public wire fields
+above are returned.
+
+### `GET /v1/paddle/manage-billing`
+
+Requires `Authorization: Bearer <clerk-session-token>`. Reads the account's stored
+`paddleSubscriptionId`, fetches a fresh Paddle `management_urls` link, and returns **`200`** with
+`{ "managementUrl": "<fresh Paddle URL>" }` and `Cache-Control: no-store`. The app should navigate
+the browser to the returned URL.
+
+Returns **`404 billing_subscription_not_found`** when the account has no Paddle subscription id, and
+**`502 billing_portal_unavailable`** when Paddle does not return a valid temporary management URL.
 
 ### `DELETE /v1/me` (item 73)
 
 Requires `Authorization: Bearer <clerk-session-token>`. **Deletes the account.** Returns **`204`** with
-no body on success.
+no body on success. Accounts with an active, trialing, or past-due paid Paddle subscription must cancel
+the subscription first; deletion returns **`409 billing_subscription_active`** until then.
 
 What is deleted:
 
@@ -217,7 +238,7 @@ See [Metering](#metering-56b) for the metering-specific error codes (`rate_limit
 
 Full-featured, enforced server-side. On the first authenticated `/v1/draft` call, the Worker stamps
 `trialStartedAt` into the user's Clerk `privateMetadata`. Fourteen days later, `/v1/draft` returns
-`402 trial_expired`. Paid state arrives with checkout in **56c**.
+`402 trial_expired`. Paid state arrives via checkout (see [Checkout & licensing](#checkout--licensing-56c)).
 
 ## Metering (56b)
 
@@ -265,10 +286,12 @@ capacity is reclaimed before the weekly reset.
 | `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).                      |
 
 **Per-account overrides.** `privateMetadata.quota` on the Clerk user —
-`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart? }` — overrides the
-vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart` equals the current
-weekly window's Monday 00:00 UTC epoch-ms `windowStart`; stale or unscoped credits are ignored. These
-are read on the same `getUser` as the trial, so metering adds no extra Clerk round-trip.
+`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart?, processedOverageEventIds? }`
+— overrides the vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart`
+equals the current weekly window's Monday 00:00 UTC epoch-ms `windowStart`; stale or unscoped credits
+are ignored. `weeklyDraftLimit: null` is treated as absent and is used by the Paddle webhook to clear
+Clerk's deep-merged paid override. These are read on the same `getUser` as the trial, so metering
+adds no extra Clerk round-trip.
 
 **Privacy.** The Durable Object stores only integers and timestamps; it never sees prompt or draft
 content. See the [Privacy design](#privacy-design--content-stateless-by-construction) section.
@@ -313,6 +336,141 @@ degrades to **503 `analytics_unavailable`**. Reads aggregate hashed metrics only
 The per-model cost table lives in `src/config.ts` (`MODEL_COSTS`, Sonnet 4.6 as the default row);
 edit it there when pricing changes or a new model is added.
 
+## Checkout & licensing (56c)
+
+Checkout and licensing run on **Paddle**. The app asks this Worker to create a Paddle transaction for
+the authenticated account, then opens that transaction in Paddle.js; Paddle then calls this Worker's
+webhook, which turns billing events into the account's entitlement — the `subscription` record read by
+[`GET /v1/me`](#subscription-item-73) and the per-tier weekly draft limit enforced by
+[Metering](#metering-56b). The app never mints a license itself; **Paddle → this webhook → Clerk
+`privateMetadata`** is the only source of truth.
+
+### `POST /v1/paddle/checkout`
+
+**Clerk bearer required.** The request body is `{ "priceId": "pri_...", "quantity": 1 }`.
+`priceId` must be one of the configured subscription tier prices or `EXTRA_DRAFTS_PRICE_ID`.
+Subscription quantities must be `1`; omitted quantities default to `1`, explicitly supplied
+quantities must be positive integers, and overage quantities are capped. Subscription checkout is
+rejected while the account already has an active/trialing/past-due Paddle subscription, so tier
+changes must go through Paddle subscription management instead of creating a second recurring
+subscription. Subscription checkout creation is also serialized per account with a short-lived
+Durable Object reservation id included in Paddle `custom_data`; a second request is rejected while a
+checkout transaction is pending, a retry resumes only a matching requested price/quantity, and only
+the matching applied subscription webhook clears the lock.
+Overage checkout requires an active Paddle subscription with a stored
+`paddleCustomerId`; the Worker passes that `customer_id` to Paddle so the later webhook credits the
+same bound customer.
+
+The Worker creates `POST /transactions` in Paddle with server-minted `custom_data` and returns:
+
+```json
+{ "transactionId": "txn_...", "checkoutUrl": "https://..." }
+```
+
+The app should open the returned `transactionId` with Paddle.js. `checkoutUrl` is present when Paddle
+returns its hosted payment link.
+
+### `POST /v1/paddle/webhook`
+
+**No Clerk bearer.** This endpoint is authenticated by the **Paddle signature**, not a session token,
+so it runs before the normal auth. Verification (per Paddle's "Verify webhook signatures"):
+
+- The `Paddle-Signature` header is `ts=<unix-seconds>;h1=<hex>`. The signed payload is
+  `"<ts>:<rawBody>"` using the **exact raw request body** (no re-serialization).
+- `h1` is an **HMAC-SHA256** hex digest under `PADDLE_WEBHOOK_SECRET`, compared **constant-time**.
+  Multiple `h1` values are accepted when any one matches, so Paddle signing-secret rotation does not
+  reject legitimate webhooks.
+- The `ts` must be within `PADDLE_WEBHOOK_TOLERANCE_SEC` of now (default **300 s**; Paddle's own SDK
+  default is a very tight 5 s — idempotency, not the clock, is our real replay defense).
+- Any failure → **`401 invalid_signature`**, and the event is **never processed**.
+
+**Events handled** (others are acknowledged `200` and ignored):
+
+| Event                                                                                                   | Write                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids). Active/trialing/past-due statuses set `privateMetadata.quota.weeklyDraftLimit`; canceled/paused statuses write `weeklyDraftLimit: null` to clear Clerk's deep-merged paid override |
+| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`                                                                                                   |
+| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion                                                                                                         |
+
+**Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
+is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or
+when the Paddle `customer_id` already matches the account's stored `paddleCustomerId`. Events without
+custom data first load the original transaction (`GET /transactions/{id}`) and validate its signed
+checkout binding when Paddle provides a `transaction_id`; otherwise, they may use Paddle
+customer-email lookup (`GET /customers/{id}` → `getUserList`) only to locate a previously-bound
+account. Email equality alone never creates a first-time binding. If no account matches, or if the
+candidate user does not match the Paddle customer, the event is
+acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help. Transient Paddle/Clerk lookup
+failures and missing Paddle API credentials return `502` so Paddle retries.
+
+**Price → tier.** `data.items[].price.id` maps to a tier via `PRICE_TO_PLAN` in `src/config.ts`
+(SANDBOX ids today):
+
+| Price id                         | Tier        | Weekly draft limit (var)      |
+| -------------------------------- | ----------- | ----------------------------- |
+| `pri_01m1syd7nfarp8pggpcnvjbgyy` | `starter`   | `STARTER_DRAFT_LIMIT` (30)    |
+| `pri_01m1symsxarc4c3jdea0ntb09w` | `pro`       | `PRO_DRAFT_LIMIT` (120)       |
+| `pri_01m1syrdg05f49kz705gbzn6tz` | `unlimited` | `UNLIMITED_DRAFT_LIMIT` (1e5) |
+
+The Durable Object also stores the selected paid plan on the pending subscription checkout
+reservation, so a matching signed subscription webhook can still apply the purchased tier if a
+catalog migration removes or replaces the old price id before Paddle delivers the event.
+
+The limits are **placeholders**, tunable per-deploy without a release. ⚠️ **Open owner decision:** the
+landing page says "per **month**", but 56b enforces a **weekly** window — the window unit and the real
+per-tier numbers are unresolved. The plumbing is deliberately window-agnostic (it writes whatever the
+var holds and stamps overage to the 56b Monday window); it does not encode a final answer.
+
+**Billing management.** Paddle portal URLs are temporary authenticated links, so the webhook never
+persists them. The app should open `GET /v1/paddle/manage-billing` for payment-method changes or
+`GET /v1/paddle/manage-billing?action=cancel` for cancellation, which fetches
+`GET /subscriptions/{id}` → `data.management_urls` on demand and returns the requested fresh URL in
+JSON for the app to navigate to.
+
+**Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
+`EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
+the Paddle transaction id and, when Paddle provides it, the transaction item id and item total.
+Approved Paddle refund/chargeback/credit adjustments mark matching credits as reversed and subtract
+any still-current weekly extras; partial adjustments are prorated from the cumulative adjusted amount
+before calculating each incremental draft change. Approved
+chargeback/credit reversals restore only drafts revoked by the corresponding chargeback/credit
+action. Tax/proration-only adjustment items are ignored rather than treated as whole-overage
+reversals. If an approved reversal or restore arrives before the matching prerequisite event, it is
+retained in `pendingOverageReversals` and applied when the prerequisite is later delivered. The
+authoritative refundable-credit ledger is stored in the account Durable Object, not Clerk metadata,
+so later Paddle adjustments can still find older overage transactions without growing
+`privateMetadata.quota` indefinitely. Per-credit reversal/restore adjustment IDs remain in that
+ledger for the refundable lifetime of the credit, so an old adjustment replay is still idempotent
+after the small processed-id ring buffer has rotated.
+
+**Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
+Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
+updated. Subscription writes are skipped when the incoming `event_id` equals the stored `lastEventId`,
+when a strictly older `occurred_at` would clobber a newer stored record, or when a different
+subscription id is already known as superseded. A different subscription may replace the stored one
+only with a signed checkout binding and a live Paddle subscription lookup confirming the event's
+current Paddle status for the same customer. Overage writes are skipped when the `event_id` is in the
+bounded `processedOverageEventIds` list (the legacy
+`lastOverageEventId` is still honored). Approved adjustment reversals/restores are skipped when the
+`adjustment_id` is in the bounded `processedOverageAdjustmentIds` list; unmatched approved
+reversals/restores are retained in a bounded `pendingOverageReversals` list by transaction id. A
+transient Clerk failure returns **`502`** so Paddle retries.
+
+**Privacy.** This endpoint handles only plan/status/timestamps and price/subscription/customer ids
+(plus a customer email used solely to locate a previously-bound account). It never sees prompt or
+draft content and **never logs the raw webhook body** (enforced by
+`scripts/check-no-body-logging.sh`).
+
+**Going live (owner, after the app half lands).** Nothing is live until the owner: (1) sets the two
+Paddle secrets (below); (2) in the Paddle dashboard creates a **notification destination** pointing at
+`https://sentwise-inference.sentwise-service.workers.dev/v1/paddle/webhook`, subscribed to
+`subscription.activated`, `subscription.created`, `subscription.updated`, `subscription.canceled`,
+`subscription.past_due`, `subscription.paused`, `subscription.resumed`, `transaction.completed`,
+`adjustment.created`, and `adjustment.updated`, and copies its signing secret into
+`PADDLE_WEBHOOK_SECRET`; (3) when moving off sandbox, flips `PADDLE_API_BASE` to
+`https://api.paddle.com` and swaps the sandbox price ids in `PRICE_TO_PLAN` for live ids. End-to-end
+verification (a real Paddle test event → a real entitlement write) happens then.
+
 ## Development
 
 Requires Node ≥ 22 (`.nvmrc`) and a Cloudflare account (Wrangler 4).
@@ -337,6 +495,20 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
 - `CF_ANALYTICS_API_TOKEN` — **56b, optional.** A Cloudflare API token with **Account Analytics
   read** permission, used by `/admin/margin` to query the Analytics Engine SQL API. When unset,
   `/admin/margin` returns `503 analytics_unavailable`.
+- `PADDLE_WEBHOOK_SECRET` — **56c.** The Paddle notification-destination signing secret
+  (`pdl_ntfset_…`) that verifies `POST /v1/paddle/webhook`. It also signs the checkout account
+  binding unless `PADDLE_CHECKOUT_BINDING_SECRET` is set. When unset, every webhook is rejected
+  `401` and `POST /v1/paddle/checkout` is unavailable.
+- `PADDLE_CHECKOUT_BINDING_SECRET` / `PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET` — **56c, optional.**
+  Stable HMAC secrets for server-minted checkout bindings; the previous secret is accepted during
+  rotations so in-flight Paddle transactions can still map their first webhook.
+- `PADDLE_WEBHOOK_MAX_BODY_BYTES` — **56c, optional.** Max Paddle webhook payload size before
+  signature verification; defaults to 128 KiB.
+- `PADDLE_API_KEY` — **56c.** A Paddle API key (`transaction.write`, `transaction.read`,
+  `subscription.read`, and `customer.read`) used by `POST /v1/paddle/checkout`,
+  `GET /v1/paddle/manage-billing`, cross-subscription replacement checks, and webhook fallback
+  mapping. Missing credentials make those operations fail closed with `5xx` instead of acknowledging
+  paid events.
 
 Push them to the Worker with (values are read from the file, never printed):
 
@@ -346,7 +518,16 @@ grep '^CLERK_SECRET_KEY='  ~/.config/sentwise-service/.env | cut -d= -f2- | npx 
 # 56b margin dashboard (optional):
 grep '^ADMIN_TOKEN='            ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put ADMIN_TOKEN
 grep '^CF_ANALYTICS_API_TOKEN=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put CF_ANALYTICS_API_TOKEN
+# 56c checkout + licensing:
+grep '^PADDLE_WEBHOOK_SECRET=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_WEBHOOK_SECRET
+grep '^PADDLE_API_KEY='        ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_API_KEY
 ```
+
+> ⚠️ **Empty-secret gotcha.** `wrangler secret put` reads the value from stdin. The piped form above
+> works, **but** if the `grep` matches nothing (the key is missing from `.env`) it pipes an empty
+> string and uploads an **empty secret silently** — which then fails webhook verification with `401`.
+> Confirm each `.env` line exists first, or run `npx wrangler secret put <NAME>` interactively in a
+> real terminal and paste the value. Never run it under a non-interactive/piped shell with no data.
 
 ### Metering storage (56b)
 

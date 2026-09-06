@@ -80,12 +80,27 @@ export async function resolveAccount(
   env: Env,
   options: { initialize: boolean },
 ): Promise<AccountInfo> {
+  const account = await resolveAccountIfExists(userId, env, options);
+  if (account) return account;
+  throw new ApiError(
+    502,
+    "account_lookup_failed",
+    "Could not load your account. Please try again.",
+  );
+}
+
+export async function resolveAccountIfExists(
+  userId: string,
+  env: Env,
+  options: { initialize: boolean },
+): Promise<AccountInfo | null> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
   let user;
   try {
     user = await clerk.users.getUser(userId);
-  } catch {
+  } catch (err) {
+    if (isClerkNotFoundError(err)) return null;
     throw new ApiError(
       502,
       "account_lookup_failed",
@@ -93,7 +108,16 @@ export async function resolveAccount(
     );
   }
 
-  const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
+  return accountInfoFromUser(userId, clerk, user, options);
+}
+
+async function accountInfoFromUser(
+  userId: string,
+  clerk: ClerkClientLike,
+  user: ClerkUserLike,
+  options: { initialize: boolean },
+): Promise<AccountInfo> {
+  const meta = user.privateMetadata ?? {};
   let startedAt = typeof meta[TRIAL_METADATA_KEY] === "string" ? meta[TRIAL_METADATA_KEY] : null;
   // A corrupt/unparseable timestamp must not permanently expire the trial —
   // treat it as not-started so it re-initializes below.
@@ -150,16 +174,59 @@ export async function clerkUserExists(userId: string, env: Env): Promise<boolean
   }
 }
 
-/** Enforce the trial: throw 402 when expired. Returns the resolved account. */
+/** Clerk's SDK versions expose 404s with slightly different error shapes. */
+export function isClerkNotFoundError(err: unknown): boolean {
+  const record = isRecord(err) ? err : null;
+  if (!record) return false;
+
+  const status = record.status ?? record.statusCode;
+  if (status === 404) return true;
+
+  const errors = record.errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some((item) => {
+    const error = isRecord(item) ? item : null;
+    const code = error?.code;
+    return code === "resource_not_found" || code === "not_found";
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * Gate drafting access. Returns the resolved account when access is granted, else
+ * throws 402. Access is granted by an active trial OR (56c) an active paid
+ * subscription written by the Paddle webhook — so a paying customer is not blocked
+ * when the 14-day trial clock runs out.
+ */
 export async function requireActiveTrial(userId: string, env: Env): Promise<AccountInfo> {
   const account = await resolveAccount(userId, env, { initialize: true });
-  if (!account.trial.active) {
-    // TODO(56c): once checkout ships, allow paid accounts past this gate.
-    throw new ApiError(402, "trial_expired", "Your 14-day free trial has ended.", {
-      trialEndsAt: account.trial.endsAt,
-    });
+  if (account.trial.active || hasPaidAccess(account.subscription)) {
+    return account;
   }
-  return account;
+  throw new ApiError(402, "trial_expired", "Your 14-day free trial has ended.", {
+    trialEndsAt: account.trial.endsAt,
+  });
+}
+
+/**
+ * Whether a resolved subscription grants drafting access (56c). A paid tier is
+ * good while `active`/`trialing`/`past_due` (past_due is a short billing grace);
+ * `canceled`/`lapsed`, and the pre-purchase `trial`/`none` plans, are not.
+ */
+export function hasPaidAccess(subscription: Subscription): boolean {
+  const paidPlan =
+    subscription.plan === "starter" ||
+    subscription.plan === "pro" ||
+    subscription.plan === "unlimited" ||
+    subscription.plan === "team";
+  const activeStatus =
+    subscription.status === "active" ||
+    subscription.status === "trialing" ||
+    subscription.status === "past_due";
+  return paidPlan && activeStatus;
 }
 
 /**
@@ -199,8 +266,18 @@ export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
 }
 
 interface ClerkUserLike {
+  privateMetadata?: Record<string, unknown> | null;
   primaryEmailAddressId?: string | null;
   emailAddresses?: Array<{ id: string; emailAddress: string }>;
+}
+
+interface ClerkClientLike {
+  users: {
+    updateUserMetadata(
+      userId: string,
+      params: { privateMetadata: Record<string, unknown> },
+    ): Promise<unknown>;
+  };
 }
 
 function primaryEmail(user: ClerkUserLike): string | null {

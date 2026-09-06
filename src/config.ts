@@ -44,6 +44,30 @@ export interface Env {
   CF_ACCOUNT_ID?: string;
   ADMIN_TOKEN?: string; // guards GET /admin/margin; endpoint 404s when unset
   CF_ANALYTICS_API_TOKEN?: string; // Cloudflare API token for the Analytics Engine SQL API
+
+  // 56c — checkout + licensing (Paddle). The two Paddle credentials are SECRETS
+  // (set via `wrangler secret put`, never committed); the rest are public vars.
+  PADDLE_WEBHOOK_SECRET?: string; // Paddle notification-destination secret (pdl_ntfset_…); verifies webhooks + signs checkout binding
+  PADDLE_API_KEY?: string; // Paddle API key (pdl_…); creates checkouts, verifies mapping, reads management/current subscription state
+  PADDLE_API_BASE?: string; // Paddle REST base; defaults to the SANDBOX base (PADDLE_SANDBOX_API_BASE)
+  PADDLE_WEBHOOK_TOLERANCE_SEC?: string | number; // signature freshness window (seconds); default DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC
+  PADDLE_WEBHOOK_MAX_BODY_BYTES?: string | number; // max signed webhook payload bytes; default DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES
+  PADDLE_CHECKOUT_BINDING_SECRET?: string; // stable HMAC secret for server-minted checkout binding; defaults to PADDLE_WEBHOOK_SECRET
+  PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // previous checkout-binding secret accepted during rotations
+
+  // 56c — per-tier weekly draft limits. Server-side placeholders (measure-first,
+  // like the 56b limits): tunable per-deploy without shipping a new binary, and
+  // written per-account into Clerk `privateMetadata.quota.weeklyDraftLimit` by the
+  // webhook so 56b enforcement uses them.
+  STARTER_DRAFT_LIMIT?: string | number;
+  PRO_DRAFT_LIMIT?: string | number;
+  UNLIMITED_DRAFT_LIMIT?: string | number;
+
+  // 56c — overage ("buy more drafts"). The one-time price id that credits extra
+  // drafts, and how many drafts one unit buys. When unset, overage purchases are
+  // ignored; buyer-supplied custom_data is never trusted for the credit amount.
+  EXTRA_DRAFTS_PRICE_ID?: string;
+  EXTRA_DRAFTS_PER_UNIT?: string | number;
 }
 
 export const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
@@ -117,3 +141,46 @@ export const DEFAULT_MODEL_COST: ModelCost = MODEL_COSTS[DEFAULT_MODEL] ?? {
   inputPerMTokUsd: 3,
   outputPerMTokUsd: 15,
 };
+
+// ---------------------------------------------------------------------------
+// 56c — checkout + licensing (Paddle).
+// ---------------------------------------------------------------------------
+
+// Paddle REST bases. We default to SANDBOX everywhere until the owner flips
+// PADDLE_API_BASE to the live base and wires live secrets.
+export const PADDLE_SANDBOX_API_BASE = "https://sandbox-api.paddle.com";
+export const PADDLE_LIVE_API_BASE = "https://api.paddle.com";
+
+// Webhook signature freshness window. Paddle's own SDK helpers default to a very
+// tight 5s tolerance; a serverless webhook with clock skew + provider retries
+// needs more headroom, and idempotency guards (not the clock) are our real replay
+// defense. Tunable via PADDLE_WEBHOOK_TOLERANCE_SEC.
+export const DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC = 300;
+
+// Paddle webhooks are small JSON payloads. Keep the public unauthenticated
+// endpoint from buffering arbitrarily large bodies before signature verification.
+export const DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES = 128 * 1024;
+
+// The three paid launch tiers. "team" is reserved (no price mapped yet).
+export type PaidPlan = "starter" | "pro" | "unlimited";
+
+// Paddle price id -> paid tier. SANDBOX price ids (owner swaps for live ids when
+// flipping PADDLE_API_BASE to the live base). The *plan* is stable; the tier's
+// weekly draft limit is resolved from a var at runtime (see PLAN_DRAFT_LIMIT_VAR
+// / resolvePlanDraftLimit in src/paddle.ts) so it stays tunable without a release.
+export const PRICE_TO_PLAN: Record<string, PaidPlan> = {
+  pri_01m1syd7nfarp8pggpcnvjbgyy: "starter",
+  pri_01m1symsxarc4c3jdea0ntb09w: "pro",
+  pri_01m1syrdg05f49kz705gbzn6tz: "unlimited",
+};
+
+// Per-tier weekly draft limit PLACEHOLDER defaults. These are deliberately not
+// "final" numbers — the window unit (weekly vs. monthly) and real per-tier caps
+// are an open owner decision (see the 56c note in docs/backlog.md). Overridable
+// per-deploy via the STARTER/PRO/UNLIMITED_DRAFT_LIMIT vars.
+export const DEFAULT_STARTER_DRAFT_LIMIT = 30;
+export const DEFAULT_PRO_DRAFT_LIMIT = 120;
+export const DEFAULT_UNLIMITED_DRAFT_LIMIT = 100_000; // fair-use ceiling, not "infinite"
+
+// Default drafts credited per unit of the configured overage price.
+export const DEFAULT_EXTRA_DRAFTS_PER_UNIT = 1;
