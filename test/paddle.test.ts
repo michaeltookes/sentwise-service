@@ -66,14 +66,21 @@ describe("parsePaddleSignatureHeader", () => {
   it("parses ts and h1", () => {
     expect(parsePaddleSignatureHeader("ts=1671552777;h1=abcdef01")).toEqual({
       ts: 1671552777,
-      h1: "abcdef01",
+      h1: ["abcdef01"],
     });
   });
 
   it("tolerates whitespace and extra elements", () => {
     expect(parsePaddleSignatureHeader(" ts=100 ; h1=deadbeef ; other=x")).toEqual({
       ts: 100,
-      h1: "deadbeef",
+      h1: ["deadbeef"],
+    });
+  });
+
+  it("retains multiple h1 values for signing secret rotation", () => {
+    expect(parsePaddleSignatureHeader("ts=100;h1=badbad;h1=deadbeef")).toEqual({
+      ts: 100,
+      h1: ["badbad", "deadbeef"],
     });
   });
 
@@ -122,6 +129,15 @@ describe("verifyPaddleSignature", () => {
     await expect(verifyPaddleSignature(body, header, SECRET, now, 300)).resolves.toEqual({
       ok: false,
       reason: "mismatch",
+    });
+  });
+
+  it("accepts any matching h1 value in a rotation header", async () => {
+    const body = subscriptionEventBody();
+    const good = await computeHmacSha256Hex(SECRET, `${ts}:${body}`);
+    const header = `ts=${ts};h1=deadbeef;h1=${good}`;
+    await expect(verifyPaddleSignature(body, header, SECRET, now, 300)).resolves.toEqual({
+      ok: true,
     });
   });
 

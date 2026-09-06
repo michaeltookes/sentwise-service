@@ -8,7 +8,6 @@ import type { OverageAdjustmentAction } from "./paddle";
 
 const PROCESSED_OVERAGE_EVENT_ID_LIMIT = 100;
 const PROCESSED_OVERAGE_ADJUSTMENT_ID_LIMIT = 100;
-const OVERAGE_CREDIT_LIMIT = 100;
 const PENDING_OVERAGE_REVERSAL_LIMIT = 100;
 
 export interface PaddleOverageCreditInput {
@@ -54,6 +53,13 @@ interface StoredOverageCredit {
   reversedByAdjustmentId?: string;
   reversalAdjustmentIds?: string[];
   restoredByAdjustmentIds?: string[];
+  reversedDraftsByAdjustment?: StoredOverageCreditReversal[];
+}
+
+interface StoredOverageCreditReversal {
+  adjustmentId: string;
+  action: "refund" | "chargeback" | "credit";
+  drafts: number;
 }
 
 interface StoredPendingOverageReversal {
@@ -412,8 +418,8 @@ function applyAdjustmentToCredits(
     }
 
     return isRestoreAction(adjustment.action)
-      ? restoreCredit(credit, amount, adjustment.adjustmentId)
-      : reverseCredit(credit, amount, adjustment.adjustmentId);
+      ? restoreCredit(credit, amount, adjustment.action, adjustment.adjustmentId)
+      : reverseCredit(credit, amount, adjustment.action, adjustment.adjustmentId);
   });
   return { credits: adjustedCredits, extraDrafts, currentWindowExtraDrafts };
 }
@@ -472,7 +478,7 @@ function adjustmentDraftsForCredit(
   if (credit.transactionId !== adjustment.transactionId) return 0;
 
   const available = isRestoreAction(adjustment.action)
-    ? reversedDrafts(credit)
+    ? restorableDrafts(credit, adjustment.action)
     : availableDrafts(credit);
   if (available <= 0) return 0;
   if (coversFullTransaction(adjustment)) return available;
@@ -493,26 +499,38 @@ function adjustmentDraftsForCredit(
 function reverseCredit(
   credit: StoredOverageCredit,
   amount: number,
+  action: OverageAdjustmentAction,
   adjustmentId: string,
 ): StoredOverageCredit {
-  const nextReversed = Math.min(credit.extraDrafts, reversedDrafts(credit) + amount);
+  const previousReversed = reversedDrafts(credit);
+  const nextReversed = Math.min(credit.extraDrafts, previousReversed + amount);
+  const appliedDrafts = nextReversed - previousReversed;
   return cleanCredit({
     ...credit,
     reversedDrafts: nextReversed,
     reversedByAdjustmentId:
       nextReversed >= credit.extraDrafts ? adjustmentId : credit.reversedByAdjustmentId,
     reversalAdjustmentIds: boundedIdList([...(credit.reversalAdjustmentIds ?? []), adjustmentId]),
+    reversedDraftsByAdjustment: addReversalEntry(
+      reversedDraftEntries(credit),
+      adjustmentId,
+      action,
+      appliedDrafts,
+    ),
   });
 }
 
 function restoreCredit(
   credit: StoredOverageCredit,
   amount: number,
+  action: OverageAdjustmentAction,
   adjustmentId: string,
 ): StoredOverageCredit {
+  const consumed = consumeRestorableDrafts(reversedDraftEntries(credit), action, amount);
   return cleanCredit({
     ...credit,
-    reversedDrafts: Math.max(0, reversedDrafts(credit) - amount),
+    reversedDrafts: Math.max(0, reversedDrafts(credit) - consumed.restoredDrafts),
+    reversedDraftsByAdjustment: consumed.entries,
     restoredByAdjustmentIds: boundedIdList([
       ...(credit.restoredByAdjustmentIds ?? []),
       adjustmentId,
@@ -528,9 +546,16 @@ function cleanCredit(credit: StoredOverageCredit): StoredOverageCredit {
   if (reversed <= 0) {
     delete out.reversedDrafts;
     delete out.reversedByAdjustmentId;
+    delete out.reversedDraftsByAdjustment;
   } else {
     out.reversedDrafts = reversed;
     if (reversed < out.extraDrafts) delete out.reversedByAdjustmentId;
+    const entries = reversedDraftEntries(out);
+    if (entries.length > 0) {
+      out.reversedDraftsByAdjustment = entries;
+    } else {
+      delete out.reversedDraftsByAdjustment;
+    }
   }
   if (!out.reversalAdjustmentIds?.length) delete out.reversalAdjustmentIds;
   if (!out.restoredByAdjustmentIds?.length) delete out.restoredByAdjustmentIds;
@@ -545,6 +570,73 @@ function coversFullTransaction(
 
 function isRestoreAction(action: OverageAdjustmentAction): boolean {
   return action === "chargeback_reverse" || action === "credit_reverse";
+}
+
+function restorableDrafts(credit: StoredOverageCredit, action: OverageAdjustmentAction): number {
+  const target = restoredReversalAction(action);
+  if (!target) return 0;
+  const drafts = reversedDraftEntries(credit).reduce(
+    (sum, entry) => sum + (entry.action === target ? entry.drafts : 0),
+    0,
+  );
+  return Math.min(reversedDrafts(credit), drafts);
+}
+
+function restoredReversalAction(
+  action: OverageAdjustmentAction,
+): StoredOverageCreditReversal["action"] | null {
+  if (action === "chargeback_reverse") return "chargeback";
+  if (action === "credit_reverse") return "credit";
+  return null;
+}
+
+function addReversalEntry(
+  entries: StoredOverageCreditReversal[],
+  adjustmentId: string,
+  action: OverageAdjustmentAction,
+  drafts: number,
+): StoredOverageCreditReversal[] {
+  if (drafts <= 0 || !isStoredReversalAction(action)) return entries;
+  const next = [...entries];
+  const existing = next.find((entry) => entry.adjustmentId === adjustmentId);
+  if (existing) {
+    existing.drafts += drafts;
+  } else {
+    next.push({ adjustmentId, action, drafts });
+  }
+  return next;
+}
+
+function consumeRestorableDrafts(
+  entries: StoredOverageCreditReversal[],
+  action: OverageAdjustmentAction,
+  amount: number,
+): { entries: StoredOverageCreditReversal[]; restoredDrafts: number } {
+  const target = restoredReversalAction(action);
+  if (!target || amount <= 0) return { entries, restoredDrafts: 0 };
+
+  let remaining = amount;
+  let restoredDrafts = 0;
+  const next: StoredOverageCreditReversal[] = [];
+  for (const entry of entries) {
+    if (entry.action !== target || remaining <= 0) {
+      next.push(entry);
+      continue;
+    }
+    const restored = Math.min(entry.drafts, remaining);
+    remaining -= restored;
+    restoredDrafts += restored;
+    const drafts = entry.drafts - restored;
+    if (drafts > 0) {
+      next.push({ ...entry, drafts });
+    }
+  }
+
+  return { entries: next, restoredDrafts };
+}
+
+function isStoredReversalAction(value: unknown): value is StoredOverageCreditReversal["action"] {
+  return value === "refund" || value === "chargeback" || value === "credit";
 }
 
 function applyCurrentWindowAdjustment(
@@ -564,6 +656,21 @@ function reversedDrafts(credit: StoredOverageCredit): number {
     return Math.min(credit.extraDrafts, Math.max(0, Math.floor(credit.reversedDrafts)));
   }
   return credit.reversedByAdjustmentId ? credit.extraDrafts : 0;
+}
+
+function reversedDraftEntries(credit: StoredOverageCredit): StoredOverageCreditReversal[] {
+  const entries = Array.isArray(credit.reversedDraftsByAdjustment)
+    ? credit.reversedDraftsByAdjustment
+    : [];
+  return entries.flatMap((entry): StoredOverageCreditReversal[] => {
+    const record = asRecord(entry);
+    if (!record) return [];
+    const adjustmentId = nullableId(record.adjustmentId);
+    const action = isStoredReversalAction(record.action) ? record.action : null;
+    const drafts = positiveInt(record.drafts);
+    if (!adjustmentId || !action || !drafts) return [];
+    return [{ adjustmentId, action, drafts }];
+  });
 }
 
 function boundedIdList(ids: string[]): string[] {
@@ -640,7 +747,7 @@ function overageCredits(quota: Record<string, unknown>): StoredOverageCredit[] {
 }
 
 function boundedOverageCredits(credits: StoredOverageCredit[]): StoredOverageCredit[] {
-  return credits.slice(-OVERAGE_CREDIT_LIMIT);
+  return credits;
 }
 
 function isStoredOverageCredit(value: unknown): value is StoredOverageCredit {

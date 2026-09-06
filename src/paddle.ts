@@ -77,7 +77,7 @@ export interface OverageAdjustmentSummary {
 
 export interface ParsedPaddleSignature {
   ts: number; // Unix seconds
-  h1: string; // hex HMAC-SHA256
+  h1: string[]; // one or more hex HMAC-SHA256 values
 }
 
 /** Parse the `Paddle-Signature` header into its `ts` and `h1` parts, or null. */
@@ -86,7 +86,7 @@ export function parsePaddleSignatureHeader(
 ): ParsedPaddleSignature | null {
   if (!header) return null;
   let ts: number | null = null;
-  let h1: string | null = null;
+  const h1: string[] = [];
   for (const part of header.split(";")) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
@@ -95,11 +95,11 @@ export function parsePaddleSignatureHeader(
     if (key === "ts") {
       const n = Number(val);
       if (Number.isFinite(n)) ts = n;
-    } else if (key === "h1") {
-      h1 = val;
+    } else if (key === "h1" && /^[0-9a-f]+$/i.test(val)) {
+      h1.push(val);
     }
   }
-  if (ts === null || !h1 || !/^[0-9a-f]+$/i.test(h1)) return null;
+  if (ts === null || h1.length === 0) return null;
   return { ts, h1 };
 }
 
@@ -148,7 +148,9 @@ export async function verifyPaddleSignature(
   const ageSec = Math.abs(now / 1000 - parsed.ts);
   if (ageSec > toleranceSec) return { ok: false, reason: "stale" };
   const expected = await computeHmacSha256Hex(secret, `${parsed.ts}:${rawBody}`);
-  return timingSafeEqualHex(expected, parsed.h1) ? { ok: true } : { ok: false, reason: "mismatch" };
+  return parsed.h1.some((h1) => timingSafeEqualHex(expected, h1))
+    ? { ok: true }
+    : { ok: false, reason: "mismatch" };
 }
 
 // ---------------------------------------------------------------------------

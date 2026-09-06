@@ -822,6 +822,47 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     ]);
   });
 
+  it("retains overage credit records beyond the newest 100 entries", async () => {
+    const monday = mondayStartUtc(Date.now());
+    const existingCredits = Array.from({ length: 100 }, (_, i) => ({
+      eventId: `evt_old_${i}`,
+      transactionId: `txn_old_${i}`,
+      extraDrafts: 1,
+      windowStart: monday,
+    }));
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: {
+          extraDrafts: 100,
+          extraDraftsWindowStart: monday,
+          overageCredits: existingCredits,
+        },
+      }),
+    );
+
+    await signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 1 }],
+        },
+        "evt_new",
+      ),
+      { overrideEnv: overageEnv },
+    );
+
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(101);
+    expect(quota.overageCredits).toHaveLength(101);
+    expect(quota.overageCredits[0]).toEqual(existingCredits[0]);
+    expect(quota.overageCredits[quota.overageCredits.length - 1]).toEqual({
+      eventId: "evt_new",
+      transactionId: "txn_evt_new",
+      extraDrafts: 1,
+      windowStart: monday,
+    });
+  });
+
   it("serializes overlapping subscription and overage writes through the account Durable Object", async () => {
     const monday = mondayStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
@@ -961,6 +1002,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         reversedDrafts: 25,
         reversedByAdjustmentId: "adj_123",
         reversalAdjustmentIds: ["adj_123"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
       },
     ]);
   });
@@ -1048,6 +1090,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         reversedDrafts: 25,
         reversedByAdjustmentId: "adj_123",
         reversalAdjustmentIds: ["adj_123"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
       },
     ]);
   });
@@ -1094,6 +1137,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         windowStart: monday,
         reversedDrafts: 10,
         reversalAdjustmentIds: ["adj_123"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 10 }],
       },
     ]);
   });
@@ -1115,6 +1159,9 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
               reversedDrafts: 25,
               reversedByAdjustmentId: "adj_chargeback",
               reversalAdjustmentIds: ["adj_chargeback"],
+              reversedDraftsByAdjustment: [
+                { adjustmentId: "adj_chargeback", action: "chargeback", drafts: 25 },
+              ],
             },
           ],
         },
@@ -1137,6 +1184,53 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         windowStart: monday,
         reversalAdjustmentIds: ["adj_chargeback"],
         restoredByAdjustmentIds: ["adj_reverse"],
+      },
+    ]);
+  });
+
+  it("restores only drafts revoked by the matching adjustment action", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 20,
+          extraDraftsWindowStart: monday,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 100,
+              windowStart: monday,
+              reversedDrafts: 80,
+              reversalAdjustmentIds: ["adj_refund", "adj_chargeback"],
+              reversedDraftsByAdjustment: [
+                { adjustmentId: "adj_refund", action: "refund", drafts: 40 },
+                { adjustmentId: "adj_chargeback", action: "chargeback", drafts: 40 },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      adjustmentBody({ id: "adj_reverse", action: "chargeback_reverse", type: "full" }, "evt_rev"),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, restored: true, extraDrafts: 40 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(60);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 100,
+        windowStart: monday,
+        reversedDrafts: 40,
+        reversalAdjustmentIds: ["adj_refund", "adj_chargeback"],
+        restoredByAdjustmentIds: ["adj_reverse"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_refund", action: "refund", drafts: 40 }],
       },
     ]);
   });

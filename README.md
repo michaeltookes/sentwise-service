@@ -369,6 +369,8 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 - The `Paddle-Signature` header is `ts=<unix-seconds>;h1=<hex>`. The signed payload is
   `"<ts>:<rawBody>"` using the **exact raw request body** (no re-serialization).
 - `h1` is an **HMAC-SHA256** hex digest under `PADDLE_WEBHOOK_SECRET`, compared **constant-time**.
+  Multiple `h1` values are accepted when any one matches, so Paddle signing-secret rotation does not
+  reject legitimate webhooks.
 - The `ts` must be within `PADDLE_WEBHOOK_TOLERANCE_SEC` of now (default **300 s**; Paddle's own SDK
   default is a very tight 5 s — idempotency, not the clock, is our real replay defense).
 - Any failure → **`401 invalid_signature`**, and the event is **never processed**.
@@ -415,9 +417,11 @@ URL.
 the Paddle transaction id and, when Paddle provides it, the transaction item id and item total.
 Approved Paddle refund/chargeback/credit adjustments mark matching credits as reversed and subtract
 any still-current weekly extras; partial adjustments are prorated by adjusted amount. Approved
-chargeback/credit reversals restore previously reversed credits. If an approved reversal or restore
-arrives before the matching prerequisite event, it is retained in `pendingOverageReversals` and
-applied when the prerequisite is later delivered.
+chargeback/credit reversals restore only drafts revoked by the corresponding chargeback/credit
+action. If an approved reversal or restore arrives before the matching prerequisite event, it is
+retained in `pendingOverageReversals` and applied when the prerequisite is later delivered. Overage
+credit records are retained rather than capped at the newest 100 entries so later Paddle adjustments
+can still find the original transaction.
 
 **Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
