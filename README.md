@@ -411,6 +411,10 @@ failures and missing Paddle API credentials return `502` so Paddle retries.
 | `pri_01m1symsxarc4c3jdea0ntb09w` | `pro`       | `PRO_DRAFT_LIMIT` (120)       |
 | `pri_01m1syrdg05f49kz705gbzn6tz` | `unlimited` | `UNLIMITED_DRAFT_LIMIT` (1e5) |
 
+The Durable Object also stores the selected paid plan on the pending subscription checkout
+reservation, so a matching signed subscription webhook can still apply the purchased tier if a
+catalog migration removes or replaces the old price id before Paddle delivers the event.
+
 The limits are **placeholders**, tunable per-deploy without a release. ⚠️ **Open owner decision:** the
 landing page says "per **month**", but 56b enforces a **weekly** window — the window unit and the real
 per-tier numbers are unresolved. The plumbing is deliberately window-agnostic (it writes whatever the

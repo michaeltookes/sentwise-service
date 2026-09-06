@@ -32,7 +32,10 @@ import {
   recordPaddleOverageInClerk,
   type PaddleOverageLedgerStore,
 } from "../src/paddle-entitlement";
-import { PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY } from "../src/quota-do";
+import {
+  PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
+  PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
+} from "../src/quota-do";
 
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
@@ -165,6 +168,7 @@ async function clearPaddleOverageCredits(userId = "user_abc"): Promise<void> {
       prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
     });
     await state.storage.delete(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY);
+    await state.storage.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
     const keys = [...sharded.keys(), ...pending.keys()];
     if (keys.length > 0) await state.storage.delete(keys);
   });
@@ -195,6 +199,16 @@ async function seedPaddleOverageCheckoutReservation(
   const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
   await runInDurableObject(stub, async (_instance, state) => {
     await state.storage.put(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY, value);
+  });
+}
+
+async function seedPaddleSubscriptionCheckoutReservation(
+  value: Record<string, unknown>,
+  userId = "user_abc",
+): Promise<void> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, value);
   });
 }
 
@@ -497,6 +511,48 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     expect(lastWrite()?.quota).toEqual({
       weeklyDraftLimit: 120,
       weeklyTokenLimit: 500000,
+    });
+  });
+
+  it("reuses the reserved checkout plan when the purchased price leaves the catalog", async () => {
+    const reservationId = "checkout-catalog-change";
+    await seedPaddleSubscriptionCheckoutReservation({
+      reservationId,
+      createdAt: Date.now(),
+      transactionId: "txn_checkout_catalog",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_checkout_catalog",
+      priceId: PRO_PRICE,
+      quantity: 1,
+      plan: "pro",
+    });
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env, reservationId);
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null, quota: {} }));
+
+    const res = await signedReq(
+      subBody({
+        eventId: "evt_catalog_change",
+        subscriptionId: "sub_catalog_change",
+        customerId: "ctm_new",
+        priceId: "pri_removed_from_catalog",
+        customData,
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(lastWrite()?.subscription).toMatchObject({
+      plan: "pro",
+      status: "active",
+      paddleSubscriptionId: "sub_catalog_change",
+      paddleCustomerId: "ctm_new",
+      priceId: PRO_PRICE,
+      lastEventId: "evt_catalog_change",
+    });
+    expect(lastWrite()?.quota).toEqual({ weeklyDraftLimit: 120 });
+    const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName("user_abc"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY)).toBe(
+        undefined,
+      );
     });
   });
 

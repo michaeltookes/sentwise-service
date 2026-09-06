@@ -176,6 +176,24 @@ function fakeStorage(values: Map<string, unknown>): TestStorage {
   };
 }
 
+function delayedJsonRequest(op: string, body: unknown, release: Promise<void>): Request {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      await release;
+      controller.enqueue(encoder.encode(JSON.stringify(body)));
+      controller.close();
+    },
+  });
+  const init: RequestInit & { duplex: "half" } = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: stream,
+    duplex: "half",
+  };
+  return new Request(`https://account-quota.internal${op}`, init);
+}
+
 describe("AccountQuota Durable Object", () => {
   it("check returns the current weekly window (Mon 00:00 UTC start)", async () => {
     const r = await callDO<CheckResult>("do-window", "/check", { now: MON, rateLimitPerMin: 10 });
@@ -604,6 +622,76 @@ describe("AccountQuota Durable Object", () => {
       alreadyDeleted: false,
       attemptId: "delete",
     });
+  });
+
+  it("blocks a subscription entitlement that passed preflight before deletion began", async () => {
+    const uid = "delete-blocks-preflighted-subscription";
+    const values = new Map<string, unknown>();
+    const baseStorage = fakeStorage(values);
+    const preflightRead = deferred<void>();
+    let deletionReads = 0;
+    const storage: TestStorage = {
+      ...baseStorage,
+      get: <T = unknown>(key: string) => {
+        if (key === ACCOUNT_DELETION_KEY && deletionReads++ === 0) {
+          preflightRead.resolve();
+        }
+        return baseStorage.get<T>(key);
+      },
+    };
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockResolvedValue(undefined);
+    const bodyReleased = deferred<void>();
+
+    const subscription = quota.fetch(
+      delayedJsonRequest(
+        "/paddle-subscription",
+        {
+          now: MON,
+          event: {
+            eventId: "evt_subscription",
+            eventType: "subscription.updated",
+            occurredAt: "2024-01-01T00:00:01.000Z",
+            data: {
+              id: "sub_current",
+              status: "active",
+              customer_id: "ctm_123",
+              custom_data: { clerkUserId: uid },
+              items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+            },
+          },
+        },
+        bodyReleased.promise,
+      ),
+    );
+    await preflightRead.promise;
+
+    const begin = await quota
+      .fetch(
+        new Request("https://account-quota.internal/begin-delete", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ now: MON + 1, attemptId: "delete" }),
+        }),
+      )
+      .then((res) => res.json<{ deleting: true; alreadyDeleted: false }>());
+    expect(begin).toMatchObject({ deleting: true, alreadyDeleted: false });
+
+    bodyReleased.resolve();
+    const response = await subscription;
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as any).error.type).toBe("account_deletion_in_progress");
+    expect(clerkMocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
   it("waits for in-flight subscription entitlement writes before reserving checkout", async () => {

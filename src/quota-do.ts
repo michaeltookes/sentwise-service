@@ -38,7 +38,12 @@
 //   POST /finish-delete { now, attemptId } -> wipe counters and keep a deleted tombstone
 //   POST /wipe    {} -> compatibility alias for /finish-delete
 
-import { ACCOUNT_DELETION_BARRIER_TIMEOUT_MS, type Env } from "./config";
+import {
+  ACCOUNT_DELETION_BARRIER_TIMEOUT_MS,
+  PRICE_TO_PLAN,
+  type Env,
+  type PaidPlan,
+} from "./config";
 import { clerkUserExists, deleteClerkUser } from "./auth";
 import { ApiError, jsonError } from "./errors";
 import { parseInterestTopic, recordInterestInClerk } from "./interest";
@@ -49,6 +54,7 @@ import {
   revokePaddleOverageInClerk,
 } from "./paddle-entitlement";
 import {
+  type PaddleSubscriptionCheckoutPlan,
   parsePaddleSubscriptionBody,
   recordPaddleSubscriptionInClerk,
 } from "./paddle-subscription-entitlement";
@@ -128,6 +134,7 @@ interface PaddleCheckoutReservation {
   checkoutUrl?: string | null;
   priceId?: string;
   quantity?: number;
+  plan?: PaidPlan;
   customerId?: string;
   blocked?: boolean;
 }
@@ -521,9 +528,10 @@ export class AccountQuota {
     try {
       const parsed = parsePaddleSubscriptionBody(body);
       const userId = this.requireUserId();
-      const result = await this.enqueuePrivateMetadataWrite(() =>
-        recordPaddleSubscriptionInClerk(userId, parsed, this.env),
-      );
+      const result = await this.enqueuePrivateMetadataWrite(async () => {
+        const checkoutPlan = await this.paddleSubscriptionCheckoutPlanForEvent(parsed.event);
+        return recordPaddleSubscriptionInClerk(userId, { ...parsed, checkoutPlan }, this.env);
+      });
       if ("applied" in result || "idempotent" in result) {
         await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
         if (!subscriptionEventAllowsOverageCheckout(parsed.event)) {
@@ -630,6 +638,7 @@ export class AccountQuota {
         expiresAt: now + RESERVATION_TTL_MS,
         priceId,
         quantity,
+        ...subscriptionCheckoutPlanForPrice(storageKey, priceId),
         ...(customerId ? { customerId } : {}),
       });
       return Response.json({ reserved: true, reservationId });
@@ -764,17 +773,26 @@ export class AccountQuota {
   private async clearPaddleSubscriptionCheckoutReservationForEvent(event: {
     data: Record<string, unknown>;
   }): Promise<void> {
-    const customData = asRecord(event.data.custom_data);
-    const reservationId = normalizedId(
-      typeof customData?.sentwiseCheckoutReservationId === "string"
-        ? customData.sentwiseCheckoutReservationId
-        : undefined,
-    );
+    const reservationId = checkoutReservationIdFromEvent(event);
     if (!reservationId) return;
     await this.clearPaddleCheckoutReservation(
       PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
       reservationId,
     );
+  }
+
+  private async paddleSubscriptionCheckoutPlanForEvent(event: {
+    data: Record<string, unknown>;
+  }): Promise<PaddleSubscriptionCheckoutPlan | null> {
+    const reservationId = checkoutReservationIdFromEvent(event);
+    if (!reservationId) return null;
+    const reservation = parsePaddleCheckoutReservation(
+      await this.storage.get<unknown>(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY),
+    );
+    if (reservation?.reservationId !== reservationId || !reservation.plan || !reservation.priceId) {
+      return null;
+    }
+    return { plan: reservation.plan, priceId: reservation.priceId };
   }
 
   private async clearPaddleOverageCheckoutReservationForTransaction(
@@ -838,7 +856,13 @@ export class AccountQuota {
   }
 
   private enqueuePrivateMetadataWrite<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.privateMetadataWriteQueue.catch(() => undefined).then(operation);
+    const run = this.privateMetadataWriteQueue
+      .catch(() => undefined)
+      .then(async () => {
+        const deletion = await this.loadBlockingAccountDeletionMarker(Date.now());
+        if (deletion) throw accountDeletionApiError(deletion);
+        return operation();
+      });
     this.privateMetadataWriteQueue = run.then(
       () => undefined,
       () => undefined,
@@ -1312,6 +1336,7 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
   const customerId = normalizedId(
     typeof reservation?.customerId === "string" ? reservation.customerId : undefined,
   );
+  const plan = paidPlanFromValue(reservation?.plan);
   return {
     reservationId,
     createdAt: reservation.createdAt,
@@ -1324,6 +1349,7 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
     ...(checkoutUrl ? { checkoutUrl } : {}),
     ...(priceId ? { priceId } : {}),
     ...(quantity > 0 ? { quantity } : {}),
+    ...(plan ? { plan } : {}),
     ...(customerId ? { customerId } : {}),
     ...(reservation.blocked === true ? { blocked: true } : {}),
   };
@@ -1348,6 +1374,32 @@ function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation
     ...(reservation.priceId ? { priceId: reservation.priceId } : {}),
     ...(reservation.quantity ? { quantity: reservation.quantity } : {}),
   };
+}
+
+function checkoutReservationIdFromEvent(event: {
+  data: Record<string, unknown>;
+}): string | undefined {
+  const customData = asRecord(event.data.custom_data);
+  return normalizedId(
+    typeof customData?.sentwiseCheckoutReservationId === "string"
+      ? customData.sentwiseCheckoutReservationId
+      : undefined,
+  );
+}
+
+function subscriptionCheckoutPlanForPrice(
+  storageKey: PaddleCheckoutReservationStorageKey,
+  priceId: string,
+): { plan?: PaidPlan } {
+  const plan =
+    storageKey === PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY
+      ? PRICE_TO_PLAN[priceId]
+      : undefined;
+  return plan ? { plan } : {};
+}
+
+function paidPlanFromValue(value: unknown): PaidPlan | null {
+  return value === "starter" || value === "pro" || value === "unlimited" ? value : null;
 }
 
 function subscriptionEventAllowsOverageCheckout(event: {
@@ -1445,6 +1497,12 @@ function accountDeletionResponse(marker: AccountDeletionMarker): Response {
     );
   }
   return jsonError(410, "account_deleted", "This account has been deleted.");
+}
+
+function accountDeletionApiError(marker: AccountDeletionMarker): ApiError {
+  return marker.status === "deleting"
+    ? new ApiError(409, "account_deletion_in_progress", "Account deletion is in progress.")
+    : new ApiError(410, "account_deleted", "This account has been deleted.");
 }
 
 function normalizedId(v: string | undefined): string | undefined {

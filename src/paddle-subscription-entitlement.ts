@@ -25,6 +25,12 @@ const SUPERSEDED_SUBSCRIPTION_ID_LIMIT = 20;
 export interface PaddleSubscriptionBody {
   now: number;
   event: PaddleEvent;
+  checkoutPlan?: PaddleSubscriptionCheckoutPlan | null;
+}
+
+export interface PaddleSubscriptionCheckoutPlan {
+  plan: PaidPlan;
+  priceId: string;
 }
 
 export type PaddleSubscriptionResult =
@@ -92,7 +98,7 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const existingSub = asRecord(meta.subscription);
-  const mapped = planMappingForSubscriptionEvent(body.event, existingSub);
+  const mapped = planMappingForSubscriptionEvent(body.event, existingSub, body.checkoutPlan);
   if (!mapped) {
     return { ignored: "unknown_price" };
   }
@@ -154,9 +160,17 @@ export async function recordPaddleSubscriptionInClerk(
 function planMappingForSubscriptionEvent(
   event: PaddleEvent,
   existingSub: Record<string, unknown> | null,
+  checkoutPlan?: PaddleSubscriptionCheckoutPlan | null,
 ): { plan: SubscriptionPlan; priceId: string | null; quotaPlan: PaidPlan | null } | null {
   const mapped = planFromEvent(event);
   if (mapped) return { ...mapped, quotaPlan: mapped.plan };
+  if (checkoutPlan) {
+    return {
+      plan: checkoutPlan.plan,
+      priceId: checkoutPlan.priceId,
+      quotaPlan: checkoutPlan.plan,
+    };
+  }
   if (
     !isTerminalSubscriptionEvent(event) &&
     !subscriptionEventMatchesStoredSubscription(event, existingSub)
