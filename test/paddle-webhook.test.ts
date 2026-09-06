@@ -1014,7 +1014,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
 
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(101);
-    expect(quota.overageCredits).toBeUndefined();
+    expect(quota.overageCredits).toBeNull();
     const credits = await storedPaddleOverageCredits();
     expect(credits).toHaveLength(101);
     expect(credits).toEqual(
@@ -1490,7 +1490,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect((await res.json()) as any).toEqual({ ok: true, revoked: true, extraDrafts: 10 });
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(40);
-    expect(quota.overageCredits).toBeUndefined();
+    expect(quota.overageCredits).toBeNull();
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
@@ -1655,7 +1655,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(25);
     expect(quota.processedOverageAdjustmentIds).toEqual(["adj_reverse"]);
-    expect(quota.overageCredits).toBeUndefined();
+    expect(quota.overageCredits).toBeNull();
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
@@ -1701,7 +1701,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect((await res.json()) as any).toEqual({ ok: true, restored: true, extraDrafts: 40 });
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(60);
-    expect(quota.overageCredits).toBeUndefined();
+    expect(quota.overageCredits).toBeNull();
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
@@ -1781,7 +1781,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(quota.extraDrafts).toBe(25);
     expect(quota.pendingOverageReversals).toEqual([]);
     expect(quota.processedOverageAdjustmentIds).toEqual(["adj_restore", "adj_chargeback"]);
-    expect(quota.overageCredits).toBeUndefined();
+    expect(quota.overageCredits).toBeNull();
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",

@@ -53,6 +53,8 @@ type CheckoutReservationResult =
       reservationId?: string;
       transactionId?: string;
       checkoutUrl?: string | null;
+      priceId?: string;
+      quantity?: number;
     };
 type CheckoutReservationRecordResult = { recorded: true } | { stale: true };
 interface ReserveResult {
@@ -79,6 +81,7 @@ interface TestStorage {
 
 const ACCOUNT_DELETION_KEY = "account_deletion";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
+const SUBSCRIPTION_CHECKOUT_REQUEST = { priceId: PRO_PRICE, quantity: 1 };
 
 beforeEach(() => {
   clerkMocks.verifyToken.mockReset();
@@ -532,6 +535,7 @@ describe("AccountQuota Durable Object", () => {
     await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
       now: MON,
       reservationId: "checkout-current",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
     });
 
     clerkMocks.getUser.mockResolvedValue({
@@ -575,6 +579,7 @@ describe("AccountQuota Durable Object", () => {
       {
         now: MON + 2,
         reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
     expect(stillPending).toEqual({ pending: true });
@@ -620,12 +625,13 @@ describe("AccountQuota Durable Object", () => {
       {
         now: MON + 4,
         reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
     expect(next).toEqual({ reserved: true, reservationId: "checkout-next" });
   });
 
-  it("keeps a subscription checkout reservation after the former timeout window", async () => {
+  it("keeps a recorded subscription checkout reservation after the former timeout window", async () => {
     const uid = "checkout-reservation-no-timeout";
     const first = await callDO<CheckoutReservationResult>(
       uid,
@@ -633,6 +639,44 @@ describe("AccountQuota Durable Object", () => {
       {
         now: MON,
         reservationId: "checkout-open",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(first).toEqual({ reserved: true, reservationId: "checkout-open" });
+    await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
+      reservationId: "checkout-open",
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+
+    const second = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 31 * 60_000,
+        reservationId: "checkout-later",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
+      },
+    );
+    expect(second).toEqual({
+      pending: true,
+      reservationId: "checkout-open",
+      transactionId: "txn_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    });
+  });
+
+  it("expires an unrecorded subscription checkout reservation", async () => {
+    const uid = "checkout-reservation-creation-timeout";
+    const first = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON,
+        reservationId: "checkout-open",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
     expect(first).toEqual({ reserved: true, reservationId: "checkout-open" });
@@ -641,11 +685,12 @@ describe("AccountQuota Durable Object", () => {
       uid,
       "/paddle-subscription-checkout-reserve",
       {
-        now: MON + 31 * 60_000,
+        now: MON + RESERVATION_TTL_MS + 1,
         reservationId: "checkout-later",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
-    expect(second).toEqual({ pending: true });
+    expect(second).toEqual({ reserved: true, reservationId: "checkout-later" });
   });
 
   it("returns pending subscription checkout transaction details for recovery", async () => {
@@ -653,12 +698,14 @@ describe("AccountQuota Durable Object", () => {
     await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
       now: MON,
       reservationId: "checkout-open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
     });
     expect(
       await callDO<CheckoutReservationRecordResult>(uid, "/paddle-subscription-checkout-record", {
         reservationId: "checkout-open",
         transactionId: "txn_open",
         checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
       }),
     ).toEqual({ recorded: true });
 
@@ -668,6 +715,7 @@ describe("AccountQuota Durable Object", () => {
       {
         now: MON + 1,
         reservationId: "checkout-next",
+        ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
 
@@ -676,6 +724,7 @@ describe("AccountQuota Durable Object", () => {
       reservationId: "checkout-open",
       transactionId: "txn_open",
       checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_open",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
     });
   });
 

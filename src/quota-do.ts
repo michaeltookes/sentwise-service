@@ -20,8 +20,8 @@
 //   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
 //   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts, credits } -> serialize Paddle overage entitlement writes
 //   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, hasAdjustmentItems, items } -> revoke/restore overage credit
-//   POST /paddle-subscription-checkout-reserve { now, reservationId } -> reserve one pending subscription checkout
-//   POST /paddle-subscription-checkout-record { reservationId, transactionId, checkoutUrl } -> attach the Paddle transaction to a reservation
+//   POST /paddle-subscription-checkout-reserve { now, reservationId, priceId, quantity } -> reserve one pending subscription checkout
+//   POST /paddle-subscription-checkout-record { reservationId, transactionId, checkoutUrl, priceId, quantity } -> attach the Paddle transaction to a reservation
 //   POST /paddle-subscription-checkout-release { reservationId } -> release a matching pending subscription checkout after failed creation
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
@@ -119,6 +119,8 @@ interface PaddleSubscriptionCheckoutReservation {
   expiresAt?: number;
   transactionId?: string;
   checkoutUrl?: string | null;
+  priceId?: string;
+  quantity?: number;
 }
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -542,8 +544,16 @@ export class AccountQuota {
     const reservationId = normalizedId(
       typeof record?.reservationId === "string" ? record.reservationId : undefined,
     );
-    if (!reservationId) {
-      return jsonError(400, "invalid_request", "A checkout reservation id is required.");
+    const priceId = normalizedId(typeof record?.priceId === "string" ? record.priceId : undefined);
+    const quantity = nonNegativeInt(
+      typeof record?.quantity === "number" ? record.quantity : undefined,
+    );
+    if (!reservationId || !priceId || quantity <= 0) {
+      return jsonError(
+        400,
+        "invalid_request",
+        "A checkout reservation id, price id, and quantity are required.",
+      );
     }
 
     return this.storage.transaction(async (txn) => {
@@ -555,12 +565,22 @@ export class AccountQuota {
       );
       const parsedReservation = parsePaddleSubscriptionCheckoutReservation(reservation);
       if (parsedReservation) {
-        return Response.json(pendingPaddleSubscriptionCheckoutReservation(parsedReservation));
+        if (
+          !parsedReservation.transactionId &&
+          (parsedReservation.expiresAt === undefined || parsedReservation.expiresAt <= now)
+        ) {
+          await txn.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
+        } else {
+          return Response.json(pendingPaddleSubscriptionCheckoutReservation(parsedReservation));
+        }
       }
 
       await txn.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
         reservationId,
         createdAt: now,
+        expiresAt: now + RESERVATION_TTL_MS,
+        priceId,
+        quantity,
       });
       return Response.json({ reserved: true, reservationId });
     });
@@ -574,11 +594,15 @@ export class AccountQuota {
     const transactionId = normalizedId(
       typeof record?.transactionId === "string" ? record.transactionId : undefined,
     );
-    if (!reservationId || !transactionId) {
+    const priceId = normalizedId(typeof record?.priceId === "string" ? record.priceId : undefined);
+    const quantity = nonNegativeInt(
+      typeof record?.quantity === "number" ? record.quantity : undefined,
+    );
+    if (!reservationId || !transactionId || !priceId || quantity <= 0) {
       return jsonError(
         400,
         "invalid_request",
-        "A checkout reservation id and transaction id are required.",
+        "A checkout reservation id, transaction id, price id, and quantity are required.",
       );
     }
     const checkoutUrl = validHttpsUrl(record?.checkoutUrl);
@@ -590,10 +614,20 @@ export class AccountQuota {
       if (reservation?.reservationId !== reservationId) {
         return Response.json({ stale: true });
       }
+      if (
+        (reservation.priceId && reservation.priceId !== priceId) ||
+        (reservation.quantity && reservation.quantity !== quantity)
+      ) {
+        return Response.json({ stale: true });
+      }
+      const recordedReservation = { ...reservation };
+      delete recordedReservation.expiresAt;
       await txn.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
-        ...reservation,
+        ...recordedReservation,
         transactionId,
         checkoutUrl,
+        priceId,
+        quantity,
       });
       return Response.json({ recorded: true });
     });
@@ -1086,6 +1120,12 @@ function parsePaddleSubscriptionCheckoutReservation(
     return null;
   }
   const checkoutUrl = validHttpsUrl(reservation.checkoutUrl);
+  const priceId = normalizedId(
+    typeof reservation?.priceId === "string" ? reservation.priceId : undefined,
+  );
+  const quantity = nonNegativeInt(
+    typeof reservation?.quantity === "number" ? reservation.quantity : undefined,
+  );
   return {
     reservationId,
     createdAt: reservation.createdAt,
@@ -1096,6 +1136,8 @@ function parsePaddleSubscriptionCheckoutReservation(
       ? { transactionId: reservation.transactionId }
       : {}),
     ...(checkoutUrl ? { checkoutUrl } : {}),
+    ...(priceId ? { priceId } : {}),
+    ...(quantity > 0 ? { quantity } : {}),
   };
 }
 
@@ -1108,6 +1150,8 @@ function pendingPaddleSubscriptionCheckoutReservation(
       reservationId: string;
       transactionId: string;
       checkoutUrl: string | null;
+      priceId?: string;
+      quantity?: number;
     } {
   if (!reservation.transactionId) return { pending: true };
   return {
@@ -1115,6 +1159,8 @@ function pendingPaddleSubscriptionCheckoutReservation(
     reservationId: reservation.reservationId,
     transactionId: reservation.transactionId,
     checkoutUrl: reservation.checkoutUrl ?? null,
+    ...(reservation.priceId ? { priceId: reservation.priceId } : {}),
+    ...(reservation.quantity ? { quantity: reservation.quantity } : {}),
   };
 }
 

@@ -353,7 +353,8 @@ rejected while the account already has an active/trialing/past-due Paddle subscr
 changes must go through Paddle subscription management instead of creating a second recurring
 subscription. Subscription checkout creation is also serialized per account with a short-lived
 Durable Object reservation id included in Paddle `custom_data`; a second request is rejected while a
-checkout transaction is pending, and only the matching applied subscription webhook clears the lock.
+checkout transaction is pending, a retry resumes only a matching requested price/quantity, and only
+the matching applied subscription webhook clears the lock.
 Overage checkout requires an active Paddle subscription with a stored
 `paddleCustomerId`; the Worker passes that `customer_id` to Paddle so the later webhook credits the
 same bound customer.

@@ -921,7 +921,9 @@ function fallbackOverageCredits(
 
 function quotaWithoutOverageCredits(quota: Record<string, unknown>): Record<string, unknown> {
   const rest = { ...quota };
-  delete rest.overageCredits;
+  if (Object.prototype.hasOwnProperty.call(rest, "overageCredits")) {
+    rest.overageCredits = null;
+  }
   return rest;
 }
 

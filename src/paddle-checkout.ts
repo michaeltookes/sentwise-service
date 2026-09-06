@@ -57,10 +57,18 @@ export async function handlePaddleCheckout(
       env,
       userId,
       checkoutReservationId,
+      body,
     );
     if (existingTransaction) return checkoutResponse(existingTransaction);
 
-    account = await loadCheckoutAccount(userId, env);
+    try {
+      account = await loadCheckoutAccount(userId, env);
+    } catch (err) {
+      await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
+        () => undefined,
+      );
+      throw err;
+    }
     if (hasActivePaddleSubscription(account.subscription)) {
       await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
         () => undefined,
@@ -96,11 +104,23 @@ export async function handlePaddleCheckout(
   }
 
   if (checkoutReservationId) {
-    await quotaRecordPaddleSubscriptionCheckout(env, userId, {
-      reservationId: checkoutReservationId,
-      transactionId: transaction.transactionId,
-      checkoutUrl: transaction.checkoutUrl,
-    });
+    try {
+      const recordResult = await quotaRecordPaddleSubscriptionCheckout(env, userId, {
+        reservationId: checkoutReservationId,
+        transactionId: transaction.transactionId,
+        checkoutUrl: transaction.checkoutUrl,
+        priceId: body.priceId,
+        quantity: body.quantity,
+      });
+      if ("stale" in recordResult) {
+        throw pendingCheckoutError();
+      }
+    } catch (err) {
+      await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
+        () => undefined,
+      );
+      throw err;
+    }
   }
 
   return checkoutResponse(transaction);
@@ -110,15 +130,18 @@ async function reserveSubscriptionCheckout(
   env: Env,
   userId: string,
   reservationId: string,
+  request: CheckoutRequestBody,
 ): Promise<{ transactionId: string; checkoutUrl: string | null } | null> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const reservation = await quotaReservePaddleSubscriptionCheckout(env, userId, {
       now: Date.now(),
       reservationId,
+      priceId: request.priceId,
+      quantity: request.quantity,
     });
     if ("reserved" in reservation) return null;
 
-    const pending = await recoverOrReleasePendingCheckout(env, userId, reservation);
+    const pending = await recoverOrReleasePendingCheckout(env, userId, reservation, request);
     if (pending) return pending;
   }
   throw pendingCheckoutError();
@@ -131,7 +154,10 @@ async function recoverOrReleasePendingCheckout(
     reservationId?: string;
     transactionId?: string;
     checkoutUrl?: string | null;
+    priceId?: string;
+    quantity?: number;
   },
+  request: CheckoutRequestBody,
 ): Promise<{ transactionId: string; checkoutUrl: string | null } | null> {
   if (!reservation.reservationId || !reservation.transactionId) {
     throw pendingCheckoutError();
@@ -144,6 +170,9 @@ async function recoverOrReleasePendingCheckout(
   }
   const checkoutUrl = snapshot.checkoutUrl ?? reservation.checkoutUrl ?? null;
   if (isRecoverableCheckoutTransaction(snapshot.status, checkoutUrl)) {
+    if (!checkoutMatchesRequest(reservation, snapshot, request)) {
+      throw checkoutConflictError();
+    }
     return {
       transactionId: reservation.transactionId,
       checkoutUrl,
@@ -155,13 +184,32 @@ async function recoverOrReleasePendingCheckout(
 async function pendingCheckoutTransactionSnapshot(
   env: Env,
   transactionId: string,
-): Promise<{ status: string | null; checkoutUrl: string | null } | null> {
+): Promise<{
+  status: string | null;
+  checkoutUrl: string | null;
+  items: { priceId: string; quantity: number }[];
+} | null> {
   try {
     return await fetchPaddleTransactionSnapshot(env, transactionId);
   } catch (err) {
     if (err instanceof ApiError) throw pendingCheckoutError();
     throw err;
   }
+}
+
+function checkoutMatchesRequest(
+  reservation: { priceId?: string; quantity?: number },
+  snapshot: { items: { priceId: string; quantity: number }[] },
+  request: CheckoutRequestBody,
+): boolean {
+  if (reservation.priceId && reservation.quantity) {
+    return reservation.priceId === request.priceId && reservation.quantity === request.quantity;
+  }
+  return (
+    snapshot.items.length === 1 &&
+    snapshot.items[0].priceId === request.priceId &&
+    snapshot.items[0].quantity === request.quantity
+  );
 }
 
 function isRecoverableCheckoutTransaction(
@@ -176,6 +224,14 @@ function pendingCheckoutError(): ApiError {
     409,
     "billing_checkout_pending",
     "A subscription checkout is already in progress.",
+  );
+}
+
+function checkoutConflictError(): ApiError {
+  return new ApiError(
+    409,
+    "billing_checkout_conflict",
+    "A different subscription checkout is already in progress.",
   );
 }
 

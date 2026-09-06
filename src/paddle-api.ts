@@ -23,6 +23,12 @@ export interface PaddleTransactionSnapshot {
   customData: Record<string, unknown> | null;
   status: string | null;
   checkoutUrl: string | null;
+  items: PaddleTransactionItemSnapshot[];
+}
+
+export interface PaddleTransactionItemSnapshot {
+  priceId: string;
+  quantity: number;
 }
 
 export type PaddleManagementAction = "update_payment_method" | "cancel";
@@ -161,6 +167,7 @@ export async function fetchPaddleTransactionSnapshot(
       customData: asRecord(data?.custom_data),
       status: typeof status === "string" && status !== "" ? status : null,
       checkoutUrl: validHttpsUrl(data ? asRecord(data.checkout)?.url : undefined),
+      items: parseTransactionItems(data?.items),
     };
   } catch (err) {
     if (err instanceof ApiError) throw err;
@@ -223,6 +230,25 @@ function validHttpsUrl(v: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+function parseTransactionItems(value: unknown): PaddleTransactionItemSnapshot[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): PaddleTransactionItemSnapshot[] => {
+    const record = asRecord(item);
+    const priceId = asRecord(record?.price)?.id ?? record?.price_id;
+    const quantity = record?.quantity;
+    if (
+      typeof priceId !== "string" ||
+      priceId === "" ||
+      typeof quantity !== "number" ||
+      !Number.isInteger(quantity) ||
+      quantity <= 0
+    ) {
+      return [];
+    }
+    return [{ priceId, quantity }];
+  });
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

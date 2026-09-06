@@ -74,6 +74,8 @@ export type PaddleSubscriptionCheckoutReservationResult =
       reservationId?: string;
       transactionId?: string;
       checkoutUrl?: string | null;
+      priceId?: string;
+      quantity?: number;
     };
 export type PaddleSubscriptionCheckoutRecordResult = { recorded: true } | { stale: true };
 export type PaddleSubscriptionCheckoutReleaseResult = { released: true };
@@ -241,7 +243,7 @@ export function quotaRecordPaddleSubscription(
 export function quotaReservePaddleSubscriptionCheckout(
   env: Env,
   userId: string,
-  body: { now: number; reservationId: string },
+  body: { now: number; reservationId: string; priceId: string; quantity: number },
 ): Promise<PaddleSubscriptionCheckoutReservationResult> {
   return call<PaddleSubscriptionCheckoutReservationResult>(
     env,
@@ -255,7 +257,13 @@ export function quotaReservePaddleSubscriptionCheckout(
 export function quotaRecordPaddleSubscriptionCheckout(
   env: Env,
   userId: string,
-  body: { reservationId: string; transactionId: string; checkoutUrl: string | null },
+  body: {
+    reservationId: string;
+    transactionId: string;
+    checkoutUrl: string | null;
+    priceId: string;
+    quantity: number;
+  },
 ): Promise<PaddleSubscriptionCheckoutRecordResult> {
   return call<PaddleSubscriptionCheckoutRecordResult>(
     env,
