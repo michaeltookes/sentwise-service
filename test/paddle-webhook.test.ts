@@ -159,6 +159,13 @@ async function storedPaddleOverageCredits(userId = "user_abc"): Promise<unknown[
   });
 }
 
+async function putPaddleOverageCredits(credits: unknown[], userId = "user_abc"): Promise<void> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.put(PADDLE_OVERAGE_CREDITS_STORAGE_KEY, credits);
+  });
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -815,6 +822,52 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent when replaying an overage event retained only in the durable ledger", async () => {
+    const monday = mondayStartUtc(Date.now());
+    await putPaddleOverageCredits([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedDrafts: 10,
+        reversalAdjustmentIds: ["adj_refund"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_refund", action: "refund", drafts: 10 }],
+      },
+    ]);
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: {
+          extraDrafts: 15,
+          extraDraftsWindowStart: monday,
+          processedOverageEventIds: Array.from({ length: 100 }, (_, i) => `evt_old_${i}`),
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      txnBody({
+        custom_data: { clerkUserId: "user_abc", kind: "overage" },
+        items: [{ price: { id: OVERAGE_PRICE }, quantity: 25 }],
+      }),
+      { overrideEnv: overageEnv },
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedDrafts: 10,
+        reversalAdjustmentIds: ["adj_refund"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_refund", action: "refund", drafts: 10 }],
+      },
+    ]);
   });
 
   it("serializes overlapping overage writes through the account Durable Object", async () => {

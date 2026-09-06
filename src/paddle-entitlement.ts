@@ -212,6 +212,11 @@ export async function recordPaddleOverageInClerk(
   let newCredits = body.credits.map((credit) =>
     storedCreditFromInput(body.eventId, body.transactionId, credit, windowStart),
   );
+  newCredits = creditsMissingFromLedger(newCredits, existingCredits);
+  if (newCredits.length === 0) {
+    await saveOverageCredits(ledgerStore, existingCredits);
+    return { idempotent: true };
+  }
   const replayed = replayPendingAdjustments(
     newCredits,
     pending,
@@ -896,6 +901,14 @@ function mergeOverageCredits(credits: StoredOverageCredit[]): StoredOverageCredi
     byCredit.set(overageCreditKey(credit), credit);
   }
   return [...byCredit.values()];
+}
+
+function creditsMissingFromLedger(
+  credits: StoredOverageCredit[],
+  existingCredits: StoredOverageCredit[],
+): StoredOverageCredit[] {
+  const existingKeys = new Set(existingCredits.map(overageCreditKey));
+  return credits.filter((credit) => !existingKeys.has(overageCreditKey(credit)));
 }
 
 function overageCreditKey(credit: StoredOverageCredit): string {
