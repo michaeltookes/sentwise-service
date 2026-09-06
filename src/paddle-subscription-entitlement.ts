@@ -2,7 +2,13 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
+import {
+  paddleCheckoutBindingMatchesEvent,
+  paddleCustomerMatchesAccount,
+  storedPaddleSubscriptionId,
+  supersededPaddleSubscriptionIds,
+} from "./paddle-account";
+import { fetchPaddleSubscriptionSnapshot } from "./paddle-api";
 import {
   buildSubscriptionRecord,
   customerIdFromEvent,
@@ -13,6 +19,8 @@ import {
   subscriptionIdFromEvent,
   type PaddleEvent,
 } from "./paddle";
+
+const SUPERSEDED_SUBSCRIPTION_ID_LIMIT = 20;
 
 export interface PaddleSubscriptionBody {
   now: number;
@@ -84,7 +92,7 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const meta = user.privateMetadata ?? {};
-  if (!(await paddleCustomerMatchesAccount(user, meta, customerIdFromEvent(body.event), env))) {
+  if (!(await subscriptionEventMatchesAccount(userId, user, meta, body.event, env))) {
     return { mapped: false };
   }
 
@@ -94,11 +102,18 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
+  const supersededSubscriptionIds = supersededPaddleSubscriptionIds(existingSub);
   const incomingSubscriptionId = subscriptionIdFromEvent(body.event);
+  if (incomingSubscriptionId && supersededSubscriptionIds.includes(incomingSubscriptionId)) {
+    return { stale: true };
+  }
   const isDifferentSubscription =
     !!existingSubscriptionId &&
     (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
-  if (isDifferentSubscription && !isPromotableSubscriptionReplacement(body.event)) {
+  if (
+    isDifferentSubscription &&
+    !(await isCurrentSubscriptionReplacement(body.event, userId, env))
+  ) {
     return { stale: true };
   }
 
@@ -114,7 +129,13 @@ export async function recordPaddleSubscriptionInClerk(
     }
   }
 
-  const record = buildSubscriptionRecord(body.event, mapped.plan, mapped.priceId, body.now);
+  const record = {
+    ...buildSubscriptionRecord(body.event, mapped.plan, mapped.priceId, body.now),
+    ...supersededSubscriptionHistory(
+      supersededSubscriptionIds,
+      isDifferentSubscription ? existingSubscriptionId : null,
+    ),
+  };
   const quota = {
     ...(asRecord(meta.quota) ?? {}),
     weeklyDraftLimit: resolvePlanDraftLimit(env, mapped.plan),
@@ -132,12 +153,53 @@ export async function recordPaddleSubscriptionInClerk(
   return { applied: true };
 }
 
+async function subscriptionEventMatchesAccount(
+  userId: string,
+  user: unknown,
+  meta: Record<string, unknown>,
+  event: PaddleEvent,
+  env: Env,
+): Promise<boolean> {
+  if (paddleCustomerMatchesAccount(user, meta, customerIdFromEvent(event), env)) return true;
+  return paddleCheckoutBindingMatchesEvent(event, userId, env);
+}
+
+async function isCurrentSubscriptionReplacement(
+  event: PaddleEvent,
+  userId: string,
+  env: Env,
+): Promise<boolean> {
+  if (!isPromotableSubscriptionReplacement(event)) return false;
+  if (!(await paddleCheckoutBindingMatchesEvent(event, userId, env))) return false;
+
+  const incomingSubscriptionId = subscriptionIdFromEvent(event);
+  if (!incomingSubscriptionId) return false;
+
+  const snapshot = await fetchPaddleSubscriptionSnapshot(env, incomingSubscriptionId);
+  if (!snapshot) return false;
+
+  const incomingCustomerId = customerIdFromEvent(event);
+  if (incomingCustomerId && snapshot.customerId !== incomingCustomerId) return false;
+  return snapshot.status === "active" || snapshot.status === "trialing";
+}
+
 function isPromotableSubscriptionReplacement(event: PaddleEvent): boolean {
   if (event.eventType !== "subscription.created" && event.eventType !== "subscription.activated") {
     return false;
   }
   const status = statusFromEvent(event);
   return status === "active" || status === "trialing";
+}
+
+function supersededSubscriptionHistory(
+  existingIds: string[],
+  replacedSubscriptionId: string | null,
+): { supersededPaddleSubscriptionIds?: string[] } {
+  const ids = replacedSubscriptionId ? [...existingIds, replacedSubscriptionId] : existingIds;
+  const unique = [...new Set(ids.filter((id) => id !== ""))].slice(
+    -SUPERSEDED_SUBSCRIPTION_ID_LIMIT,
+  );
+  return unique.length > 0 ? { supersededPaddleSubscriptionIds: unique } : {};
 }
 
 function positiveInt(value: unknown): number | null {

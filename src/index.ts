@@ -30,6 +30,7 @@ import {
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
 import { recordInterest } from "./interest";
+import { handlePaddleCheckout } from "./paddle-checkout";
 import { handlePaddleManageBilling } from "./paddle-management";
 import { handlePaddleWebhook } from "./paddle-webhook";
 
@@ -45,6 +46,7 @@ export { AccountQuota } from "./quota-do";
  *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
  *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
  *   POST   /v1/interest   -> record demand for a parked capability (item 75; first click wins)
+ *   POST   /v1/paddle/checkout -> authenticated server-side Paddle transaction checkout
  *   GET    /v1/paddle/manage-billing -> redirect to a fresh Paddle billing-management URL
  *   POST   /v1/paddle/webhook -> Paddle checkout/licensing events -> entitlement writes (56c; signature-auth, no bearer)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
@@ -78,6 +80,11 @@ export default {
       if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
         return await handlePaddleManageBilling(userId, env);
+      }
+
+      if (pathname === "/v1/paddle/checkout" && request.method === "POST") {
+        const { userId } = await authenticate(request, env);
+        return await handlePaddleCheckout(userId, request, env);
       }
 
       if (pathname === "/v1/me" && request.method === "GET") {
@@ -231,6 +238,7 @@ export default {
         pathname === "/v1/draft" ||
         pathname === "/v1/me" ||
         pathname === "/v1/interest" ||
+        pathname === "/v1/paddle/checkout" ||
         pathname === "/v1/paddle/manage-billing" ||
         pathname === "/v1/paddle/webhook" ||
         pathname === "/healthz" ||

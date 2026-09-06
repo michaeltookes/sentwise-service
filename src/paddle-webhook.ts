@@ -5,17 +5,20 @@
 // src/paddle.ts; this file owns the Clerk + Paddle-API I/O.
 //
 // PRIVACY: this endpoint handles only plan/status/timestamps and price/
-// subscription/customer ids (plus a customer email used solely to match an
-// account when the checkout did not attach a Clerk user id). It never sees,
-// logs, or stores prompt or draft content, and it never logs the raw webhook
-// body.
+// subscription/customer ids (plus a customer email used solely to locate a
+// previously-bound account when Paddle omits checkout custom data). It never
+// sees, logs, or stores prompt or draft content, and it never logs the raw
+// webhook body.
 
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, type Env } from "./config";
 import { ApiError } from "./errors";
 import { numFrom } from "./metering";
-import { paddleCustomerMatchesAccount } from "./paddle-account";
+import {
+  paddleCheckoutBindingMatchesEvent,
+  paddleCustomerMatchesStoredAccount,
+} from "./paddle-account";
 import { fetchPaddleCustomerEmail } from "./paddle-api";
 import {
   adjustedTransactionIdFromEvent,
@@ -88,7 +91,7 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
-  // Resolve the Clerk user: custom_data.clerkUserId (primary), else email match.
+  // Resolve the Clerk user: signed checkout custom data or stored-customer email fallback.
   const userId = await resolveClerkUserId(event, env, clerk);
   if (!userId) {
     return ack({ mapped: false });
@@ -226,12 +229,14 @@ async function resolveClerkUserId(
       throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
     }
     const meta = user.privateMetadata ?? {};
-    return (await paddleCustomerMatchesAccount(user, meta, customerId, env))
+    if (paddleCustomerMatchesStoredAccount(meta, customerId)) return fromCustomData;
+    return (await paddleCheckoutBindingMatchesEvent(event, fromCustomData, env))
       ? fromCustomData
       : null;
   }
 
-  // Fallback: look the customer's email up in Clerk.
+  // Fallback: look the customer's email up in Clerk. The serialized writer still
+  // requires the account to have this Paddle customer id already stored.
   const customerId = customerIdFromEvent(event);
   if (!customerId) return null;
   const email = await fetchPaddleCustomerEmail(env, customerId);

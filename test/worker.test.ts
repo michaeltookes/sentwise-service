@@ -34,6 +34,9 @@ const env: Env = {
   CLERK_PUBLISHABLE_KEY: "pk_test",
 };
 
+const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
+const OVERAGE_PRICE = "pri_overage";
+const PADDLE_SECRET = "pdl_ntfset_testsecret";
 const ACCOUNT_DELETION_KEY = "account_deletion";
 
 function usageAnalytics() {
@@ -739,6 +742,83 @@ describe("GET /v1/paddle/manage-billing", () => {
 
     expect(res.status).toBe(502);
     expect(((await res.json()) as any).error.type).toBe("billing_portal_unavailable");
+  });
+});
+
+describe("POST /v1/paddle/checkout", () => {
+  const paddleEnv: Env = {
+    ...env,
+    PADDLE_WEBHOOK_SECRET: PADDLE_SECRET,
+    PADDLE_API_KEY: "pdl_apikey",
+    PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+    EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE,
+  };
+
+  it("creates a server-authenticated Paddle transaction checkout", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: {
+              id: "txn_123",
+              checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_123" },
+            },
+          }),
+          { status: 201 },
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      transactionId: "txn_123",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_123",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/transactions",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer pdl_apikey" }),
+      }),
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string) as Record<string, any>;
+    expect(body).toMatchObject({
+      collection_mode: "automatic",
+      items: [{ price_id: PRO_PRICE, quantity: 1 }],
+      checkout: { url: null },
+    });
+    expect(body.custom_data).toMatchObject({ clerkUserId: "user_123" });
+    expect(body.custom_data.sentwiseCheckoutBinding).toMatch(/^v1:[0-9a-f]{64}$/);
+  });
+
+  it("rejects unsupported checkout prices before calling Paddle", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: "pri_attacker" }),
+      }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

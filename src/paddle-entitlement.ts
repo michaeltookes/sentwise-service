@@ -154,7 +154,7 @@ export async function recordPaddleOverageInClerk(
   }
 
   const meta = user.privateMetadata ?? {};
-  if (!(await paddleCustomerMatchesAccount(user, meta, body.customerId, env))) {
+  if (!paddleCustomerMatchesAccount(user, meta, body.customerId, env)) {
     return { mapped: false };
   }
 
@@ -220,7 +220,7 @@ export async function revokePaddleOverageInClerk(
   }
 
   const meta = user.privateMetadata ?? {};
-  if (!(await paddleCustomerMatchesAccount(user, meta, body.customerId, env))) {
+  if (!paddleCustomerMatchesAccount(user, meta, body.customerId, env)) {
     return { mapped: false };
   }
 

@@ -47,8 +47,8 @@ export interface Env {
 
   // 56c — checkout + licensing (Paddle). The two Paddle credentials are SECRETS
   // (set via `wrangler secret put`, never committed); the rest are public vars.
-  PADDLE_WEBHOOK_SECRET?: string; // Paddle notification-destination secret (pdl_ntfset_…); verifies POST /v1/paddle/webhook
-  PADDLE_API_KEY?: string; // Paddle API key (pdl_…); verifies customer mapping + reads on-demand management URLs
+  PADDLE_WEBHOOK_SECRET?: string; // Paddle notification-destination secret (pdl_ntfset_…); verifies webhooks + signs checkout binding
+  PADDLE_API_KEY?: string; // Paddle API key (pdl_…); creates checkouts, verifies mapping, reads management/current subscription state
   PADDLE_API_BASE?: string; // Paddle REST base; defaults to the SANDBOX base (PADDLE_SANDBOX_API_BASE)
   PADDLE_WEBHOOK_TOLERANCE_SEC?: string | number; // signature freshness window (seconds); default DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC
 

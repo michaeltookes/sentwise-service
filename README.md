@@ -68,7 +68,7 @@ access past the 14-day trial.
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin
   -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
   -> src/anthropic.ts       forward to Anthropic, map the response — no logging, no storage
@@ -335,12 +335,27 @@ edit it there when pricing changes or a new model is added.
 
 ## Checkout & licensing (56c)
 
-Checkout and licensing run on **Paddle**. The app opens a Paddle checkout (passing the buyer's Clerk
-user id as `custom_data.clerkUserId`); Paddle then calls this Worker's webhook, which turns billing
-events into the account's entitlement — the `subscription` record read by
+Checkout and licensing run on **Paddle**. The app asks this Worker to create a Paddle transaction for
+the authenticated account, then opens that transaction in Paddle.js; Paddle then calls this Worker's
+webhook, which turns billing events into the account's entitlement — the `subscription` record read by
 [`GET /v1/me`](#subscription-item-73) and the per-tier weekly draft limit enforced by
 [Metering](#metering-56b). The app never mints a license itself; **Paddle → this webhook → Clerk
 `privateMetadata`** is the only source of truth.
+
+### `POST /v1/paddle/checkout`
+
+**Clerk bearer required.** The request body is `{ "priceId": "pri_...", "quantity": 1 }`.
+`priceId` must be one of the configured subscription tier prices or `EXTRA_DRAFTS_PRICE_ID`.
+Subscription quantities must be `1`; overage quantities are capped.
+
+The Worker creates `POST /transactions` in Paddle with server-minted `custom_data` and returns:
+
+```json
+{ "transactionId": "txn_...", "checkoutUrl": "https://..." }
+```
+
+The app should open the returned `transactionId` with Paddle.js. `checkoutUrl` is present when Paddle
+returns its hosted payment link.
 
 ### `POST /v1/paddle/webhook`
 
@@ -362,13 +377,14 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 | `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID` |
 | `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion       |
 
-**Account mapping.** `data.custom_data.clerkUserId` (attached by the app's checkout) identifies the
-candidate Clerk user, but it is trusted only when the Paddle `customer_id` matches the account's
-stored `paddleCustomerId` or `GET /customers/{id}` returns an email on that Clerk user. Events
-without custom data use the same Paddle customer-email lookup (`GET /customers/{id}` →
-`getUserList`). If no account matches, or if the candidate user does not match the Paddle customer,
-the event is acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help. Transient
-Paddle/Clerk lookup failures return `502` so Paddle retries.
+**Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
+is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or
+when the Paddle `customer_id` already matches the account's stored `paddleCustomerId`. Events without
+custom data may use Paddle customer-email lookup (`GET /customers/{id}` → `getUserList`) only to
+locate a previously-bound account; email equality alone never creates a first-time binding. If no
+account matches, or if the candidate user does not match the Paddle customer, the event is
+acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help. Transient Paddle/Clerk lookup
+failures and missing Paddle API credentials return `502` so Paddle retries.
 
 **Price → tier.** `data.items[].price.id` maps to a tier via `PRICE_TO_PLAN` in `src/config.ts`
 (SANDBOX ids today):
@@ -400,8 +416,11 @@ when that transaction is later delivered.
 **Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
 updated. Subscription writes are skipped when the incoming `event_id` equals the stored `lastEventId`,
-or when a strictly older `occurred_at` would clobber a newer stored record. Overage writes are skipped
-when the `event_id` is in the bounded `processedOverageEventIds` list (the legacy
+when a strictly older `occurred_at` would clobber a newer stored record, or when a different
+subscription id is already known as superseded. A different active/trialing subscription may replace
+the stored one only with a signed checkout binding and a live Paddle subscription lookup confirming
+that it is still active/trialing for the same customer. Overage writes are skipped when the `event_id`
+is in the bounded `processedOverageEventIds` list (the legacy
 `lastOverageEventId` is still honored). Approved adjustment reversals/restores are skipped when the
 `adjustment_id` is in the bounded `processedOverageAdjustmentIds` list; unmatched approved reversals
 are retained in a bounded `pendingOverageReversals` list by transaction id. A transient Clerk failure
@@ -446,13 +465,12 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   read** permission, used by `/admin/margin` to query the Analytics Engine SQL API. When unset,
   `/admin/margin` returns `503 analytics_unavailable`.
 - `PADDLE_WEBHOOK_SECRET` — **56c.** The Paddle notification-destination signing secret
-  (`pdl_ntfset_…`) that verifies `POST /v1/paddle/webhook`. When unset, every webhook is rejected
-  `401` (nothing is entitled).
-- `PADDLE_API_KEY` — **56c, optional-but-recommended.** A Paddle API key (`subscription.read` +
-  `customer.read`) used by `GET /v1/paddle/manage-billing` to fetch a fresh temporary portal URL and
-  by the webhook to verify a checkout's Paddle customer against the Clerk account. When unset,
-  billing management cannot redirect and first-time Paddle customer mappings are not accepted unless
-  the account already has a matching stored `paddleCustomerId`.
+  (`pdl_ntfset_…`) that verifies `POST /v1/paddle/webhook` and signs the checkout account binding.
+  When unset, every webhook is rejected `401` and `POST /v1/paddle/checkout` is unavailable.
+- `PADDLE_API_KEY` — **56c.** A Paddle API key (`transaction.write`, `subscription.read`, and
+  `customer.read`) used by `POST /v1/paddle/checkout`, `GET /v1/paddle/manage-billing`, cross-subscription
+  replacement checks, and webhook fallback mapping. Missing credentials make those operations fail
+  closed with `5xx` instead of acknowledging paid events.
 
 Push them to the Worker with (values are read from the file, never printed):
 

@@ -23,6 +23,7 @@ vi.mock("@clerk/backend", () => ({
 }));
 
 import worker from "../src/index";
+import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
@@ -117,9 +118,11 @@ function subBody(fields: {
   customerId?: string;
   subscriptionId?: string;
   nextBilledAt?: string;
+  customData?: Record<string, unknown>;
 }): string {
   const custom =
-    fields.clerkUserId === null ? {} : { clerkUserId: fields.clerkUserId ?? "user_abc" };
+    fields.customData ??
+    (fields.clerkUserId === null ? {} : { clerkUserId: fields.clerkUserId ?? "user_abc" });
   return JSON.stringify({
     event_id: fields.eventId ?? "evt_1",
     event_type: fields.eventType ?? "subscription.created",
@@ -370,7 +373,99 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("skips an active retry from a superseded Paddle subscription", async () => {
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env);
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_current",
+          paddleCustomerId: "ctm_123",
+          supersededPaddleSubscriptionIds: ["sub_old"],
+          lastEventId: "evt_current",
+          updatedAt: "2026-09-05T00:00:00.000Z",
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.activated",
+        eventId: "evt_old_active_retry",
+        subscriptionId: "sub_old",
+        status: "active",
+        occurredAt: "2026-09-06T00:00:00.000Z",
+        customData,
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, stale: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("checks Paddle before allowing a different active subscription to replace the stored one", async () => {
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL): Promise<Response> => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/subscriptions/sub_old")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "canceled" } }), {
+              status: 200,
+            }),
+          );
+        }
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      }),
+    );
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_current",
+          paddleCustomerId: "ctm_123",
+          lastEventId: "evt_current",
+          updatedAt: "2026-09-05T00:00:00.000Z",
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.activated",
+        eventId: "evt_old_active_retry",
+        subscriptionId: "sub_old",
+        status: "active",
+        occurredAt: "2026-09-06T00:00:00.000Z",
+        customData,
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, stale: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
   it("allows a fresh active subscription to replace a different stored subscription", async () => {
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL): Promise<Response> => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/subscriptions/sub_current")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "active" } }), {
+              status: 200,
+            }),
+          );
+        }
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      }),
+    );
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: {
@@ -391,6 +486,7 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
         subscriptionId: "sub_current",
         status: "active",
         occurredAt: "2026-09-05T00:00:00.000Z",
+        customData,
       }),
     );
 
@@ -399,6 +495,7 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
       paddleSubscriptionId: "sub_current",
       status: "active",
       lastEventId: "evt_new_sub",
+      supersededPaddleSubscriptionIds: ["sub_old"],
     });
   });
 
@@ -1025,6 +1122,33 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("does not trust unsigned first-time custom_data.clerkUserId even when the email matches", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+
+    const res = await signedReq(subBody({ clerkUserId: "user_abc", customerId: "ctm_attacker" }));
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("accepts signed checkout custom data for first-time Paddle customer binding", async () => {
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null, quota: {} }));
+
+    const res = await signedReq(subBody({ customData, customerId: "ctm_new" }));
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(lastWrite()?.subscription.paddleCustomerId).toBe("ctm_new");
+  });
+
   it("accepts custom_data.clerkUserId when the stored Paddle customer id matches", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -1117,6 +1241,18 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     });
     expect(res.status).toBe(502);
     expect(((await res.json()) as any).error.type).toBe("account_lookup_failed");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("returns 502 when the Paddle API key is missing for email fallback", async () => {
+    const res = await signedReq(subBody({ clerkUserId: null, customerId: "ctm_email" }), {
+      overrideEnv: { ...env, PADDLE_API_KEY: "" },
+    });
+
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("customer_lookup_failed");
+    expect(mocks.getUserList).not.toHaveBeenCalled();
     expect(mocks.getUser).not.toHaveBeenCalled();
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
