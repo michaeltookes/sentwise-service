@@ -653,6 +653,7 @@ export class AccountQuota {
 
   private async handleFinishDelete(body: DeletionBody): Promise<Response> {
     const now = normalizedNow(body.now);
+    await this.privateMetadataWriteQueue.catch(() => undefined);
     await this.storage.put(ACCOUNT_DELETION_KEY, { status: "deleted", updatedAt: now });
     await this.scheduleAccountDeletionAlarm(now + 1).catch(() => undefined);
     try {

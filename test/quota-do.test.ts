@@ -105,6 +105,16 @@ async function callDO<T>(userId: string, op: string, body: unknown): Promise<T> 
   return res.json<T>();
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 async function pendingSettlements(stub: DurableObjectStub): Promise<PendingSettlementRecord[]> {
   return runInDurableObject(stub, async (_instance, state) => {
     const pending = await state.storage.list<PendingSettlementRecord>({
@@ -443,6 +453,51 @@ describe("AccountQuota Durable Object", () => {
     });
     expect(check.status).toBe(410);
     expect(((await check.json()) as any).error.type).toBe("account_deleted");
+    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
+  it("waits for in-flight entitlement writes before final deletion cleanup", async () => {
+    const uid = "delete-waits-entitlement";
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockImplementation(async () => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+    });
+
+    const overage = callDOResponse(uid, "/paddle-overage", {
+      now: MON,
+      eventId: "evt_overage",
+      transactionId: "txn_overage",
+      customerId: "ctm_123",
+      extraDrafts: 1,
+      credits: [{ transactionItemId: null, extraDrafts: 1, amount: null }],
+    });
+    await writeStarted.promise;
+
+    let deletionFinished = false;
+    const finish = callDO<{ deleted: boolean }>(uid, "/finish-delete", {
+      now: MON + 1,
+      attemptId: "delete",
+    }).then((result) => {
+      deletionFinished = true;
+      return result;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(deletionFinished).toBe(false);
+
+    releaseWrite.resolve();
+    expect((await (await overage).json()) as any).toEqual({ applied: true, extraDrafts: 1 });
+    expect(await finish).toEqual({ deleted: true, cleanupPending: false });
     expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
   });
 

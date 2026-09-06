@@ -741,12 +741,26 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("is idempotent on the overage event id", async () => {
+    const monday = mondayStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         quota: {
-          extraDrafts: 25,
-          extraDraftsWindowStart: mondayStartUtc(Date.now()),
+          extraDrafts: 15,
+          extraDraftsWindowStart: monday,
           lastOverageEventId: "evt_txn",
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 25,
+              windowStart: monday,
+              reversedDrafts: 10,
+              reversalAdjustmentIds: ["adj_refund"],
+              reversedDraftsByAdjustment: [
+                { adjustmentId: "adj_refund", action: "refund", drafts: 10 },
+              ],
+            },
+          ],
         },
       }),
     );
@@ -759,6 +773,17 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedDrafts: 10,
+        reversalAdjustmentIds: ["adj_refund"],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_refund", action: "refund", drafts: 10 }],
+      },
+    ]);
   });
 
   it("is idempotent when replaying any retained processed overage event id", async () => {

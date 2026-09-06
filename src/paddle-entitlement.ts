@@ -181,13 +181,14 @@ export async function recordPaddleOverageInClerk(
       typeof existingQuota.extraDraftsWindowStart === "number"
         ? existingQuota.extraDraftsWindowStart
         : mondayStartUtc(body.now);
+    const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
     await saveOverageCredits(
       ledgerStore,
       mergeOverageCredits([
-        ...(await loadOverageCredits(existingQuota, ledgerStore)),
         ...body.credits.map((credit) =>
           storedCreditFromInput(body.eventId, body.transactionId, credit, repairWindowStart),
         ),
+        ...existingCredits,
       ]),
     );
     return { idempotent: true };
