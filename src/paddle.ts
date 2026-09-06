@@ -1,0 +1,356 @@
+// Pure, I/O-free Paddle helpers (56c — checkout + licensing). Signature
+// verification, webhook-event parsing, and the mapping from a Paddle event to
+// the Sentwise subscription wire record + the per-tier quota limit. Everything
+// here is deterministic and unit-testable: crypto is WebCrypto (no network), and
+// there is no Clerk, no storage, and no logging.
+//
+// PRIVACY: this module handles only plan/status enums, timestamps, billing URLs,
+// price/subscription/customer ids, and integer draft counts — never prompt or
+// draft content. The webhook body it verifies carries billing metadata only.
+
+import {
+  DEFAULT_EXTRA_DRAFTS_PER_UNIT,
+  DEFAULT_PRO_DRAFT_LIMIT,
+  DEFAULT_STARTER_DRAFT_LIMIT,
+  DEFAULT_UNLIMITED_DRAFT_LIMIT,
+  PRICE_TO_PLAN,
+  type PaidPlan,
+} from "./config";
+import { numFrom } from "./metering";
+import type { SubscriptionPlan, SubscriptionStatus } from "./subscription";
+
+// The subscription lifecycle events we act on, plus the transaction event that
+// carries an overage ("buy more drafts") purchase.
+export const HANDLED_EVENT_TYPES = [
+  "subscription.created",
+  "subscription.updated",
+  "subscription.canceled",
+  "subscription.past_due",
+  "transaction.completed",
+] as const;
+
+export type HandledEventType = (typeof HANDLED_EVENT_TYPES)[number];
+
+export function isSubscriptionEvent(eventType: string): boolean {
+  return eventType.startsWith("subscription.");
+}
+
+// ---------------------------------------------------------------------------
+// Signature verification (Paddle "Verify webhook signatures").
+// Header: `ts=<unix-seconds>;h1=<hex-hmac-sha256>` over the payload `<ts>:<rawBody>`.
+// ---------------------------------------------------------------------------
+
+export interface ParsedPaddleSignature {
+  ts: number; // Unix seconds
+  h1: string; // hex HMAC-SHA256
+}
+
+/** Parse the `Paddle-Signature` header into its `ts` and `h1` parts, or null. */
+export function parsePaddleSignatureHeader(
+  header: string | null | undefined,
+): ParsedPaddleSignature | null {
+  if (!header) return null;
+  let ts: number | null = null;
+  let h1: string | null = null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    const val = part.slice(eq + 1).trim();
+    if (key === "ts") {
+      const n = Number(val);
+      if (Number.isFinite(n)) ts = n;
+    } else if (key === "h1") {
+      h1 = val;
+    }
+  }
+  if (ts === null || !h1 || !/^[0-9a-f]+$/i.test(h1)) return null;
+  return { ts, h1 };
+}
+
+/** Constant-time compare of two equal-length hex strings. Length-mismatch is a fast false. */
+export function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/** HMAC-SHA256 of `message` under `secret`, hex-encoded. WebCrypto, no I/O. */
+export async function computeHmacSha256Hex(secret: string, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export type SignatureFailure = "no_secret" | "malformed" | "stale" | "mismatch";
+export type SignatureResult = { ok: true } | { ok: false; reason: SignatureFailure };
+
+/**
+ * Verify a Paddle webhook signature against the exact raw body. Rejects a missing
+ * secret, a malformed header, a stale timestamp (outside `toleranceSec` in either
+ * direction), and a mismatched HMAC. Never throws; returns a tagged result.
+ */
+export async function verifyPaddleSignature(
+  rawBody: string,
+  signatureHeader: string | null | undefined,
+  secret: string | undefined,
+  now: number,
+  toleranceSec: number,
+): Promise<SignatureResult> {
+  if (!secret) return { ok: false, reason: "no_secret" };
+  const parsed = parsePaddleSignatureHeader(signatureHeader);
+  if (!parsed) return { ok: false, reason: "malformed" };
+  const ageSec = Math.abs(now / 1000 - parsed.ts);
+  if (ageSec > toleranceSec) return { ok: false, reason: "stale" };
+  const expected = await computeHmacSha256Hex(secret, `${parsed.ts}:${rawBody}`);
+  return timingSafeEqualHex(expected, parsed.h1) ? { ok: true } : { ok: false, reason: "mismatch" };
+}
+
+// ---------------------------------------------------------------------------
+// Event parsing.
+// ---------------------------------------------------------------------------
+
+export interface PaddleEvent {
+  eventId: string;
+  eventType: string;
+  occurredAt: string | null;
+  data: Record<string, unknown>;
+}
+
+/** Structurally parse a webhook body. Requires event_id, event_type, and a data object. */
+export function parsePaddleEvent(rawBody: string): PaddleEvent | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(rawBody);
+  } catch {
+    return null;
+  }
+  if (typeof json !== "object" || json === null) return null;
+  const r = json as Record<string, unknown>;
+  const eventId = typeof r.event_id === "string" ? r.event_id : null;
+  const eventType = typeof r.event_type === "string" ? r.event_type : null;
+  const data =
+    typeof r.data === "object" && r.data !== null ? (r.data as Record<string, unknown>) : null;
+  if (!eventId || !eventType || !data) return null;
+  return {
+    eventId,
+    eventType,
+    occurredAt: typeof r.occurred_at === "string" ? r.occurred_at : null,
+    data,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Data extraction from the `data` object.
+// ---------------------------------------------------------------------------
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
+}
+
+/** `data.custom_data.clerkUserId` — the app's checkout attaches this. */
+export function clerkUserIdFromEvent(event: PaddleEvent): string | null {
+  const custom = asRecord(event.data.custom_data);
+  const id = custom?.clerkUserId;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** `data.customer_id` on a subscription/transaction. */
+export function customerIdFromEvent(event: PaddleEvent): string | null {
+  const id = event.data.customer_id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** `data.id` — the subscription id on subscription.* events. */
+export function subscriptionIdFromEvent(event: PaddleEvent): string | null {
+  const id = event.data.id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** All `data.items[].price.id` values, in order. */
+export function priceIdsFromEvent(event: PaddleEvent): string[] {
+  const items = event.data.items;
+  if (!Array.isArray(items)) return [];
+  const out: string[] = [];
+  for (const item of items) {
+    const price = asRecord(asRecord(item)?.price);
+    const id = price?.id;
+    if (typeof id === "string" && id !== "") out.push(id);
+  }
+  return out;
+}
+
+/**
+ * The paid tier for a subscription event: the first item whose price id is in
+ * PRICE_TO_PLAN wins; the raw matching price id comes back too (for reconciliation).
+ * Returns null when no item maps to a known tier.
+ */
+export function planFromEvent(event: PaddleEvent): { plan: PaidPlan; priceId: string } | null {
+  for (const priceId of priceIdsFromEvent(event)) {
+    const plan = PRICE_TO_PLAN[priceId];
+    if (plan) return { plan, priceId };
+  }
+  return null;
+}
+
+/**
+ * Map an event to a wire `status`. Prefers the entity's own `data.status` (the
+ * source of truth), then falls back to the event type. A Paddle "paused"
+ * subscription is treated as `canceled` for access purposes.
+ */
+export function statusFromEvent(event: PaddleEvent): SubscriptionStatus {
+  const dataStatus = typeof event.data.status === "string" ? event.data.status : undefined;
+  switch (dataStatus) {
+    case "active":
+      return "active";
+    case "trialing":
+      return "trialing";
+    case "past_due":
+      return "past_due";
+    case "canceled":
+    case "paused":
+      return "canceled";
+  }
+  switch (event.eventType) {
+    case "subscription.canceled":
+      return "canceled";
+    case "subscription.past_due":
+      return "past_due";
+    default:
+      return "active";
+  }
+}
+
+/** Normalize any parseable timestamp to canonical ISO-with-millis, or null. */
+export function normalizeIso(v: unknown): string | null {
+  if (typeof v !== "string" || v === "") return null;
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms).toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// Per-tier weekly draft limit resolution (var-driven placeholders).
+// ---------------------------------------------------------------------------
+
+export interface PlanLimitEnv {
+  STARTER_DRAFT_LIMIT?: string | number;
+  PRO_DRAFT_LIMIT?: string | number;
+  UNLIMITED_DRAFT_LIMIT?: string | number;
+}
+
+/** Resolve a paid tier's weekly draft limit from vars, falling back to placeholders. */
+export function resolvePlanDraftLimit(env: PlanLimitEnv, plan: PaidPlan): number {
+  switch (plan) {
+    case "starter":
+      return numFrom(env.STARTER_DRAFT_LIMIT, DEFAULT_STARTER_DRAFT_LIMIT);
+    case "pro":
+      return numFrom(env.PRO_DRAFT_LIMIT, DEFAULT_PRO_DRAFT_LIMIT);
+    case "unlimited":
+      return numFrom(env.UNLIMITED_DRAFT_LIMIT, DEFAULT_UNLIMITED_DRAFT_LIMIT);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Overage ("buy more drafts") credit from a transaction.completed event.
+// ---------------------------------------------------------------------------
+
+export interface OverageEnv {
+  EXTRA_DRAFTS_PRICE_ID?: string;
+  EXTRA_DRAFTS_PER_UNIT?: string | number;
+}
+
+/**
+ * How many extra drafts a `transaction.completed` event credits, or 0 when it is
+ * not an overage purchase. Subscription renewals also emit transaction.completed,
+ * so crediting is deliberately gated: the event must either carry
+ * `custom_data.kind === "overage"` or include the configured overage price id.
+ *
+ * Amount precedence: an explicit numeric `custom_data.extraDrafts` wins; else the
+ * summed quantity of matching line items × EXTRA_DRAFTS_PER_UNIT (default 1).
+ */
+export function overageDraftsFromEvent(event: PaddleEvent, env: OverageEnv): number {
+  if (event.eventType !== "transaction.completed") return 0;
+
+  const custom = asRecord(event.data.custom_data);
+  const isOverageKind = typeof custom?.kind === "string" && custom.kind === "overage";
+  const overagePriceId =
+    typeof env.EXTRA_DRAFTS_PRICE_ID === "string" && env.EXTRA_DRAFTS_PRICE_ID !== ""
+      ? env.EXTRA_DRAFTS_PRICE_ID
+      : null;
+
+  const items = Array.isArray(event.data.items) ? event.data.items : [];
+  const matchingItems = overagePriceId
+    ? items.filter((item) => asRecord(asRecord(item)?.price)?.id === overagePriceId)
+    : items;
+  const hasConfiguredPrice = overagePriceId !== null && matchingItems.length > 0;
+
+  if (!isOverageKind && !hasConfiguredPrice) return 0;
+
+  // Explicit count wins.
+  if (custom && typeof custom.extraDrafts === "number" && Number.isFinite(custom.extraDrafts)) {
+    return Math.max(0, Math.floor(custom.extraDrafts));
+  }
+
+  const perUnit = numFrom(env.EXTRA_DRAFTS_PER_UNIT, DEFAULT_EXTRA_DRAFTS_PER_UNIT);
+  let units = 0;
+  for (const item of matchingItems) {
+    const q = asRecord(item)?.quantity;
+    if (typeof q === "number" && Number.isFinite(q) && q > 0) units += Math.floor(q);
+  }
+  if (units === 0 && isOverageKind) units = 1; // an overage-kind purchase with no usable quantity buys one unit
+  return Math.max(0, units * perUnit);
+}
+
+// ---------------------------------------------------------------------------
+// The stored `privateMetadata.subscription` record (56c writes; item 73 reads).
+// parseSubscriptionOverride reads plan/status/renewsAt/manageBillingUrl; the rest
+// is for reconciliation + idempotency.
+// ---------------------------------------------------------------------------
+
+export interface StoredSubscriptionRecord {
+  plan: SubscriptionPlan;
+  status: SubscriptionStatus;
+  renewsAt: string | null;
+  manageBillingUrl: string | null;
+  paddleSubscriptionId: string | null;
+  paddleCustomerId: string | null;
+  priceId: string | null;
+  updatedAt: string;
+  lastEventId: string; // idempotency guard
+}
+
+/**
+ * Build the subscription record to store for a subscription.* event. `plan` and
+ * `priceId` come from planFromEvent; `manageBillingUrl` is fetched separately
+ * (webhook side) and passed in, preserving a prior URL when the fetch is skipped.
+ */
+export function buildSubscriptionRecord(
+  event: PaddleEvent,
+  plan: SubscriptionPlan,
+  priceId: string | null,
+  manageBillingUrl: string | null,
+  now: number,
+): StoredSubscriptionRecord {
+  return {
+    plan,
+    status: statusFromEvent(event),
+    renewsAt: normalizeIso(event.data.next_billed_at),
+    manageBillingUrl,
+    paddleSubscriptionId: subscriptionIdFromEvent(event),
+    paddleCustomerId: customerIdFromEvent(event),
+    priceId,
+    updatedAt: normalizeIso(event.occurredAt) ?? new Date(now).toISOString(),
+    lastEventId: event.eventId,
+  };
+}
