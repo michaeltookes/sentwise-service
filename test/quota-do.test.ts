@@ -458,7 +458,12 @@ describe("AccountQuota Durable Object", () => {
 
   it("waits for in-flight entitlement writes before final deletion cleanup", async () => {
     const uid = "delete-waits-entitlement";
-    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
+    const values = new Map<string, unknown>();
+    const storage = fakeStorage(values);
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
     const writeStarted = deferred<void>();
     const releaseWrite = deferred<void>();
     clerkMocks.getUser.mockResolvedValue({
@@ -473,7 +478,18 @@ describe("AccountQuota Durable Object", () => {
       await releaseWrite.promise;
     });
 
-    const overage = callDOResponse(uid, "/paddle-overage", {
+    const fetchQuota = <T>(op: string, body: unknown) =>
+      quota
+        .fetch(
+          new Request(`https://account-quota.internal${op}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+        )
+        .then((res) => res.json<T>());
+
+    const overage = fetchQuota<{ applied: boolean; extraDrafts: number }>("/paddle-overage", {
       now: MON,
       eventId: "evt_overage",
       transactionId: "txn_overage",
@@ -484,7 +500,7 @@ describe("AccountQuota Durable Object", () => {
     await writeStarted.promise;
 
     let deletionFinished = false;
-    const finish = callDO<{ deleted: boolean }>(uid, "/finish-delete", {
+    const finish = fetchQuota<{ deleted: boolean; cleanupPending: boolean }>("/finish-delete", {
       now: MON + 1,
       attemptId: "delete",
     }).then((result) => {
@@ -496,9 +512,9 @@ describe("AccountQuota Durable Object", () => {
     expect(deletionFinished).toBe(false);
 
     releaseWrite.resolve();
-    expect((await (await overage).json()) as any).toEqual({ applied: true, extraDrafts: 1 });
+    expect(await overage).toEqual({ applied: true, extraDrafts: 1 });
     expect(await finish).toEqual({ deleted: true, cleanupPending: false });
-    expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
+    expect([...values.keys()].sort()).toEqual([ACCOUNT_DELETION_KEY]);
   });
 
   it("persists the deletion tombstone before scheduling cleanup retry", async () => {

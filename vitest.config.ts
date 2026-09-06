@@ -13,6 +13,7 @@ export default defineConfig({
           ANTHROPIC_API_KEY: "sk-ant-dummy",
           CLERK_PUBLISHABLE_KEY: "pk_test_dummy",
           PADDLE_WEBHOOK_SECRET: "pdl_ntfset_testsecret",
+          PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET: "old_checkout_binding_secret",
           PADDLE_API_KEY: "pdl_apikey",
           PADDLE_API_BASE: "https://sandbox-api.paddle.com",
         },
