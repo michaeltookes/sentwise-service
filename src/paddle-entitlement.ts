@@ -127,6 +127,10 @@ export type PaddleOverageReversalResult =
   | { ignored: "not_overage_reversal" }
   | { mapped: false };
 
+interface PaddleOverageWriteOptions {
+  allowInactiveSubscription?: boolean;
+}
+
 export function parsePaddleOverageBody(body: unknown): PaddleOverageBody {
   const record = asRecord(body);
   if (!record) {
@@ -198,6 +202,7 @@ export async function recordPaddleOverageInClerk(
   body: PaddleOverageBody,
   env: Env,
   ledgerStore?: PaddleOverageLedgerStore,
+  options: PaddleOverageWriteOptions = {},
 ): Promise<PaddleOverageResult> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
@@ -283,7 +288,7 @@ export async function recordPaddleOverageInClerk(
     return { idempotent: true };
   }
 
-  if (!storedSubscriptionAllowsOverage(meta.subscription)) {
+  if (!storedSubscriptionAllowsOverage(meta.subscription) && !options.allowInactiveSubscription) {
     return { mapped: false };
   }
 

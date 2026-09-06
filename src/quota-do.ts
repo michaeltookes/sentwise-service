@@ -541,8 +541,14 @@ export class AccountQuota {
     try {
       const parsed = parsePaddleOverageBody(body);
       const userId = this.requireUserId();
+      const allowInactiveSubscription = await this.overageCheckoutReservationMatchesTransaction(
+        parsed.transactionId,
+        parsed.customerId,
+      );
       const result = await this.enqueuePrivateMetadataWrite(() =>
-        recordPaddleOverageInClerk(userId, parsed, this.env, this.storage),
+        recordPaddleOverageInClerk(userId, parsed, this.env, this.storage, {
+          allowInactiveSubscription,
+        }),
       );
       await this.clearPaddleOverageCheckoutReservationForTransaction(parsed.transactionId);
       return Response.json(result);
@@ -780,6 +786,19 @@ export class AccountQuota {
       );
       if (reservation?.transactionId !== transactionId) return;
       await txn.delete(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY);
+    });
+  }
+
+  private async overageCheckoutReservationMatchesTransaction(
+    transactionId: string,
+    customerId: string | null,
+  ): Promise<boolean> {
+    if (!customerId) return false;
+    return this.storage.transaction(async (txn) => {
+      const reservation = parsePaddleCheckoutReservation(
+        await txn.get<unknown>(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY),
+      );
+      return reservation?.transactionId === transactionId && reservation.customerId === customerId;
     });
   }
 

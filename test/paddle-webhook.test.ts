@@ -1040,6 +1040,52 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(await storedPaddleOverageCheckoutReservation()).toBeUndefined();
   });
 
+  it("credits a tracked overage transaction completed after subscription cancellation", async () => {
+    const monday = mondayStartUtc(Date.now());
+    await seedPaddleOverageCheckoutReservation({
+      reservationId: "overage-open",
+      createdAt: Date.now(),
+      transactionId: "txn_evt_reserved",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_evt_reserved",
+      priceId: OVERAGE_PRICE,
+      quantity: 2,
+      customerId: "ctm_123",
+    });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+        quota: { weeklyDraftLimit: null },
+      }),
+    );
+
+    const res = await signedReq(
+      txnBody(
+        {
+          custom_data: {
+            clerkUserId: "user_abc",
+            kind: "overage",
+            sentwiseCheckoutReservationId: "overage-open",
+          },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 2 }],
+        },
+        "evt_reserved",
+      ),
+      { overrideEnv: overageEnv },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true, extraDrafts: 2 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(2);
+    expect(quota.extraDraftsWindowStart).toBe(monday);
+    expect(await storedPaddleOverageCheckoutReservation()).toBeUndefined();
+  });
+
   it("accumulates a second purchase within the same window", async () => {
     const monday = mondayStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
