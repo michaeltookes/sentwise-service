@@ -744,7 +744,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.weeklyDraftLimit).toBe(120); // preserved
     expect(quota.lastOverageEventId).toBe("evt_txn");
     expect(quota.processedOverageEventIds).toEqual(["evt_txn"]);
-    expect(quota.overageCredits).toBeNull();
+    expect(quota.overageCredits).toBeUndefined();
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
@@ -1230,7 +1230,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(0);
     expect(quota.processedOverageAdjustmentIds).toEqual(["adj_123"]);
-    expect(quota.overageCredits).toBeUndefined();
+    expect(quota.overageCredits).toBeNull();
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
