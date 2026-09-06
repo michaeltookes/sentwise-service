@@ -273,34 +273,24 @@ export interface OverageEnv {
 /**
  * How many extra drafts a `transaction.completed` event credits, or 0 when it is
  * not an overage purchase. Subscription renewals also emit transaction.completed,
- * so crediting is deliberately gated: the event must either carry
- * `custom_data.kind === "overage"` or include the configured overage price id.
- *
- * Amount precedence: an explicit numeric `custom_data.extraDrafts` wins; else the
- * summed quantity of matching line items × EXTRA_DRAFTS_PER_UNIT (default 1).
+ * so crediting requires the configured overage price id. The amount is derived
+ * only from matching line-item quantity times EXTRA_DRAFTS_PER_UNIT (default 1);
+ * buyer-supplied custom_data can tag a checkout but never controls the credit.
  */
 export function overageDraftsFromEvent(event: PaddleEvent, env: OverageEnv): number {
   if (event.eventType !== "transaction.completed") return 0;
 
-  const custom = asRecord(event.data.custom_data);
-  const isOverageKind = typeof custom?.kind === "string" && custom.kind === "overage";
   const overagePriceId =
     typeof env.EXTRA_DRAFTS_PRICE_ID === "string" && env.EXTRA_DRAFTS_PRICE_ID !== ""
       ? env.EXTRA_DRAFTS_PRICE_ID
       : null;
+  if (!overagePriceId) return 0;
 
   const items = Array.isArray(event.data.items) ? event.data.items : [];
-  const matchingItems = overagePriceId
-    ? items.filter((item) => asRecord(asRecord(item)?.price)?.id === overagePriceId)
-    : items;
-  const hasConfiguredPrice = overagePriceId !== null && matchingItems.length > 0;
-
-  if (!isOverageKind && !hasConfiguredPrice) return 0;
-
-  // Explicit count wins.
-  if (custom && typeof custom.extraDrafts === "number" && Number.isFinite(custom.extraDrafts)) {
-    return Math.max(0, Math.floor(custom.extraDrafts));
-  }
+  const matchingItems = items.filter(
+    (item) => asRecord(asRecord(item)?.price)?.id === overagePriceId,
+  );
+  if (matchingItems.length === 0) return 0;
 
   const perUnit = numFrom(env.EXTRA_DRAFTS_PER_UNIT, DEFAULT_EXTRA_DRAFTS_PER_UNIT);
   let units = 0;
@@ -308,7 +298,6 @@ export function overageDraftsFromEvent(event: PaddleEvent, env: OverageEnv): num
     const q = asRecord(item)?.quantity;
     if (typeof q === "number" && Number.isFinite(q) && q > 0) units += Math.floor(q);
   }
-  if (units === 0 && isOverageKind) units = 1; // an overage-kind purchase with no usable quantity buys one unit
   return Math.max(0, units * perUnit);
 }
 

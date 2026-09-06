@@ -10,9 +10,10 @@
 // or stores prompt or draft content, and it never logs the raw webhook body.
 
 import { createClerkClient } from "@clerk/backend";
+import { isClerkNotFoundError } from "./auth";
 import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, PADDLE_SANDBOX_API_BASE, type Env } from "./config";
 import { ApiError } from "./errors";
-import { mondayStartUtc, numFrom } from "./metering";
+import { numFrom } from "./metering";
 import {
   buildSubscriptionRecord,
   clerkUserIdFromEvent,
@@ -26,6 +27,7 @@ import {
   verifyPaddleSignature,
   type PaddleEvent,
 } from "./paddle";
+import { quotaRecordPaddleOverage } from "./quota-client";
 
 const HANDLED = new Set([
   "subscription.created",
@@ -78,20 +80,15 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
     return ack({ mapped: false });
   }
 
-  let user;
-  try {
-    user = await clerk.users.getUser(userId);
-  } catch {
-    // Transient — let Paddle retry.
-    throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
-  }
-  const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
-
   if (isSubscriptionEvent(event.eventType)) {
+    const meta = await loadClerkPrivateMetadata(clerk, userId);
+    if (!meta) {
+      return ack({ mapped: false });
+    }
     return await applySubscriptionEvent(event, env, clerk, userId, meta);
   }
   // transaction.completed → overage credit.
-  return await applyOverageEvent(event, env, clerk, userId, meta);
+  return await applyOverageEvent(event, env, userId);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +147,8 @@ async function applySubscriptionEvent(
     await clerk.users.updateUserMetadata(userId, {
       privateMetadata: { subscription: record, quota },
     });
-  } catch {
+  } catch (err) {
+    if (isClerkNotFoundError(err)) return ack({ mapped: false });
     throw new ApiError(502, "entitlement_write_failed", "Could not record the subscription.");
   }
   return ack({ applied: true });
@@ -160,46 +158,29 @@ async function applySubscriptionEvent(
 // transaction.completed → extra drafts stamped to the current weekly window.
 // ---------------------------------------------------------------------------
 
-async function applyOverageEvent(
-  event: PaddleEvent,
-  env: Env,
-  clerk: ReturnType<typeof createClerkClient>,
-  userId: string,
-  meta: Record<string, unknown>,
-): Promise<Response> {
+async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): Promise<Response> {
   const credit = overageDraftsFromEvent(event, env);
   if (credit <= 0) {
     // Most transaction.completed events are subscription renewals, not overage.
     return ack({ ignored: "not_overage" });
   }
 
-  const existingQuota = asRecord(meta.quota) ?? {};
-  // Idempotency: an overage transaction we already credited.
-  if (existingQuota.lastOverageEventId === event.eventId) {
-    return ack({ idempotent: true });
-  }
-
-  // 56b requires extras to be stamped to the current Monday window to count;
-  // accumulate within the same window, reset when the window has rolled.
-  const now = Date.now();
-  const windowStart = mondayStartUtc(now);
-  const sameWindow = existingQuota.extraDraftsWindowStart === windowStart;
-  const prevExtras =
-    sameWindow && typeof existingQuota.extraDrafts === "number" ? existingQuota.extraDrafts : 0;
-
-  const quota = {
-    ...existingQuota,
-    extraDrafts: prevExtras + credit,
-    extraDraftsWindowStart: windowStart,
-    lastOverageEventId: event.eventId,
-  };
-
   try {
-    await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
-  } catch {
-    throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase.");
+    const result = await quotaRecordPaddleOverage(env, userId, {
+      now: Date.now(),
+      eventId: event.eventId,
+      extraDrafts: credit,
+    });
+    return ack(result);
+  } catch (err) {
+    if (err instanceof ApiError && err.type === "account_deleted") {
+      return ack({ mapped: false });
+    }
+    if (err instanceof ApiError && err.type === "account_deletion_in_progress") {
+      throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
+    }
+    throw err;
   }
-  return ack({ applied: true, extraDrafts: credit });
 }
 
 // ---------------------------------------------------------------------------
@@ -226,12 +207,12 @@ async function resolveClerkUserId(
     const firstId = asRecord(arr[0])?.id;
     return typeof firstId === "string" ? firstId : null;
   } catch {
-    return null;
+    throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
   }
 }
 
 // ---------------------------------------------------------------------------
-// Paddle REST reads (best-effort; failures degrade to null, never throw).
+// Paddle REST reads.
 // ---------------------------------------------------------------------------
 
 function paddleApiBase(env: Env): string {
@@ -272,13 +253,30 @@ async function fetchCustomerEmail(env: Env, customerId: string): Promise<string 
         "content-type": "application/json",
       },
     });
-    if (!res.ok) return null;
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new ApiError(502, "customer_lookup_failed", "Could not resolve the customer.");
+    }
     const body: unknown = await res.json();
     const data = asRecord(asRecord(body)?.data);
     const email = data?.email;
     return typeof email === "string" && email !== "" ? email : null;
-  } catch {
-    return null;
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(502, "customer_lookup_failed", "Could not resolve the customer.");
+  }
+}
+
+async function loadClerkPrivateMetadata(
+  clerk: ReturnType<typeof createClerkClient>,
+  userId: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const user = await clerk.users.getUser(userId);
+    return user.privateMetadata ?? {};
+  } catch (err) {
+    if (isClerkNotFoundError(err)) return null;
+    throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
   }
 }
 

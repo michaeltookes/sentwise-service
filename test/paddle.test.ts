@@ -313,9 +313,9 @@ describe("overageDraftsFromEvent", () => {
     expect(overageDraftsFromEvent(event, {})).toBe(0);
   });
 
-  it("uses an explicit custom_data.extraDrafts count when kind=overage", () => {
+  it("ignores buyer-supplied custom_data.extraDrafts without the configured overage price", () => {
     const event = txn({ custom_data: { kind: "overage", extraDrafts: 50 }, items: [] })!;
-    expect(overageDraftsFromEvent(event, {})).toBe(50);
+    expect(overageDraftsFromEvent(event, {})).toBe(0);
   });
 
   it("sums quantities of the configured overage price id", () => {
@@ -339,9 +339,22 @@ describe("overageDraftsFromEvent", () => {
     ).toBe(20);
   });
 
-  it("defaults an overage-kind purchase with no usable quantity to one unit", () => {
+  it("derives credit from line items rather than buyer-supplied custom_data.extraDrafts", () => {
+    const event = txn({
+      custom_data: { kind: "overage", extraDrafts: 1_000_000 },
+      items: [{ price: { id: "pri_overage" }, quantity: 2 }],
+    })!;
+    expect(
+      overageDraftsFromEvent(event, {
+        EXTRA_DRAFTS_PRICE_ID: "pri_overage",
+        EXTRA_DRAFTS_PER_UNIT: 10,
+      }),
+    ).toBe(20);
+  });
+
+  it("does not credit an overage-kind purchase with no matching price item", () => {
     const event = txn({ custom_data: { kind: "overage" }, items: [] })!;
-    expect(overageDraftsFromEvent(event, {})).toBe(1);
+    expect(overageDraftsFromEvent(event, { EXTRA_DRAFTS_PRICE_ID: "pri_overage" })).toBe(0);
   });
 });
 

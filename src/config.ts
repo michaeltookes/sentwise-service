@@ -60,9 +60,9 @@ export interface Env {
   PRO_DRAFT_LIMIT?: string | number;
   UNLIMITED_DRAFT_LIMIT?: string | number;
 
-  // 56c — overage ("buy more drafts"). Optional: the one-time price id that
-  // credits extra drafts, and how many drafts one unit buys. When unset, an
-  // overage transaction is recognized only by `custom_data.kind === "overage"`.
+  // 56c — overage ("buy more drafts"). The one-time price id that credits extra
+  // drafts, and how many drafts one unit buys. When unset, overage purchases are
+  // ignored; buyer-supplied custom_data is never trusted for the credit amount.
   EXTRA_DRAFTS_PRICE_ID?: string;
   EXTRA_DRAFTS_PER_UNIT?: string | number;
 }
@@ -175,6 +175,5 @@ export const DEFAULT_STARTER_DRAFT_LIMIT = 30;
 export const DEFAULT_PRO_DRAFT_LIMIT = 120;
 export const DEFAULT_UNLIMITED_DRAFT_LIMIT = 100_000; // fair-use ceiling, not "infinite"
 
-// Default drafts credited per unit of the overage price when the transaction does
-// not carry an explicit `custom_data.extraDrafts` count.
+// Default drafts credited per unit of the configured overage price.
 export const DEFAULT_EXTRA_DRAFTS_PER_UNIT = 1;

@@ -48,7 +48,7 @@
     "UNLIMITED_DRAFT_LIMIT": "100000", // fair-use ceiling, not "infinite"
     "EXTRA_DRAFTS_PER_UNIT": "1", // drafts credited per unit of the overage price
     // EXTRA_DRAFTS_PRICE_ID: set to the one-time "buy more drafts" price id once it
-    // exists; until then an overage is recognized by custom_data.kind === "overage".
+    // exists; until then transaction.completed overage crediting stays disabled.
   },
 
   // 56b — per-account usage counters (weekly drafts/tokens + sliding rate-limit

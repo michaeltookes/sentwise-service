@@ -150,6 +150,27 @@ export async function clerkUserExists(userId: string, env: Env): Promise<boolean
   }
 }
 
+/** Clerk's SDK versions expose 404s with slightly different error shapes. */
+export function isClerkNotFoundError(err: unknown): boolean {
+  const record = isRecord(err) ? err : null;
+  if (!record) return false;
+
+  const status = record.status ?? record.statusCode;
+  if (status === 404) return true;
+
+  const errors = record.errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some((item) => {
+    const error = isRecord(item) ? item : null;
+    const code = error?.code;
+    return code === "resource_not_found" || code === "not_found";
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 /**
  * Gate drafting access. Returns the resolved account when access is granted, else
  * throws 402. Access is granted by an active trial OR (56c) an active paid

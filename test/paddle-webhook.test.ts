@@ -27,6 +27,7 @@ import worker from "../src/index";
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
 const UNLIMITED_PRICE = "pri_01m1syrdg05f49kz705gbzn6tz";
+const OVERAGE_PRICE = "pri_overage";
 const SECRET = "pdl_ntfset_testsecret";
 
 const env: Env = {
@@ -104,6 +105,16 @@ function subBody(fields: {
 function lastWrite() {
   const call = mocks.updateUserMetadata.mock.calls.at(-1);
   return call?.[1]?.privateMetadata as { subscription?: any; quota?: any } | undefined;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("POST /v1/paddle/webhook — signature", () => {
@@ -288,13 +299,16 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     });
   }
 
+  const overageEnv: Env = { ...env, EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE };
+
   it("credits extra drafts stamped to the CURRENT Monday window", async () => {
     mocks.getUser.mockResolvedValue(userWith({ quota: { weeklyDraftLimit: 120 } }));
     const res = await signedReq(
       txnBody({
-        custom_data: { clerkUserId: "user_abc", kind: "overage", extraDrafts: 25 },
-        items: [],
+        custom_data: { clerkUserId: "user_abc", kind: "overage", extraDrafts: 1_000_000 },
+        items: [{ price: { id: OVERAGE_PRICE }, quantity: 25 }],
       }),
+      { overrideEnv: overageEnv },
     );
     expect(res.status).toBe(200);
     expect((await res.json()) as any).toEqual({ ok: true, applied: true, extraDrafts: 25 });
@@ -304,6 +318,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.extraDraftsWindowStart).toBe(mondayStartUtc(Date.now()));
     expect(quota.weeklyDraftLimit).toBe(120); // preserved
     expect(quota.lastOverageEventId).toBe("evt_txn");
+    expect(quota.processedOverageEventIds).toEqual(["evt_txn"]);
   });
 
   it("accumulates a second purchase within the same window", async () => {
@@ -315,13 +330,18 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     await signedReq(
       txnBody(
-        { custom_data: { clerkUserId: "user_abc", kind: "overage", extraDrafts: 5 }, items: [] },
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+        },
         "evt_new",
       ),
+      { overrideEnv: overageEnv },
     );
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(15);
     expect(quota.extraDraftsWindowStart).toBe(monday);
+    expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_new"]);
   });
 
   it("resets extras when the stored purchase belongs to a prior window", async () => {
@@ -330,9 +350,10 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     await signedReq(
       txnBody({
-        custom_data: { clerkUserId: "user_abc", kind: "overage", extraDrafts: 5 },
-        items: [],
+        custom_data: { clerkUserId: "user_abc", kind: "overage" },
+        items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
       }),
+      { overrideEnv: overageEnv },
     );
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(5);
@@ -351,12 +372,92 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     const res = await signedReq(
       txnBody({
-        custom_data: { clerkUserId: "user_abc", kind: "overage", extraDrafts: 25 },
-        items: [],
+        custom_data: { clerkUserId: "user_abc", kind: "overage" },
+        items: [{ price: { id: OVERAGE_PRICE }, quantity: 25 }],
       }),
+      { overrideEnv: overageEnv },
     );
     expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent when replaying any retained processed overage event id", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: {
+          extraDrafts: 30,
+          extraDraftsWindowStart: monday,
+          lastOverageEventId: "evt_b",
+          processedOverageEventIds: ["evt_a", "evt_b"],
+        },
+      }),
+    );
+    const res = await signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 10 }],
+        },
+        "evt_a",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("serializes overlapping overage writes through the account Durable Object", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let storedMeta: Record<string, unknown> = {
+      quota: { extraDrafts: 0, extraDraftsWindowStart: monday },
+    };
+    const firstWrite = deferred<void>();
+    const firstWriteStarted = deferred<void>();
+
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation(async (_userId, update) => {
+      const quota = update.privateMetadata.quota as Record<string, unknown>;
+      if (quota.lastOverageEventId === "evt_a") {
+        firstWriteStarted.resolve();
+        await firstWrite.promise;
+      }
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const first = signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 10 }],
+        },
+        "evt_a",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    await firstWriteStarted.promise;
+
+    const second = signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+        },
+        "evt_b",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.getUser).toHaveBeenCalledTimes(1);
+
+    firstWrite.resolve();
+    await Promise.all([first, second]);
+
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(15);
+    expect(quota.extraDraftsWindowStart).toBe(monday);
+    expect(quota.processedOverageEventIds).toEqual(["evt_a", "evt_b"]);
   });
 
   it("ignores a plain renewal transaction (no overage markers)", async () => {
@@ -375,6 +476,22 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     expect(res.status).toBe(200);
     expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
     expect(mocks.getUser).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges 200 mapped:false for a stale custom_data.clerkUserId", async () => {
+    mocks.getUser.mockRejectedValue({ status: 404 });
+    const res = await signedReq(subBody({ clerkUserId: "user_deleted" }));
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("returns 502 when direct Clerk user lookup fails transiently", async () => {
+    mocks.getUser.mockRejectedValue(new Error("clerk down"));
+    const res = await signedReq(subBody({ clerkUserId: "user_abc" }));
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("account_lookup_failed");
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
   it("falls back to matching the customer email in Clerk", async () => {
@@ -417,6 +534,52 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     expect(mocks.getUser).toHaveBeenCalledWith("user_matched");
     // manage-billing URL fetched from the Paddle API and stored.
     expect(lastWrite()?.subscription.manageBillingUrl).toBe("https://portal.paddle.com/manage/abc");
+  });
+
+  it("returns 502 when the Clerk email fallback lookup fails transiently", async () => {
+    const envWithApi: Env = {
+      ...env,
+      PADDLE_API_KEY: "pdl_apikey",
+      PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ data: { email: "marcus@example.com" } }), { status: 200 }),
+        ),
+      ),
+    );
+    mocks.getUserList.mockRejectedValue(new Error("clerk list down"));
+
+    const res = await signedReq(subBody({ clerkUserId: null, customerId: "ctm_email" }), {
+      overrideEnv: envWithApi,
+    });
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("account_lookup_failed");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("returns 502 when the Paddle customer email lookup fails transiently", async () => {
+    const envWithApi: Env = {
+      ...env,
+      PADDLE_API_KEY: "pdl_apikey",
+      PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("{}", { status: 503 }))),
+    );
+
+    const res = await signedReq(subBody({ clerkUserId: null, customerId: "ctm_email" }), {
+      overrideEnv: envWithApi,
+    });
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("customer_lookup_failed");
+    expect(mocks.getUserList).not.toHaveBeenCalled();
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
   it("returns 502 (Paddle retries) when the Clerk write fails", async () => {

@@ -15,6 +15,7 @@
 //   POST /reserve { now, reservationId, estimatedTokens, limits } -> { reserved, ... }
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /interest { topic } -> serialize Clerk interest metadata writes per user
+//   POST /paddle-overage { now, eventId, extraDrafts } -> serialize Paddle overage entitlement writes
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /defer-release { now, reservationId, reservationWindowStart, estimatedTokens }
@@ -28,6 +29,7 @@ import { ACCOUNT_DELETION_BARRIER_TIMEOUT_MS, type Env } from "./config";
 import { clerkUserExists, deleteClerkUser } from "./auth";
 import { ApiError, jsonError } from "./errors";
 import { parseInterestTopic, recordInterestInClerk } from "./interest";
+import { parsePaddleOverageBody, recordPaddleOverageInClerk } from "./paddle-entitlement";
 import {
   activeReservations,
   pruneStamps,
@@ -122,7 +124,7 @@ export class AccountQuota {
   private readonly storage: DurableObjectStorage;
   private readonly env: Env;
   private readonly userId?: string;
-  private interestWriteQueue: Promise<void> = Promise.resolve();
+  private privateMetadataWriteQueue: Promise<void> = Promise.resolve();
 
   constructor(state: DurableObjectState, env: Env) {
     this.storage = state.storage;
@@ -172,6 +174,8 @@ export class AccountQuota {
         return this.handlePeek(await request.json<PeekBody>());
       case "/interest":
         return this.handleInterest(await request.json<unknown>());
+      case "/paddle-overage":
+        return this.handlePaddleOverage(await request.json<unknown>());
       default:
         return new Response("not found", { status: 404 });
     }
@@ -442,7 +446,7 @@ export class AccountQuota {
     try {
       const topic = parseInterestTopic(body);
       const userId = this.requireUserId();
-      const result = await this.enqueueInterestWrite(() =>
+      const result = await this.enqueuePrivateMetadataWrite(() =>
         recordInterestInClerk(userId, topic, this.env),
       );
       return Response.json(result);
@@ -452,9 +456,23 @@ export class AccountQuota {
     }
   }
 
-  private enqueueInterestWrite<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.interestWriteQueue.catch(() => undefined).then(operation);
-    this.interestWriteQueue = run.then(
+  private async handlePaddleOverage(body: unknown): Promise<Response> {
+    try {
+      const parsed = parsePaddleOverageBody(body);
+      const userId = this.requireUserId();
+      const result = await this.enqueuePrivateMetadataWrite(() =>
+        recordPaddleOverageInClerk(userId, parsed, this.env),
+      );
+      return Response.json(result);
+    } catch (err) {
+      if (err instanceof ApiError) return err.toResponse();
+      throw err;
+    }
+  }
+
+  private enqueuePrivateMetadataWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.privateMetadataWriteQueue.catch(() => undefined).then(operation);
+    this.privateMetadataWriteQueue = run.then(
       () => undefined,
       () => undefined,
     );

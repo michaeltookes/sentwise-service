@@ -46,6 +46,8 @@ export interface FinishAccountDeletionResult {
 export interface RecordInterestResult {
   recorded: boolean;
 }
+export type PaddleOverageResult =
+  { applied: true; extraDrafts: number } | { idempotent: true } | { mapped: false };
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
   const id = env.ACCOUNT_QUOTA.idFromName(userId);
@@ -160,6 +162,15 @@ export function quotaRecordInterest(
   body: { topic: InterestTopic },
 ): Promise<RecordInterestResult> {
   return call<RecordInterestResult>(env, userId, "/interest", body);
+}
+
+/** Serialize and record a Paddle overage entitlement through the user's Durable Object. */
+export function quotaRecordPaddleOverage(
+  env: Env,
+  userId: string,
+  body: { now: number; eventId: string; extraDrafts: number },
+): Promise<PaddleOverageResult> {
+  return call<PaddleOverageResult>(env, userId, "/paddle-overage", body);
 }
 
 /** Set a deletion barrier before attempting Clerk deletion. Does not wipe counters. */

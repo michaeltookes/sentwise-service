@@ -273,10 +273,11 @@ capacity is reclaimed before the weekly reset.
 | `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).                      |
 
 **Per-account overrides.** `privateMetadata.quota` on the Clerk user —
-`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart? }` — overrides the
-vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart` equals the current
-weekly window's Monday 00:00 UTC epoch-ms `windowStart`; stale or unscoped credits are ignored. These
-are read on the same `getUser` as the trial, so metering adds no extra Clerk round-trip.
+`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart?, processedOverageEventIds? }`
+— overrides the vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart`
+equals the current weekly window's Monday 00:00 UTC epoch-ms `windowStart`; stale or unscoped credits
+are ignored. These are read on the same `getUser` as the trial, so metering adds no extra Clerk
+round-trip.
 
 **Privacy.** The Durable Object stores only integers and timestamps; it never sees prompt or draft
 content. See the [Privacy design](#privacy-design--content-stateless-by-construction) section.
@@ -347,11 +348,12 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 | Event                                                           | Write                                                                                                                                                           |
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `subscription.created` / `.updated` / `.canceled` / `.past_due` | `privateMetadata.subscription` (plan/status/renewsAt/manageBillingUrl + reconciliation ids) **and** `privateMetadata.quota.weeklyDraftLimit` = the tier's limit |
-| `transaction.completed` (overage / "buy more drafts")           | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it                                      |
+| `transaction.completed` (overage / "buy more drafts")           | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`    |
 
 **Account mapping.** `data.custom_data.clerkUserId` (attached by the app's checkout) is primary; the
 fallback looks the Paddle customer's email up in Clerk (`GET /customers/{id}` → `getUserList`). If no
 account matches, the event is acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help.
+Transient Paddle/Clerk lookup failures return `502` so Paddle retries.
 
 **Price → tier.** `data.items[].price.id` maps to a tier via `PRICE_TO_PLAN` in `src/config.ts`
 (SANDBOX ids today):
@@ -371,10 +373,14 @@ var holds and stamps overage to the 56b Monday window); it does not encode a fin
 (`GET /subscriptions/{id}` → `data.management_urls`) because webhooks omit management URLs. Best-effort:
 if `PADDLE_API_KEY` is unset or the fetch fails, a previously stored URL is preserved, else `null`.
 
+**Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
+`EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored.
+
 **Idempotency & ordering.** Subscription writes are skipped when the incoming `event_id` equals the
 stored `lastEventId`, or when a strictly older `occurred_at` would clobber a newer stored record.
-Overage writes are skipped when the `event_id` equals the stored `lastOverageEventId`. A transient
-Clerk failure returns **`502`** so Paddle retries.
+Overage writes run through the per-user Durable Object so overlapping purchases are serialized, and
+are skipped when the `event_id` is in the bounded `processedOverageEventIds` list (the legacy
+`lastOverageEventId` is still honored). A transient Clerk failure returns **`502`** so Paddle retries.
 
 **Privacy.** This endpoint handles only plan/status/timestamps/URLs and price/subscription/customer
 ids (plus a customer email used solely to match an account). It never sees prompt or draft content
