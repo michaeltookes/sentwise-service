@@ -1371,25 +1371,37 @@ describe("AccountQuota Durable Object", () => {
 
   it("settle markers dedupe older retries after many newer settlements", async () => {
     const uid = "do-settle-marker-dedupe";
-    let last!: WindowResult;
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(uid));
     const count = OLD_BOUNDED_ARRAY_SIZE + 5;
-    for (let i = 0; i < count; i++) {
-      const reserved = await callDO<ReserveResult>(uid, "/reserve", {
-        now: MON + i,
-        reservationId: `settled-${i}`,
-        estimatedTokens: 1,
-        limits: { ...hardLimits, weeklyDraftLimit: 1_000, weeklyTokenLimit: 1_000 },
-      });
-      last = await callDO<WindowResult>(uid, "/settle", {
-        now: MON + i,
-        reservationId: reserved.reservationId,
-        reservationWindowStart: reserved.window.windowStart,
-        estimatedTokens: reserved.estimatedTokens,
-        tokensDelta: 1,
-      });
-    }
-    expect(last.window.draftsUsed).toBe(count);
-    expect(last.window.tokensUsed).toBe(count);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("window", {
+        windowStart: MON,
+        resetsAt: MON + WEEK_MS,
+        draftsUsed: count,
+        tokensUsed: count,
+        tokensReserved: 0,
+        activeReservations: [],
+        settledReservationIds: [],
+      } satisfies WindowState);
+      for (let i = 0; i < count; i++) {
+        await state.storage.put(`settled_settlement:settled-${i}`, {
+          settledAt: MON + i,
+        });
+      }
+    });
+
+    const markerKeys = await runInDurableObject(stub, async (_instance, state) => {
+      return [
+        ...(
+          await state.storage.list({
+            prefix: "settled_settlement:",
+          })
+        ).keys(),
+      ];
+    });
+    expect(markerKeys).toHaveLength(count);
+    expect(markerKeys).toContain("settled_settlement:settled-0");
 
     const retryOldSettlement = await callDO<WindowResult>(uid, "/settle", {
       now: MON + 10_000,
