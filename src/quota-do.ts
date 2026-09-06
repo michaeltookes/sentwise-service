@@ -615,11 +615,7 @@ export class AccountQuota {
       const reservation = await txn.get<unknown>(storageKey);
       const parsedReservation = parsePaddleCheckoutReservation(reservation);
       if (parsedReservation) {
-        if (checkoutReservationExpiredBeforeTransaction(parsedReservation, now)) {
-          await txn.delete(storageKey);
-        } else {
-          return Response.json(pendingPaddleCheckoutReservation(parsedReservation));
-        }
+        return Response.json(pendingPaddleCheckoutReservation(parsedReservation));
       }
 
       await txn.put(storageKey, {
@@ -722,19 +718,12 @@ export class AccountQuota {
   }
 
   private async handlePaddleCheckoutPeek(
-    body: unknown,
+    _body: unknown,
     storageKey: PaddleCheckoutReservationStorageKey,
   ): Promise<Response> {
-    const record = asRecord(body);
-    const now = normalizedNow(typeof record?.now === "number" ? record.now : undefined);
-
     return this.storage.transaction(async (txn) => {
       const reservation = parsePaddleCheckoutReservation(await txn.get<unknown>(storageKey));
       if (!reservation) return Response.json({ pending: false });
-      if (checkoutReservationExpiredBeforeTransaction(reservation, now)) {
-        await txn.delete(storageKey);
-        return Response.json({ pending: false });
-      }
       return Response.json(pendingPaddleCheckoutReservation(reservation));
     });
   }
@@ -866,10 +855,6 @@ export class AccountQuota {
       ] as const) {
         const reservation = parsePaddleCheckoutReservation(await txn.get<unknown>(storageKey));
         if (!reservation) continue;
-        if (checkoutReservationExpiredBeforeTransaction(reservation, now)) {
-          await txn.delete(storageKey);
-          continue;
-        }
         return { checkoutPending: true };
       }
 
@@ -1323,16 +1308,6 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
     ...(customerId ? { customerId } : {}),
     ...(reservation.blocked === true ? { blocked: true } : {}),
   };
-}
-
-function checkoutReservationExpiredBeforeTransaction(
-  reservation: PaddleCheckoutReservation,
-  now: number,
-): boolean {
-  return (
-    !reservation.transactionId &&
-    (reservation.expiresAt === undefined || reservation.expiresAt <= now)
-  );
 }
 
 function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation):

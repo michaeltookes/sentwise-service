@@ -874,7 +874,7 @@ describe("AccountQuota Durable Object", () => {
     });
   });
 
-  it("expires an unrecorded subscription checkout reservation", async () => {
+  it("keeps an unrecorded subscription checkout reservation pending after the former timeout", async () => {
     const uid = "checkout-reservation-creation-timeout";
     const first = await callDO<CheckoutReservationResult>(
       uid,
@@ -896,7 +896,7 @@ describe("AccountQuota Durable Object", () => {
         ...SUBSCRIPTION_CHECKOUT_REQUEST,
       },
     );
-    expect(second).toEqual({ reserved: true, reservationId: "checkout-later" });
+    expect(second).toEqual({ pending: true });
   });
 
   it("rejects begin-delete while a subscription checkout reservation is pending", async () => {
@@ -1001,7 +1001,7 @@ describe("AccountQuota Durable Object", () => {
     expect(record).toEqual({ unusable: true });
   });
 
-  it("expires an unrecorded checkout reservation before begin-delete", async () => {
+  it("rejects begin-delete while an unrecorded checkout reservation is pending", async () => {
     const uid = "checkout-reservation-expired-delete";
     await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
       now: MON,
@@ -1009,16 +1009,13 @@ describe("AccountQuota Durable Object", () => {
       ...SUBSCRIPTION_CHECKOUT_REQUEST,
     });
 
-    const begin = await callDO<{ deleting: true; alreadyDeleted: false }>(uid, "/begin-delete", {
+    const begin = await callDOResponse(uid, "/begin-delete", {
       now: MON + RESERVATION_TTL_MS + 1,
       attemptId: "delete-attempt",
     });
 
-    expect(begin).toMatchObject({
-      deleting: true,
-      alreadyDeleted: false,
-      attemptId: "delete-attempt",
-    });
+    expect(begin.status).toBe(409);
+    expect(((await begin.json()) as any).error.type).toBe("billing_checkout_pending");
   });
 
   it("returns pending subscription checkout transaction details for recovery", async () => {

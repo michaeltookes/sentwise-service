@@ -2234,6 +2234,61 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
+  it("keeps partial adjustments pending when purchase amounts are unavailable", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 50,
+          extraDraftsWindowStart: monday,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              transactionItemId: "txnitm_1",
+              extraDrafts: 50,
+              windowStart: monday,
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      adjustmentBody({
+        type: "partial",
+        items: [{ item_id: "txnitm_1", type: "partial", amount: "1000" }],
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, pending: true });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(50);
+    expect(quota.processedOverageAdjustmentIds).toEqual(["adj_123"]);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([
+      {
+        eventId: "evt_adj",
+        adjustmentId: "adj_123",
+        transactionId: "txn_evt_txn",
+        action: "refund",
+        adjustmentType: "partial",
+        hasAdjustmentItems: true,
+        items: [{ transactionItemId: "txnitm_1", type: "partial", amount: 1000 }],
+      },
+    ]);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 50,
+        windowStart: monday,
+      },
+    ]);
+  });
+
   it("ignores tax-only adjustment items without revoking overage credit", async () => {
     const monday = mondayStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(

@@ -95,11 +95,24 @@ export async function handlePaddleCheckout(
     throw err;
   }
 
-  const recordResult = await recordCheckoutReservation(env, userId, body, checkoutReservationId, {
-    transactionId: transaction.transactionId,
-    checkoutUrl: transaction.checkoutUrl,
-    customerId,
-  });
+  let recordResult: Awaited<ReturnType<typeof recordCheckoutReservation>>;
+  try {
+    recordResult = await recordCheckoutReservation(env, userId, body, checkoutReservationId, {
+      transactionId: transaction.transactionId,
+      checkoutUrl: transaction.checkoutUrl,
+      customerId,
+    });
+  } catch (err) {
+    try {
+      await cancelPaddleTransaction(env, transaction.transactionId);
+      await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
+        () => undefined,
+      );
+    } catch {
+      // Keep the reservation blocking retries if the payable transaction may still exist.
+    }
+    throw err;
+  }
   if ("stale" in recordResult || "unusable" in recordResult) {
     await cancelPaddleTransaction(env, transaction.transactionId);
     await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId);

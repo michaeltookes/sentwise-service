@@ -737,7 +737,7 @@ function adjustmentApplicationForCredit(
       adjustedAmount: item.amount,
     };
   }
-  return { drafts: available };
+  return { drafts: 0 };
 }
 
 function adjustmentAlreadyAppliedToAnyCredit(
