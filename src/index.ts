@@ -32,7 +32,7 @@ import {
 import { recordUsage } from "./analytics";
 import { handleMargin } from "./admin";
 import { recordInterest } from "./interest";
-import { handlePaddleCheckout, hasOpenPaddleSubscriptionCheckout } from "./paddle-checkout";
+import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
 import { handlePaddleManageBilling } from "./paddle-management";
 import { handlePaddleWebhook } from "./paddle-webhook";
 
@@ -110,7 +110,7 @@ export default {
         if (account && hasPaidAccess(account.subscription)) {
           throw activeSubscriptionDeletionError();
         }
-        if (account && (await hasOpenPaddleSubscriptionCheckout(userId, env))) {
+        if (account && (await hasOpenPaddleCheckout(userId, env))) {
           throw new ApiError(
             409,
             "billing_checkout_pending",

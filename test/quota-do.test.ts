@@ -37,6 +37,7 @@ vi.mock("../src/auth", () => ({
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 const OLD_BOUNDED_ARRAY_SIZE = 128;
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
+const OVERAGE_PRICE = "pri_overage";
 
 interface CheckResult {
   allowed: boolean;
@@ -56,7 +57,7 @@ type CheckoutReservationResult =
       priceId?: string;
       quantity?: number;
     };
-type CheckoutReservationRecordResult = { recorded: true } | { stale: true };
+type CheckoutReservationRecordResult = { recorded: true } | { stale: true } | { unusable: true };
 interface ReserveResult {
   reserved: boolean;
   blockedByQuota: boolean;
@@ -82,6 +83,11 @@ interface TestStorage {
 const ACCOUNT_DELETION_KEY = "account_deletion";
 const PENDING_SETTLEMENT_KEY_PREFIX = "pending_settlement:";
 const SUBSCRIPTION_CHECKOUT_REQUEST = { priceId: PRO_PRICE, quantity: 1 };
+const OVERAGE_CHECKOUT_REQUEST = {
+  priceId: OVERAGE_PRICE,
+  quantity: 2,
+  customerId: "ctm_123",
+};
 
 beforeEach(() => {
   clerkMocks.verifyToken.mockReset();
@@ -600,6 +606,73 @@ describe("AccountQuota Durable Object", () => {
     });
   });
 
+  it("waits for in-flight subscription entitlement writes before reserving checkout", async () => {
+    const uid = "checkout-reserve-waits-subscription";
+    const storage = fakeStorage(new Map<string, unknown>());
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockImplementation(async () => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+    });
+
+    const fetchQuota = <T>(op: string, body: unknown) =>
+      quota
+        .fetch(
+          new Request(`https://account-quota.internal${op}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+        )
+        .then((res) => res.json<T>());
+
+    const subscription = fetchQuota<{ applied: true }>("/paddle-subscription", {
+      now: MON,
+      event: {
+        eventId: "evt_subscription",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:01.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: { clerkUserId: uid },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    await writeStarted.promise;
+
+    let reserveFinished = false;
+    const reserve = fetchQuota<CheckoutReservationResult>("/paddle-subscription-checkout-reserve", {
+      now: MON + 1,
+      reservationId: "checkout-next",
+      ...SUBSCRIPTION_CHECKOUT_REQUEST,
+    }).then((result) => {
+      reserveFinished = true;
+      return result;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(reserveFinished).toBe(false);
+
+    releaseWrite.resolve();
+    expect(await subscription).toEqual({ applied: true });
+    expect(await reserve).toEqual({ reserved: true, reservationId: "checkout-next" });
+  });
+
   it("only clears checkout reservations for matching applied subscription events", async () => {
     const uid = "checkout-reservation-correlated-webhook";
     await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
@@ -849,6 +922,83 @@ describe("AccountQuota Durable Object", () => {
     expect(((await begin.json()) as any).error.type).toBe("billing_checkout_pending");
     const peek = await callDOResponse(uid, "/peek", { now: MON + 2 });
     expect(peek.status).toBe(200);
+  });
+
+  it("rejects begin-delete while an overage checkout reservation is pending", async () => {
+    const uid = "overage-checkout-reservation-blocks-delete";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-overage-checkout-reserve", {
+      now: MON,
+      reservationId: "overage-open",
+      ...OVERAGE_CHECKOUT_REQUEST,
+    });
+    await callDO<CheckoutReservationRecordResult>(uid, "/paddle-overage-checkout-record", {
+      reservationId: "overage-open",
+      transactionId: "txn_overage_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_overage_open",
+      ...OVERAGE_CHECKOUT_REQUEST,
+    });
+
+    const begin = await callDOResponse(uid, "/begin-delete", {
+      now: MON + 1,
+      attemptId: "delete-attempt",
+    });
+
+    expect(begin.status).toBe(409);
+    expect(((await begin.json()) as any).error.type).toBe("billing_checkout_pending");
+  });
+
+  it("marks an unrecorded overage checkout unusable when the subscription is canceled", async () => {
+    const uid = "overage-checkout-unusable-on-cancel";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-overage-checkout-reserve", {
+      now: MON,
+      reservationId: "overage-open",
+      ...OVERAGE_CHECKOUT_REQUEST,
+    });
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          lastEventId: "evt_current",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+        },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockResolvedValue(undefined);
+
+    expect(
+      await callDO<{ applied: true }>(uid, "/paddle-subscription", {
+        now: MON + 1,
+        event: {
+          eventId: "evt_cancel",
+          eventType: "subscription.canceled",
+          occurredAt: "2024-01-01T00:00:01.000Z",
+          data: {
+            id: "sub_current",
+            status: "canceled",
+            customer_id: "ctm_123",
+            custom_data: { clerkUserId: uid },
+            items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+          },
+        },
+      }),
+    ).toEqual({ applied: true });
+
+    const record = await callDO<CheckoutReservationRecordResult>(
+      uid,
+      "/paddle-overage-checkout-record",
+      {
+        reservationId: "overage-open",
+        transactionId: "txn_overage_open",
+        checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_overage_open",
+        ...OVERAGE_CHECKOUT_REQUEST,
+      },
+    );
+    expect(record).toEqual({ unusable: true });
   });
 
   it("expires an unrecorded checkout reservation before begin-delete", async () => {

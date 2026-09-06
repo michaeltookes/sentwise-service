@@ -3,12 +3,13 @@ import { isClerkNotFoundError } from "./auth";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
 import { mondayStartUtc } from "./metering";
-import { paddleCustomerMatchesAccount } from "./paddle-account";
+import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
 import type { OverageAdjustmentAction } from "./paddle";
 
 const PROCESSED_OVERAGE_EVENT_ID_LIMIT = 100;
 const PROCESSED_OVERAGE_ADJUSTMENT_ID_LIMIT = 100;
 const LEDGER_STORAGE_BULK_OPERATION_LIMIT = 128;
+const ACTIVE_OVERAGE_SUBSCRIPTION_STATUSES = new Set(["active", "trialing", "past_due"]);
 export const PADDLE_OVERAGE_CREDITS_STORAGE_KEY = "paddle_overage_credits";
 export const PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX = "paddle_overage_credit:";
 export const PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY = "paddle_overage_pending_reversals";
@@ -272,6 +273,10 @@ export async function recordPaddleOverageInClerk(
     await saveOverageCredits(ledgerStore, replayed.credits);
     await savePendingOverageReversals(ledgerStore, replayed.remainingPending);
     return { idempotent: true };
+  }
+
+  if (!storedSubscriptionAllowsOverage(meta.subscription)) {
+    return { mapped: false };
   }
 
   const windowStart = mondayStartUtc(body.now);
@@ -1350,6 +1355,21 @@ async function loadShardedOverageCredits(
 
 function overageCreditStorageKey(credit: StoredOverageCredit): string {
   return `${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}${encodeURIComponent(overageCreditKey(credit))}`;
+}
+
+function storedSubscriptionAllowsOverage(rawSubscription: unknown): boolean {
+  const subscription = asRecord(rawSubscription);
+  if (!subscription) return false;
+
+  const status = typeof subscription.status === "string" ? subscription.status : null;
+  if (!status) return true;
+  if (!ACTIVE_OVERAGE_SUBSCRIPTION_STATUSES.has(status)) return false;
+
+  return isPaidPlan(subscription.plan) || storedPaddleSubscriptionId(rawSubscription) !== null;
+}
+
+function isPaidPlan(value: unknown): boolean {
+  return value === "starter" || value === "pro" || value === "unlimited" || value === "team";
 }
 
 function storedCreditEquals(value: unknown, credit: StoredOverageCredit): boolean {

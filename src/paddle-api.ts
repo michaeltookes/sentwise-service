@@ -108,6 +108,34 @@ export async function createPaddleCheckoutTransaction(
   }
 }
 
+export async function cancelPaddleTransaction(env: Env, transactionId: string): Promise<void> {
+  const apiKey = requirePaddleApiKey(
+    "transaction_cancel_failed",
+    "Could not cancel the checkout.",
+    env,
+  );
+  try {
+    const res = await fetch(
+      `${paddleApiBase(env)}/transactions/${encodeURIComponent(transactionId)}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ status: "canceled" }),
+      },
+    );
+    if (res.status === 404) return;
+    if (!res.ok) {
+      throw new ApiError(502, "transaction_cancel_failed", "Could not cancel the checkout.");
+    }
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(502, "transaction_cancel_failed", "Could not cancel the checkout.");
+  }
+}
+
 export async function fetchPaddleManagementUrl(
   env: Env,
   subscriptionId: string,

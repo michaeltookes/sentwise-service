@@ -7,16 +7,30 @@ import {
   storedPaddleCustomerId,
   storedPaddleSubscriptionId,
 } from "./paddle-account";
-import { createPaddleCheckoutTransaction, fetchPaddleTransactionSnapshot } from "./paddle-api";
 import {
+  cancelPaddleTransaction,
+  createPaddleCheckoutTransaction,
+  fetchPaddleTransactionSnapshot,
+} from "./paddle-api";
+import {
+  quotaPeekPaddleOverageCheckout,
   quotaPeekPaddleSubscriptionCheckout,
+  quotaRecordPaddleOverageCheckout,
   quotaRecordPaddleSubscriptionCheckout,
+  quotaReleasePaddleOverageCheckout,
   quotaReleasePaddleSubscriptionCheckout,
+  quotaReservePaddleOverageCheckout,
   quotaReservePaddleSubscriptionCheckout,
 } from "./quota-client";
 
 const MAX_CHECKOUT_QUANTITY = 100;
 const ACTIVE_SUBSCRIPTION_STATUSES = new Set(["active", "trialing", "past_due"]);
+
+interface PendingCheckoutTransaction {
+  reservationId: string;
+  transactionId: string;
+  checkoutUrl: string | null;
+}
 
 export async function handlePaddleCheckout(
   userId: string,
@@ -30,19 +44,88 @@ export async function handlePaddleCheckout(
   let account = await loadCheckoutAccount(userId, env);
   let customerId = storedPaddleCustomerId(account.subscription);
 
-  if (body.kind === "subscription" && hasActivePaddleSubscription(account.subscription)) {
+  assertCheckoutEligible(body, account.subscription, customerId);
+
+  const checkoutReservationId = crypto.randomUUID();
+  const existingTransaction = await reserveCheckout(
+    env,
+    userId,
+    checkoutReservationId,
+    body,
+    customerId,
+  );
+  if (existingTransaction) {
+    try {
+      account = await loadCheckoutAccount(userId, env);
+      customerId = storedPaddleCustomerId(account.subscription);
+      assertCheckoutEligible(body, account.subscription, customerId);
+    } catch (err) {
+      if (isCheckoutEligibilityError(err)) {
+        await cancelPaddleTransaction(env, existingTransaction.transactionId);
+        await releaseCheckoutReservation(env, userId, body.kind, existingTransaction.reservationId);
+      }
+      throw err;
+    }
+    return checkoutResponse(existingTransaction);
+  }
+
+  try {
+    account = await loadCheckoutAccount(userId, env);
+    customerId = storedPaddleCustomerId(account.subscription);
+    assertCheckoutEligible(body, account.subscription, customerId);
+  } catch (err) {
+    await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
+      () => undefined,
+    );
+    throw err;
+  }
+
+  let transaction;
+  try {
+    transaction = await createPaddleCheckoutTransaction(env, {
+      priceId: body.priceId,
+      quantity: body.quantity,
+      customData: await buildPaddleCheckoutCustomData(userId, env, checkoutReservationId),
+      customerId,
+    });
+  } catch (err) {
+    await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
+      () => undefined,
+    );
+    throw err;
+  }
+
+  const recordResult = await recordCheckoutReservation(env, userId, body, checkoutReservationId, {
+    transactionId: transaction.transactionId,
+    checkoutUrl: transaction.checkoutUrl,
+    customerId,
+  });
+  if ("stale" in recordResult || "unusable" in recordResult) {
+    await cancelPaddleTransaction(env, transaction.transactionId);
+    await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId);
+    if ("unusable" in recordResult) {
+      throw subscriptionRequiredError();
+    }
+    throw pendingCheckoutError();
+  }
+
+  return checkoutResponse(transaction);
+}
+
+function assertCheckoutEligible(
+  body: CheckoutRequestBody,
+  rawSubscription: unknown,
+  customerId: string | null,
+): void {
+  if (body.kind === "subscription" && hasActivePaddleSubscription(rawSubscription)) {
     throw new ApiError(
       409,
       "billing_subscription_active",
       "Manage your current subscription before starting a new one.",
     );
   }
-  if (body.kind === "overage" && !hasActivePaddleSubscription(account.subscription)) {
-    throw new ApiError(
-      409,
-      "billing_subscription_required",
-      "An active Paddle subscription is required before buying extra drafts.",
-    );
+  if (body.kind === "overage" && !hasActivePaddleSubscription(rawSubscription)) {
+    throw subscriptionRequiredError();
   }
   if (body.kind === "overage" && !customerId) {
     throw new ApiError(
@@ -51,111 +134,113 @@ export async function handlePaddleCheckout(
       "Your Paddle customer is not ready for overage checkout yet.",
     );
   }
-
-  const checkoutReservationId = body.kind === "subscription" ? crypto.randomUUID() : null;
-  if (checkoutReservationId) {
-    const existingTransaction = await reserveSubscriptionCheckout(
-      env,
-      userId,
-      checkoutReservationId,
-      body,
-    );
-    if (existingTransaction) return checkoutResponse(existingTransaction);
-
-    try {
-      account = await loadCheckoutAccount(userId, env);
-    } catch (err) {
-      await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
-        () => undefined,
-      );
-      throw err;
-    }
-    if (hasActivePaddleSubscription(account.subscription)) {
-      await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
-        () => undefined,
-      );
-      throw new ApiError(
-        409,
-        "billing_subscription_active",
-        "Manage your current subscription before starting a new one.",
-      );
-    }
-    customerId = storedPaddleCustomerId(account.subscription);
-  }
-
-  let transaction;
-  try {
-    transaction = await createPaddleCheckoutTransaction(env, {
-      priceId: body.priceId,
-      quantity: body.quantity,
-      customData: await buildPaddleCheckoutCustomData(
-        userId,
-        env,
-        checkoutReservationId ?? undefined,
-      ),
-      customerId,
-    });
-  } catch (err) {
-    if (checkoutReservationId) {
-      await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
-        () => undefined,
-      );
-    }
-    throw err;
-  }
-
-  if (checkoutReservationId) {
-    const recordResult = await quotaRecordPaddleSubscriptionCheckout(env, userId, {
-      reservationId: checkoutReservationId,
-      transactionId: transaction.transactionId,
-      checkoutUrl: transaction.checkoutUrl,
-      priceId: body.priceId,
-      quantity: body.quantity,
-    });
-    if ("stale" in recordResult) {
-      throw pendingCheckoutError();
-    }
-  }
-
-  return checkoutResponse(transaction);
 }
 
-export async function hasOpenPaddleSubscriptionCheckout(
-  userId: string,
+export async function hasOpenPaddleCheckout(userId: string, env: Env): Promise<boolean> {
+  const now = Date.now();
+  const subscriptionReservation = await quotaPeekPaddleSubscriptionCheckout(env, userId, { now });
+  if (await hasOpenCheckoutReservation(env, userId, "subscription", subscriptionReservation)) {
+    return true;
+  }
+
+  const overageReservation = await quotaPeekPaddleOverageCheckout(env, userId, { now });
+  return await hasOpenCheckoutReservation(env, userId, "overage", overageReservation);
+}
+
+export const hasOpenPaddleSubscriptionCheckout = hasOpenPaddleCheckout;
+
+async function hasOpenCheckoutReservation(
   env: Env,
+  userId: string,
+  kind: CheckoutRequestBody["kind"],
+  reservation: {
+    pending: boolean;
+    reservationId?: string;
+    transactionId?: string;
+  },
 ): Promise<boolean> {
-  const reservation = await quotaPeekPaddleSubscriptionCheckout(env, userId, { now: Date.now() });
   if (!reservation.pending) return false;
   if (!reservation.reservationId || !reservation.transactionId) return true;
 
   const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
   if (!snapshot || snapshot.status === "canceled") {
-    await quotaReleasePaddleSubscriptionCheckout(env, userId, reservation.reservationId);
+    await releaseCheckoutReservation(env, userId, kind, reservation.reservationId);
     return false;
   }
 
   return true;
 }
 
-async function reserveSubscriptionCheckout(
+async function reserveCheckout(
   env: Env,
   userId: string,
   reservationId: string,
   request: CheckoutRequestBody,
-): Promise<{ transactionId: string; checkoutUrl: string | null } | null> {
+  customerId: string | null,
+): Promise<PendingCheckoutTransaction | null> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const reservation = await quotaReservePaddleSubscriptionCheckout(env, userId, {
-      now: Date.now(),
-      reservationId,
-      priceId: request.priceId,
-      quantity: request.quantity,
-    });
+    const reservation =
+      request.kind === "subscription"
+        ? await quotaReservePaddleSubscriptionCheckout(env, userId, {
+            now: Date.now(),
+            reservationId,
+            priceId: request.priceId,
+            quantity: request.quantity,
+          })
+        : await quotaReservePaddleOverageCheckout(env, userId, {
+            now: Date.now(),
+            reservationId,
+            priceId: request.priceId,
+            quantity: request.quantity,
+            customerId: customerId ?? "",
+          });
     if ("reserved" in reservation) return null;
 
     const pending = await recoverOrReleasePendingCheckout(env, userId, reservation, request);
     if (pending) return pending;
   }
   throw pendingCheckoutError();
+}
+
+async function recordCheckoutReservation(
+  env: Env,
+  userId: string,
+  request: CheckoutRequestBody,
+  reservationId: string,
+  transaction: {
+    transactionId: string;
+    checkoutUrl: string | null;
+    customerId: string | null;
+  },
+): Promise<{ recorded: true } | { stale: true } | { unusable: true }> {
+  if (request.kind === "subscription") {
+    return quotaRecordPaddleSubscriptionCheckout(env, userId, {
+      reservationId,
+      transactionId: transaction.transactionId,
+      checkoutUrl: transaction.checkoutUrl,
+      priceId: request.priceId,
+      quantity: request.quantity,
+    });
+  }
+  return quotaRecordPaddleOverageCheckout(env, userId, {
+    reservationId,
+    transactionId: transaction.transactionId,
+    checkoutUrl: transaction.checkoutUrl,
+    priceId: request.priceId,
+    quantity: request.quantity,
+    customerId: transaction.customerId ?? "",
+  });
+}
+
+function releaseCheckoutReservation(
+  env: Env,
+  userId: string,
+  kind: CheckoutRequestBody["kind"],
+  reservationId: string,
+): Promise<{ released: true }> {
+  return kind === "subscription"
+    ? quotaReleasePaddleSubscriptionCheckout(env, userId, reservationId)
+    : quotaReleasePaddleOverageCheckout(env, userId, reservationId);
 }
 
 async function recoverOrReleasePendingCheckout(
@@ -169,14 +254,14 @@ async function recoverOrReleasePendingCheckout(
     quantity?: number;
   },
   request: CheckoutRequestBody,
-): Promise<{ transactionId: string; checkoutUrl: string | null } | null> {
+): Promise<PendingCheckoutTransaction | null> {
   if (!reservation.reservationId || !reservation.transactionId) {
     throw pendingCheckoutError();
   }
 
   const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
   if (!snapshot || snapshot.status === "canceled") {
-    await quotaReleasePaddleSubscriptionCheckout(env, userId, reservation.reservationId);
+    await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
     return null;
   }
   const checkoutUrl = snapshot.checkoutUrl ?? reservation.checkoutUrl ?? null;
@@ -185,6 +270,7 @@ async function recoverOrReleasePendingCheckout(
       throw checkoutConflictError();
     }
     return {
+      reservationId: reservation.reservationId,
       transactionId: reservation.transactionId,
       checkoutUrl,
     };
@@ -231,10 +317,23 @@ function isRecoverableCheckoutTransaction(
 }
 
 function pendingCheckoutError(): ApiError {
+  return new ApiError(409, "billing_checkout_pending", "A Paddle checkout is already in progress.");
+}
+
+function subscriptionRequiredError(): ApiError {
   return new ApiError(
     409,
-    "billing_checkout_pending",
-    "A subscription checkout is already in progress.",
+    "billing_subscription_required",
+    "An active Paddle subscription is required before buying extra drafts.",
+  );
+}
+
+function isCheckoutEligibilityError(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    (err.type === "billing_subscription_active" ||
+      err.type === "billing_subscription_required" ||
+      err.type === "billing_customer_not_bound")
   );
 }
 
@@ -250,7 +349,10 @@ function checkoutResponse(transaction: {
   transactionId: string;
   checkoutUrl: string | null;
 }): Response {
-  const res = Response.json(transaction);
+  const res = Response.json({
+    transactionId: transaction.transactionId,
+    checkoutUrl: transaction.checkoutUrl,
+  });
   res.headers.set("Cache-Control", "no-store");
   return res;
 }

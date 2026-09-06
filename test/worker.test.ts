@@ -26,7 +26,10 @@ vi.mock("@clerk/backend", () => ({
 // Import AFTER the mock is registered.
 import worker from "../src/index";
 import { clerkUserExists } from "../src/auth";
-import { PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY } from "../src/quota-do";
+import {
+  PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
+  PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
+} from "../src/quota-do";
 
 const env: Env = {
   ...testEnv,
@@ -57,10 +60,11 @@ async function clearAccountDeletionState(userId: string): Promise<void> {
   });
 }
 
-async function clearPaddleSubscriptionCheckoutReservation(userId: string): Promise<void> {
+async function clearPaddleCheckoutReservations(userId: string): Promise<void> {
   const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(userId));
   await runInDurableObject(stub, async (_instance, state) => {
     await state.storage.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
+    await state.storage.delete(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY);
   });
 }
 
@@ -297,7 +301,10 @@ function quotaNamespaceWithDeletionFailures(options: {
         attemptIds.clear();
         return Promise.resolve(Response.json({ deleted: true, cleanupPending: false }));
       }
-      if (path === "/paddle-subscription-checkout-peek") {
+      if (
+        path === "/paddle-subscription-checkout-peek" ||
+        path === "/paddle-overage-checkout-peek"
+      ) {
         return Promise.resolve(Response.json({ pending: false }));
       }
       if (path === "/peek") {
@@ -344,7 +351,7 @@ beforeEach(async () => {
   mocks.getUser.mockReset();
   mocks.updateUserMetadata.mockReset();
   mocks.deleteUser.mockReset();
-  await clearPaddleSubscriptionCheckoutReservation("user_123");
+  await clearPaddleCheckoutReservations("user_123");
 });
 
 describe("GET /healthz", () => {
@@ -1432,7 +1439,20 @@ describe("POST /v1/paddle/checkout", () => {
       items: [{ price_id: OVERAGE_PRICE, quantity: 3 }],
       checkout: { url: null },
     });
-    expect(body.custom_data.sentwiseCheckoutReservationId).toBeUndefined();
+    expect(body.custom_data.sentwiseCheckoutReservationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName("user_123"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(
+        await state.storage.get(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY),
+      ).toMatchObject({
+        transactionId: "txn_overage",
+        priceId: OVERAGE_PRICE,
+        quantity: 3,
+        customerId: "ctm_123",
+      });
+    });
   });
 
   it("rejects explicitly invalid checkout quantities", async () => {
@@ -1637,6 +1657,88 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     );
   });
 
+  it("rejects account deletion while an overage checkout transaction is pending", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-pending-overage-checkout" });
+    const activeSubscription = userWith({
+      subscription: {
+        plan: "pro",
+        status: "active",
+        paddleSubscriptionId: "sub_123",
+        paddleCustomerId: "ctm_123",
+      },
+    });
+    const canceledSubscription = userWith({
+      subscription: {
+        plan: "pro",
+        status: "canceled",
+        paddleSubscriptionId: "sub_123",
+        paddleCustomerId: "ctm_123",
+      },
+    });
+    mocks.getUser
+      .mockResolvedValueOnce(activeSubscription)
+      .mockResolvedValueOnce(activeSubscription)
+      .mockResolvedValue(canceledSubscription);
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_pending_overage_delete",
+                checkout: {
+                  url: "https://checkout.paddle.com/pay?_ptxn=txn_pending_overage_delete",
+                },
+              },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_pending_overage_delete") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_pending_overage_delete",
+                status: "draft",
+                checkout: {
+                  url: "https://checkout.paddle.com/pay?_ptxn=txn_pending_overage_delete",
+                },
+                items: [{ price: { id: OVERAGE_PRICE }, quantity: 2 }],
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const checkout = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: OVERAGE_PRICE, quantity: 2 }),
+      }),
+      deletePaddleEnv,
+    );
+    expect(checkout.status).toBe(200);
+
+    const del = await worker.fetch(
+      req("/v1/me", { method: "DELETE", headers: bearer() }),
+      deletePaddleEnv,
+    );
+
+    expect(del.status).toBe(409);
+    expect(((await del.json()) as any).error.type).toBe("billing_checkout_pending");
+    expect(fetchMock.mock.calls.filter(([input, init]) => isClerkDelete(input, init))).toHaveLength(
+      0,
+    );
+  });
+
   it("releases a canceled subscription checkout before deleting the account", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-canceled-checkout" });
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -1697,7 +1799,10 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     const quotaStub = {
       fetch: vi.fn((input: RequestInfo | URL) => {
         const path = internalUrl(input).pathname;
-        if (path === "/paddle-subscription-checkout-peek") {
+        if (
+          path === "/paddle-subscription-checkout-peek" ||
+          path === "/paddle-overage-checkout-peek"
+        ) {
           return Promise.resolve(Response.json({ pending: false }));
         }
         if (path === "/begin-delete") {

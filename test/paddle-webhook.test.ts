@@ -32,6 +32,7 @@ import {
   recordPaddleOverageInClerk,
   type PaddleOverageLedgerStore,
 } from "../src/paddle-entitlement";
+import { PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY } from "../src/quota-do";
 
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
@@ -163,6 +164,7 @@ async function clearPaddleOverageCredits(userId = "user_abc"): Promise<void> {
     const pending = await state.storage.list({
       prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
     });
+    await state.storage.delete(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY);
     const keys = [...sharded.keys(), ...pending.keys()];
     if (keys.length > 0) await state.storage.delete(keys);
   });
@@ -176,6 +178,23 @@ async function storedPaddleOverageCredits(userId = "user_abc"): Promise<unknown[
       prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
     });
     return [...(Array.isArray(legacy) ? legacy : []), ...sharded.values()];
+  });
+}
+
+async function storedPaddleOverageCheckoutReservation(userId = "user_abc"): Promise<unknown> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  return runInDurableObject(stub, async (_instance, state) => {
+    return state.storage.get(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY);
+  });
+}
+
+async function seedPaddleOverageCheckoutReservation(
+  value: Record<string, unknown>,
+  userId = "user_abc",
+): Promise<void> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.put(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY, value);
   });
 }
 
@@ -346,6 +365,51 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
       weeklyTokenLimit: 500000,
       extraDrafts: 7,
     });
+  });
+
+  it("cancels a tracked overage checkout when the subscription is canceled", async () => {
+    await seedPaddleOverageCheckoutReservation({
+      reservationId: "overage-open",
+      createdAt: Date.now(),
+      transactionId: "txn_overage_open",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_overage_open",
+      priceId: OVERAGE_PRICE,
+      quantity: 2,
+      customerId: "ctm_123",
+    });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+        quota: { weeklyDraftLimit: 120 },
+      }),
+    );
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_overage_open") {
+        expect(init?.method).toBe("PATCH");
+        expect(init?.body).toBe(JSON.stringify({ status: "canceled" }));
+        return Promise.resolve(new Response(JSON.stringify({ data: { id: "txn_overage_open" } })));
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await signedReq(
+      subBody({ eventType: "subscription.canceled", status: "canceled" }),
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/transactions/txn_overage_open",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(await storedPaddleOverageCheckoutReservation()).toBeUndefined();
   });
 
   it("ignores an unknown price id (200, no write)", async () => {
@@ -819,6 +883,75 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(await storedPaddleOverageCreditKeys()).toEqual([
       expect.stringMatching(new RegExp(`^${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}`)),
     ]);
+  });
+
+  it("does not credit a new overage purchase after the stored subscription is inactive", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+        quota: { weeklyDraftLimit: null },
+      }),
+    );
+
+    const res = await signedReq(
+      txnBody({
+        custom_data: { clerkUserId: "user_abc", kind: "overage" },
+        items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+      }),
+      { overrideEnv: overageEnv },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, mapped: false });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    expect(await storedPaddleOverageCredits()).toEqual([]);
+  });
+
+  it("clears the tracked overage checkout after the matching transaction completes", async () => {
+    await seedPaddleOverageCheckoutReservation({
+      reservationId: "overage-open",
+      createdAt: Date.now(),
+      transactionId: "txn_evt_reserved",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_evt_reserved",
+      priceId: OVERAGE_PRICE,
+      quantity: 2,
+      customerId: "ctm_123",
+    });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+        quota: { weeklyDraftLimit: 120 },
+      }),
+    );
+
+    const res = await signedReq(
+      txnBody(
+        {
+          custom_data: {
+            clerkUserId: "user_abc",
+            kind: "overage",
+            sentwiseCheckoutReservationId: "overage-open",
+          },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 2 }],
+        },
+        "evt_reserved",
+      ),
+      { overrideEnv: overageEnv },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true, extraDrafts: 2 });
+    expect(await storedPaddleOverageCheckoutReservation()).toBeUndefined();
   });
 
   it("accumulates a second purchase within the same window", async () => {

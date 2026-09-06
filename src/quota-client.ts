@@ -77,10 +77,15 @@ export type PaddleSubscriptionCheckoutReservationResult =
       priceId?: string;
       quantity?: number;
     };
+export type PaddleOverageCheckoutReservationResult = PaddleSubscriptionCheckoutReservationResult;
 export type PaddleSubscriptionCheckoutPeekResult =
   { pending: false } | Extract<PaddleSubscriptionCheckoutReservationResult, { pending: true }>;
-export type PaddleSubscriptionCheckoutRecordResult = { recorded: true } | { stale: true };
+export type PaddleOverageCheckoutPeekResult = PaddleSubscriptionCheckoutPeekResult;
+export type PaddleSubscriptionCheckoutRecordResult =
+  { recorded: true } | { stale: true } | { unusable: true };
+export type PaddleOverageCheckoutRecordResult = PaddleSubscriptionCheckoutRecordResult;
 export type PaddleSubscriptionCheckoutReleaseResult = { released: true };
+export type PaddleOverageCheckoutReleaseResult = PaddleSubscriptionCheckoutReleaseResult;
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
   const id = env.ACCOUNT_QUOTA.idFromName(userId);
@@ -302,6 +307,67 @@ export function quotaReleasePaddleSubscriptionCheckout(
     "/paddle-subscription-checkout-release",
     { reservationId },
   );
+}
+
+/** Reserve a per-account overage checkout slot before creating it in Paddle. */
+export function quotaReservePaddleOverageCheckout(
+  env: Env,
+  userId: string,
+  body: {
+    now: number;
+    reservationId: string;
+    priceId: string;
+    quantity: number;
+    customerId: string;
+  },
+): Promise<PaddleOverageCheckoutReservationResult> {
+  return call<PaddleOverageCheckoutReservationResult>(
+    env,
+    userId,
+    "/paddle-overage-checkout-reserve",
+    body,
+  );
+}
+
+/** Attach the created Paddle transaction to a pending overage checkout slot. */
+export function quotaRecordPaddleOverageCheckout(
+  env: Env,
+  userId: string,
+  body: {
+    reservationId: string;
+    transactionId: string;
+    checkoutUrl: string | null;
+    priceId: string;
+    quantity: number;
+    customerId: string;
+  },
+): Promise<PaddleOverageCheckoutRecordResult> {
+  return call<PaddleOverageCheckoutRecordResult>(
+    env,
+    userId,
+    "/paddle-overage-checkout-record",
+    body,
+  );
+}
+
+/** Read the current per-account overage checkout slot without creating one. */
+export function quotaPeekPaddleOverageCheckout(
+  env: Env,
+  userId: string,
+  body: { now: number },
+): Promise<PaddleOverageCheckoutPeekResult> {
+  return call<PaddleOverageCheckoutPeekResult>(env, userId, "/paddle-overage-checkout-peek", body);
+}
+
+/** Release a pending overage checkout slot after the transaction is canceled or completed. */
+export function quotaReleasePaddleOverageCheckout(
+  env: Env,
+  userId: string,
+  reservationId: string,
+): Promise<PaddleOverageCheckoutReleaseResult> {
+  return call<PaddleOverageCheckoutReleaseResult>(env, userId, "/paddle-overage-checkout-release", {
+    reservationId,
+  });
 }
 
 /** Set a deletion barrier before attempting Clerk deletion. Does not wipe counters. */
