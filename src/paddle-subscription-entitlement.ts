@@ -160,7 +160,12 @@ function planMappingForSubscriptionEvent(
 ): { plan: SubscriptionPlan; priceId: string | null; quotaPlan: PaidPlan | null } | null {
   const mapped = planFromEvent(event);
   if (mapped) return { ...mapped, quotaPlan: mapped.plan };
-  if (!isTerminalSubscriptionEvent(event)) return null;
+  if (
+    !isTerminalSubscriptionEvent(event) &&
+    !subscriptionEventMatchesStoredSubscription(event, existingSub)
+  ) {
+    return null;
+  }
 
   const plan = storedSubscriptionPlan(existingSub);
   if (!plan || plan === "trial" || plan === "none") return null;
@@ -169,6 +174,19 @@ function planMappingForSubscriptionEvent(
     priceId: storedSubscriptionPriceId(existingSub),
     quotaPlan: isKnownPaidPlan(plan) ? plan : null,
   };
+}
+
+function subscriptionEventMatchesStoredSubscription(
+  event: PaddleEvent,
+  existingSub: Record<string, unknown> | null,
+): boolean {
+  const incomingSubscriptionId = subscriptionIdFromEvent(event);
+  const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
+  return (
+    !!incomingSubscriptionId &&
+    !!existingSubscriptionId &&
+    incomingSubscriptionId === existingSubscriptionId
+  );
 }
 
 function isTerminalSubscriptionEvent(event: PaddleEvent): boolean {

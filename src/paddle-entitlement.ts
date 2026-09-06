@@ -11,6 +11,9 @@ const PROCESSED_OVERAGE_ADJUSTMENT_ID_LIMIT = 100;
 const LEDGER_STORAGE_BULK_OPERATION_LIMIT = 128;
 export const PADDLE_OVERAGE_CREDITS_STORAGE_KEY = "paddle_overage_credits";
 export const PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX = "paddle_overage_credit:";
+export const PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY = "paddle_overage_pending_reversals";
+export const PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX =
+  "paddle_overage_pending_reversal:";
 
 export interface PaddleOverageLedgerStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -221,7 +224,7 @@ export async function recordPaddleOverageInClerk(
       typeof existingQuota.extraDrafts === "number"
         ? Math.max(0, Math.floor(existingQuota.extraDrafts))
         : null;
-    const pending = pendingOverageReversals(existingQuota);
+    const pending = await loadPendingOverageReversals(existingQuota, ledgerStore);
     const repairedCredits = body.credits.map((credit) =>
       storedCreditFromInput(body.eventId, body.transactionId, credit, repairWindowStart),
     );
@@ -255,10 +258,11 @@ export async function recordPaddleOverageInClerk(
         ...quotaWithoutOverageCredits(existingQuota),
         ...(replayed.currentExtras !== null ? { extraDrafts: replayed.currentExtras } : {}),
         overageCreditTransactions: nextCreditTransactions,
-        pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
+        ...fallbackPendingOverageReversals(ledgerStore, replayed.remainingPending),
         ...fallbackOverageCredits(ledgerStore, replayed.credits),
       };
       try {
+        await savePendingOverageReversals(ledgerStore, replayed.remainingPending);
         await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
       } catch (err) {
         if (isClerkNotFoundError(err)) return { mapped: false };
@@ -275,7 +279,7 @@ export async function recordPaddleOverageInClerk(
     sameWindow && typeof existingQuota.extraDrafts === "number"
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
       : 0;
-  const pending = pendingOverageReversals(existingQuota);
+  const pending = await loadPendingOverageReversals(existingQuota, ledgerStore);
   const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
   const expectedCredits = body.credits.map((credit) =>
     storedCreditFromInput(body.eventId, body.transactionId, credit, windowStart),
@@ -312,11 +316,12 @@ export async function recordPaddleOverageInClerk(
         expectedCredits,
       ),
     ]),
-    pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
+    ...fallbackPendingOverageReversals(ledgerStore, replayed.remainingPending),
     ...fallbackOverageCredits(ledgerStore, allCredits),
   };
 
   try {
+    await savePendingOverageReversals(ledgerStore, replayed.remainingPending);
     await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
   } catch (err) {
     if (isClerkNotFoundError(err)) return { mapped: false };
@@ -375,7 +380,7 @@ export async function revokePaddleOverageInClerk(
     typeof existingQuota.extraDrafts === "number"
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
       : 0;
-  const pending = pendingOverageReversals(existingQuota);
+  const pending = await loadPendingOverageReversals(existingQuota, ledgerStore);
   const creditTransactions = overageCreditTransactions(existingQuota);
   const wasPreviouslyApplied = adjustmentAlreadyAppliedToAnyCredit(credits, body);
   let applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
@@ -387,19 +392,21 @@ export async function revokePaddleOverageInClerk(
 
   if (applied.extraDrafts === 0 && !applied.processed) {
     await saveOverageCredits(ledgerStore, credits);
+    const remainingPending = boundedPendingOverageReversals([
+      ...pending,
+      pendingOverageReversalFromBody(body),
+    ]);
     const quota = {
       ...quotaWithoutOverageCredits(existingQuota),
       processedOverageAdjustmentIds: boundedProcessedOverageAdjustmentIds([
         ...processedAdjustmentIds,
         body.adjustmentId,
       ]),
-      pendingOverageReversals: boundedPendingOverageReversals([
-        ...pending,
-        pendingOverageReversalFromBody(body),
-      ]),
+      ...fallbackPendingOverageReversals(ledgerStore, remainingPending),
       ...fallbackOverageCredits(ledgerStore, credits),
     };
     try {
+      await savePendingOverageReversals(ledgerStore, remainingPending);
       await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
     } catch (err) {
       if (isClerkNotFoundError(err)) return { mapped: false };
@@ -446,11 +453,12 @@ export async function revokePaddleOverageInClerk(
       ...processedAdjustmentIds,
       body.adjustmentId,
     ]),
-    pendingOverageReversals: boundedPendingOverageReversals(remainingPending),
+    ...fallbackPendingOverageReversals(ledgerStore, remainingPending),
     ...fallbackOverageCredits(ledgerStore, applied.credits),
   };
 
   try {
+    await savePendingOverageReversals(ledgerStore, remainingPending);
     await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
   } catch (err) {
     if (isClerkNotFoundError(err)) return { mapped: false };
@@ -584,7 +592,7 @@ function pendingOverageReversalsAfterAppliedAdjustment(
   credits: StoredOverageCredit[],
   creditTransactions: StoredOverageCreditTransaction[],
 ): StoredPendingOverageReversal[] {
-  if (!processed || !coversFullTransaction(body)) return pending;
+  if (!processed) return pending;
   const transaction = creditTransactions.find(
     (candidate) => candidate.transactionId === body.transactionId,
   );
@@ -1193,11 +1201,93 @@ async function saveOverageCredits(
   await deleteStorage(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
 }
 
+async function loadPendingOverageReversals(
+  quota: Record<string, unknown>,
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+): Promise<StoredPendingOverageReversal[]> {
+  const metadataPending = pendingOverageReversalsFromValue(quota.pendingOverageReversals);
+  if (!ledgerStore) return boundedPendingOverageReversals(metadataPending);
+  const aggregatePending = pendingOverageReversalsFromValue(
+    await ledgerStore.get<unknown>(PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY),
+  );
+  const shardedPending = await loadShardedPendingOverageReversals(ledgerStore);
+  return boundedPendingOverageReversals([
+    ...metadataPending,
+    ...aggregatePending,
+    ...shardedPending,
+  ]);
+}
+
+async function savePendingOverageReversals(
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+  pending: StoredPendingOverageReversal[],
+): Promise<void> {
+  if (!ledgerStore) return;
+  const mergedPending = boundedPendingOverageReversals(pending);
+  if (!ledgerStore.list || !ledgerStore.delete) {
+    await ledgerStore.put(PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY, mergedPending);
+    return;
+  }
+  const listStorage = ledgerStore.list.bind(ledgerStore);
+  const deleteStorage = ledgerStore.delete.bind(ledgerStore);
+
+  const nextByStorageKey = new Map(
+    mergedPending.map((item) => [pendingOverageReversalStorageKey(item), item] as const),
+  );
+  const stored = await listStorage<unknown>({
+    prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
+  });
+
+  for (const [key, pendingReversal] of nextByStorageKey) {
+    if (!storedPendingOverageReversalEquals(stored.get(key), pendingReversal)) {
+      await ledgerStore.put(key, pendingReversal);
+    }
+  }
+
+  const staleKeys = [...stored.keys()].filter((key) => !nextByStorageKey.has(key));
+  if (staleKeys.length > 0) {
+    await deleteStorageKeys(deleteStorage, staleKeys);
+  }
+  await deleteStorage(PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY);
+}
+
+async function loadShardedPendingOverageReversals(
+  ledgerStore: PaddleOverageLedgerStore,
+): Promise<StoredPendingOverageReversal[]> {
+  if (!ledgerStore.list) return [];
+  const stored = await ledgerStore.list<unknown>({
+    prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
+  });
+  return [...stored.values()].flatMap((value): StoredPendingOverageReversal[] =>
+    isStoredPendingOverageReversal(value) ? [value] : [],
+  );
+}
+
+function pendingOverageReversalStorageKey(item: StoredPendingOverageReversal): string {
+  return `${PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX}${encodeURIComponent(item.adjustmentId)}`;
+}
+
+function storedPendingOverageReversalEquals(
+  value: unknown,
+  pending: StoredPendingOverageReversal,
+): boolean {
+  return isStoredPendingOverageReversal(value) && JSON.stringify(value) === JSON.stringify(pending);
+}
+
 function fallbackOverageCredits(
   ledgerStore: PaddleOverageLedgerStore | undefined,
   credits: StoredOverageCredit[],
 ): { overageCredits?: StoredOverageCredit[] } {
   return ledgerStore ? {} : { overageCredits: mergeOverageCredits(credits) };
+}
+
+function fallbackPendingOverageReversals(
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+  pending: StoredPendingOverageReversal[],
+): { pendingOverageReversals: StoredPendingOverageReversal[] } {
+  return {
+    pendingOverageReversals: ledgerStore ? [] : boundedPendingOverageReversals(pending),
+  };
 }
 
 function quotaWithoutOverageCredits(quota: Record<string, unknown>): Record<string, unknown> {
@@ -1318,8 +1408,8 @@ function boundedOverageCreditTransactions(
   return [...byTransactionId.values()].slice(-PROCESSED_OVERAGE_EVENT_ID_LIMIT);
 }
 
-function pendingOverageReversals(quota: Record<string, unknown>): StoredPendingOverageReversal[] {
-  const pending = Array.isArray(quota.pendingOverageReversals) ? quota.pendingOverageReversals : [];
+function pendingOverageReversalsFromValue(value: unknown): StoredPendingOverageReversal[] {
+  const pending = Array.isArray(value) ? value : [];
   return boundedPendingOverageReversals(pending.filter(isStoredPendingOverageReversal));
 }
 

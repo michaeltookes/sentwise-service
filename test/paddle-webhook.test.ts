@@ -27,6 +27,8 @@ import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 import {
   PADDLE_OVERAGE_CREDITS_STORAGE_KEY,
   PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+  PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY,
+  PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
   recordPaddleOverageInClerk,
   type PaddleOverageLedgerStore,
 } from "../src/paddle-entitlement";
@@ -154,10 +156,14 @@ async function clearPaddleOverageCredits(userId = "user_abc"): Promise<void> {
   const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
   await runInDurableObject(stub, async (_instance, state) => {
     await state.storage.delete(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
+    await state.storage.delete(PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY);
     const sharded = await state.storage.list({
       prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
     });
-    const keys = [...sharded.keys()];
+    const pending = await state.storage.list({
+      prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
+    });
+    const keys = [...sharded.keys(), ...pending.keys()];
     if (keys.length > 0) await state.storage.delete(keys);
   });
 }
@@ -170,6 +176,19 @@ async function storedPaddleOverageCredits(userId = "user_abc"): Promise<unknown[
       prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
     });
     return [...(Array.isArray(legacy) ? legacy : []), ...sharded.values()];
+  });
+}
+
+async function storedPaddlePendingOverageReversals(userId = "user_abc"): Promise<unknown[]> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  return runInDurableObject(stub, async (_instance, state) => {
+    const aggregate = await state.storage.get<unknown[]>(
+      PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY,
+    );
+    const sharded = await state.storage.list<unknown>({
+      prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
+    });
+    return [...(Array.isArray(aggregate) ? aggregate : []), ...sharded.values()];
   });
 }
 
@@ -373,6 +392,46 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     });
     expect(lastWrite()?.quota).toEqual({
       weeklyDraftLimit: null,
+      weeklyTokenLimit: 500000,
+    });
+  });
+
+  it("reuses the stored plan when a legacy subscription resumes with an unmapped price", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+          priceId: PRO_PRICE,
+          lastEventId: "evt_cancel",
+          updatedAt: "2026-09-05T00:00:00.000Z",
+        },
+        quota: { weeklyDraftLimit: null, weeklyTokenLimit: 500000 },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.resumed",
+        eventId: "evt_removed_price_resume",
+        status: "active",
+        priceId: "pri_removed_from_catalog",
+        occurredAt: "2026-09-06T00:00:00.000Z",
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(lastWrite()?.subscription).toMatchObject({
+      plan: "pro",
+      status: "active",
+      paddleSubscriptionId: "sub_123",
+      priceId: PRO_PRICE,
+      lastEventId: "evt_removed_price_resume",
+    });
+    expect(lastWrite()?.quota).toEqual({
+      weeklyDraftLimit: 120,
       weeklyTokenLimit: 500000,
     });
   });
@@ -1475,7 +1534,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     const reversalRes = await signedReq(adjustmentBody());
 
     expect((await reversalRes.json()) as any).toEqual({ ok: true, pending: true });
-    expect((storedMeta.quota as Record<string, unknown>).pendingOverageReversals).toEqual([
+    expect((storedMeta.quota as Record<string, unknown>).pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([
       {
         eventId: "evt_adj",
         adjustmentId: "adj_123",
@@ -1508,6 +1568,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(quota.extraDraftsWindowStart).toBe(monday);
     expect(quota.pendingOverageReversals).toEqual([]);
     expect(quota.overageCredits).toBeUndefined();
+    expect(await storedPaddlePendingOverageReversals()).toEqual([]);
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
@@ -1621,7 +1682,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     });
     let quota = storedMeta.quota as Record<string, unknown>;
     expect(quota.extraDrafts).toBe(15);
-    expect(quota.pendingOverageReversals).toEqual([
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([
       {
         eventId: "evt_adj",
         adjustmentId: "adj_123",
@@ -1651,6 +1713,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     quota = storedMeta.quota as Record<string, unknown>;
     expect(quota.extraDrafts).toBe(0);
     expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([]);
     expect(await storedPaddleOverageCredits()).toEqual([
       {
         eventId: "evt_txn",
@@ -1673,6 +1736,121 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         reversedByAdjustmentId: "adj_123",
         reversalAdjustmentIds: ["adj_123"],
         reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 15 }],
+      },
+    ]);
+  });
+
+  it("preserves itemized adjustments across partial processed purchase ledger repairs", async () => {
+    const monday = mondayStartUtc(Date.now());
+    await putPaddleOverageCredits([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 10,
+        windowStart: monday,
+      },
+    ]);
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {
+        extraDrafts: 25,
+        extraDraftsWindowStart: monday,
+        processedOverageEventIds: ["evt_txn"],
+        overageCreditTransactions: [
+          {
+            eventId: "evt_txn",
+            transactionId: "txn_evt_txn",
+            windowStart: monday,
+            creditKeys: ["evt_txn:txn_evt_txn:txnitm_1", "evt_txn:txn_evt_txn:txnitm_2"],
+          },
+        ],
+      },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const adjustmentRes = await signedReq(
+      adjustmentBody({
+        id: "adj_itemized",
+        type: "partial",
+        items: [
+          { item_id: "txnitm_1", type: "full" },
+          { item_id: "txnitm_2", type: "full" },
+        ],
+      }),
+    );
+
+    expect((await adjustmentRes.json()) as any).toEqual({
+      ok: true,
+      revoked: true,
+      extraDrafts: 10,
+    });
+    let quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(15);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([
+      {
+        eventId: "evt_adj",
+        adjustmentId: "adj_itemized",
+        transactionId: "txn_evt_txn",
+        action: "refund",
+        adjustmentType: "partial",
+        hasAdjustmentItems: true,
+        items: [
+          { transactionItemId: "txnitm_1", type: "full", amount: null },
+          { transactionItemId: "txnitm_2", type: "full", amount: null },
+        ],
+      },
+    ]);
+
+    const retryRes = await signedReq(
+      overageTxnBody(
+        {
+          id: "txn_evt_txn",
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [
+            { id: "txnitm_1", price: { id: OVERAGE_PRICE }, quantity: 10 },
+            { id: "txnitm_2", price: { id: OVERAGE_PRICE }, quantity: 15 },
+          ],
+        },
+        "evt_txn",
+      ),
+      { overrideEnv: { ...env, EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE } },
+    );
+
+    expect((await retryRes.json()) as any).toEqual({ ok: true, idempotent: true });
+    quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(0);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([]);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 10,
+        windowStart: monday,
+        reversedDrafts: 10,
+        reversedByAdjustmentId: "adj_itemized",
+        reversalAdjustmentIds: ["adj_itemized"],
+        reversedDraftsByAdjustment: [
+          { adjustmentId: "adj_itemized", action: "refund", drafts: 10 },
+        ],
+      },
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_2",
+        extraDrafts: 15,
+        windowStart: monday,
+        reversedDrafts: 15,
+        reversedByAdjustmentId: "adj_itemized",
+        reversalAdjustmentIds: ["adj_itemized"],
+        reversedDraftsByAdjustment: [
+          { adjustmentId: "adj_itemized", action: "refund", drafts: 15 },
+        ],
       },
     ]);
   });
@@ -1701,17 +1879,22 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
 
     expect((await res.json()) as any).toEqual({ ok: true, pending: true });
     const quota = storedMeta.quota as Record<string, unknown>;
-    const pendingReversals = quota.pendingOverageReversals as unknown[];
+    expect(quota.pendingOverageReversals).toEqual([]);
+    const pendingReversals = await storedPaddlePendingOverageReversals();
     expect(pendingReversals).toHaveLength(101);
-    expect(pendingReversals[0]).toEqual(pending[0]);
-    expect(pendingReversals.at(-1)).toEqual({
-      eventId: "evt_adj_new",
-      adjustmentId: "adj_new",
-      transactionId: "txn_new",
-      action: "refund",
-      adjustmentType: null,
-      items: [],
-    });
+    expect(pendingReversals).toEqual(
+      expect.arrayContaining([
+        pending[0],
+        {
+          eventId: "evt_adj_new",
+          adjustmentId: "adj_new",
+          transactionId: "txn_new",
+          action: "refund",
+          adjustmentType: null,
+          items: [],
+        },
+      ]),
+    );
   });
 
   it("prorates a partial adjustment for one transaction item", async () => {
@@ -2205,7 +2388,8 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     );
 
     expect((await restoreRes.json()) as any).toEqual({ ok: true, pending: true });
-    expect((storedMeta.quota as Record<string, unknown>).pendingOverageReversals).toEqual([
+    expect((storedMeta.quota as Record<string, unknown>).pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([
       {
         eventId: "evt_restore",
         adjustmentId: "adj_restore",
@@ -2228,6 +2412,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     const quota = storedMeta.quota as Record<string, unknown>;
     expect(quota.extraDrafts).toBe(25);
     expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([]);
     expect(quota.processedOverageAdjustmentIds).toEqual(["adj_restore", "adj_chargeback"]);
     expect(quota.overageCredits).toBeNull();
     expect(await storedPaddleOverageCredits()).toEqual([
