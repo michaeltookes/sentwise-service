@@ -104,22 +104,15 @@ export async function handlePaddleCheckout(
   }
 
   if (checkoutReservationId) {
-    try {
-      const recordResult = await quotaRecordPaddleSubscriptionCheckout(env, userId, {
-        reservationId: checkoutReservationId,
-        transactionId: transaction.transactionId,
-        checkoutUrl: transaction.checkoutUrl,
-        priceId: body.priceId,
-        quantity: body.quantity,
-      });
-      if ("stale" in recordResult) {
-        throw pendingCheckoutError();
-      }
-    } catch (err) {
-      await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
-        () => undefined,
-      );
-      throw err;
+    const recordResult = await quotaRecordPaddleSubscriptionCheckout(env, userId, {
+      reservationId: checkoutReservationId,
+      transactionId: transaction.transactionId,
+      checkoutUrl: transaction.checkoutUrl,
+      priceId: body.priceId,
+      quantity: body.quantity,
+    });
+    if ("stale" in recordResult) {
+      throw pendingCheckoutError();
     }
   }
 

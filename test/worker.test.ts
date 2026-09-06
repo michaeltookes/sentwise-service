@@ -1188,15 +1188,25 @@ describe("POST /v1/paddle/checkout", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("releases a subscription checkout reservation when recording the transaction fails", async () => {
+  it("keeps a subscription checkout reservation when recording the transaction fails", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
     const releaseBodies: Array<{ reservationId?: string }> = [];
+    let pendingReservation:
+      { reservationId: string; priceId: string; quantity: number } | undefined;
     const quotaStub = {
       fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const path = requestUrl(input).replace("https://account-quota.internal", "");
         const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
         if (path === "/paddle-subscription-checkout-reserve") {
+          if (pendingReservation) {
+            return Promise.resolve(Response.json({ pending: true, ...pendingReservation }));
+          }
+          pendingReservation = {
+            reservationId: body.reservationId,
+            priceId: body.priceId,
+            quantity: body.quantity,
+          };
           return Promise.resolve(
             Response.json({ reserved: true, reservationId: body.reservationId }),
           );
@@ -1251,13 +1261,28 @@ describe("POST /v1/paddle/checkout", () => {
 
     expect(res.status).toBe(502);
     expect(((await res.json()) as any).error.type).toBe("checkout_record_failed");
-    expect(releaseBodies).toEqual([
-      {
-        reservationId: expect.stringMatching(
-          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-        ),
-      },
-    ]);
+    expect(releaseBodies).toEqual([]);
+    expect(pendingReservation?.reservationId).toEqual(
+      expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+    );
+
+    const retry = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      quotaEnv,
+    );
+
+    expect(retry.status).toBe(409);
+    expect(((await retry.json()) as any).error.type).toBe("billing_checkout_pending");
+    const transactionCreates = (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([input, init]) =>
+        requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
+        init?.method === "POST",
+    );
+    expect(transactionCreates).toHaveLength(1);
   });
 
   it("releases a subscription checkout reservation when Paddle creation fails", async () => {
