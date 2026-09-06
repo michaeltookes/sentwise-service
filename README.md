@@ -360,7 +360,7 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids) **and** `privateMetadata.quota.weeklyDraftLimit` = the tier's limit               |
 | `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID` |
-| `adjustment.created` / `.updated` (approved refund/chargeback/credit)                                   | Marks matching overage credits reversed and removes any still-current weekly extra drafts for the adjusted transaction                                       |
+| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion       |
 
 **Account mapping.** `data.custom_data.clerkUserId` (attached by the app's checkout) identifies the
 candidate Clerk user, but it is trusted only when the Paddle `customer_id` matches the account's
@@ -390,16 +390,21 @@ persists them. The app should open `GET /v1/paddle/manage-billing`, which fetche
 
 **Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
 `EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
-the Paddle transaction id; approved Paddle refund/chargeback/credit adjustments mark matching credits
-as reversed and subtract any still-current weekly extras.
+the Paddle transaction id and, when Paddle provides it, the transaction item id and item total.
+Approved Paddle refund/chargeback/credit adjustments mark matching credits as reversed and subtract
+any still-current weekly extras; partial adjustments are prorated by adjusted amount. Approved
+chargeback/credit reversals restore previously reversed credits. If an approved reversal arrives
+before the matching `transaction.completed`, it is retained in `pendingOverageReversals` and applied
+when that transaction is later delivered.
 
 **Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
 Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
 updated. Subscription writes are skipped when the incoming `event_id` equals the stored `lastEventId`,
 or when a strictly older `occurred_at` would clobber a newer stored record. Overage writes are skipped
 when the `event_id` is in the bounded `processedOverageEventIds` list (the legacy
-`lastOverageEventId` is still honored). Approved adjustment reversals are skipped when the
-`adjustment_id` is in the bounded `processedOverageAdjustmentIds` list. A transient Clerk failure
+`lastOverageEventId` is still honored). Approved adjustment reversals/restores are skipped when the
+`adjustment_id` is in the bounded `processedOverageAdjustmentIds` list; unmatched approved reversals
+are retained in a bounded `pendingOverageReversals` list by transaction id. A transient Clerk failure
 returns **`502`** so Paddle retries.
 
 **Privacy.** This endpoint handles only plan/status/timestamps and price/subscription/customer ids

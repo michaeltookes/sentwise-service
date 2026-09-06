@@ -44,6 +44,32 @@ export function isAdjustmentEvent(eventType: string): boolean {
   return eventType === "adjustment.created" || eventType === "adjustment.updated";
 }
 
+export type OverageAdjustmentAction =
+  "refund" | "chargeback" | "credit" | "chargeback_reverse" | "credit_reverse";
+
+export interface OverageCreditItem {
+  transactionItemId: string | null;
+  extraDrafts: number;
+  amount: number | null;
+}
+
+export interface OverageCreditSummary {
+  extraDrafts: number;
+  credits: OverageCreditItem[];
+}
+
+export interface OverageAdjustmentItem {
+  transactionItemId: string;
+  type: "full" | "partial";
+  amount: number | null;
+}
+
+export interface OverageAdjustmentSummary {
+  action: OverageAdjustmentAction;
+  adjustmentType: string | null;
+  items: OverageAdjustmentItem[];
+}
+
 // ---------------------------------------------------------------------------
 // Signature verification (Paddle "Verify webhook signatures").
 // Header: `ts=<unix-seconds>;h1=<hex-hmac-sha256>` over the payload `<ts>:<rawBody>`.
@@ -273,6 +299,43 @@ export function isApprovedOverageReversal(event: PaddleEvent): boolean {
   return event.data.status === "approved";
 }
 
+export function isApprovedOverageRestore(event: PaddleEvent): boolean {
+  if (!isAdjustmentEvent(event.eventType)) return false;
+  const action = event.data.action;
+  if (action !== "chargeback_reverse" && action !== "credit_reverse") return false;
+  return event.data.status === "approved";
+}
+
+export function isApprovedOverageAdjustment(event: PaddleEvent): boolean {
+  return isApprovedOverageReversal(event) || isApprovedOverageRestore(event);
+}
+
+export function overageAdjustmentFromEvent(event: PaddleEvent): OverageAdjustmentSummary | null {
+  if (!isApprovedOverageAdjustment(event)) return null;
+  const action = event.data.action as OverageAdjustmentAction;
+  const adjustmentType = typeof event.data.type === "string" ? event.data.type : null;
+  const items = Array.isArray(event.data.items) ? event.data.items : [];
+  return {
+    action,
+    adjustmentType,
+    items: items.flatMap((item): OverageAdjustmentItem[] => {
+      const record = asRecord(item);
+      if (!record) return [];
+      const transactionItemId = record?.item_id;
+      if (typeof transactionItemId !== "string" || transactionItemId === "") return [];
+      const type = record.type === "partial" ? "partial" : record.type === "full" ? "full" : null;
+      if (!type) return [];
+      return [
+        {
+          transactionItemId,
+          type,
+          amount: parsePaddleAmount(record.amount),
+        },
+      ];
+    }),
+  };
+}
+
 /** Normalize any parseable timestamp to canonical ISO-with-millis, or null. */
 export function normalizeIso(v: unknown): string | null {
   if (typeof v !== "string" || v === "") return null;
@@ -320,27 +383,98 @@ export interface OverageEnv {
  * buyer-supplied custom_data can tag a checkout but never controls the credit.
  */
 export function overageDraftsFromEvent(event: PaddleEvent, env: OverageEnv): number {
-  if (event.eventType !== "transaction.completed") return 0;
+  return overageCreditFromEvent(event, env).extraDrafts;
+}
+
+export function overageCreditFromEvent(event: PaddleEvent, env: OverageEnv): OverageCreditSummary {
+  if (event.eventType !== "transaction.completed") return { extraDrafts: 0, credits: [] };
 
   const overagePriceId =
     typeof env.EXTRA_DRAFTS_PRICE_ID === "string" && env.EXTRA_DRAFTS_PRICE_ID !== ""
       ? env.EXTRA_DRAFTS_PRICE_ID
       : null;
-  if (!overagePriceId) return 0;
-
-  const items = Array.isArray(event.data.items) ? event.data.items : [];
-  const matchingItems = items.filter(
-    (item) => asRecord(asRecord(item)?.price)?.id === overagePriceId,
-  );
-  if (matchingItems.length === 0) return 0;
+  if (!overagePriceId) return { extraDrafts: 0, credits: [] };
 
   const perUnit = numFrom(env.EXTRA_DRAFTS_PER_UNIT, DEFAULT_EXTRA_DRAFTS_PER_UNIT);
-  let units = 0;
-  for (const item of matchingItems) {
-    const q = asRecord(item)?.quantity;
-    if (typeof q === "number" && Number.isFinite(q) && q > 0) units += Math.floor(q);
+  const credits = overageCreditItemsFromDetails(event, overagePriceId, perUnit);
+  const fallbackCredits =
+    credits.length > 0
+      ? credits
+      : overageCreditItemsFromTransactionItems(event, overagePriceId, perUnit);
+  return {
+    extraDrafts: fallbackCredits.reduce((sum, item) => sum + item.extraDrafts, 0),
+    credits: fallbackCredits,
+  };
+}
+
+function overageCreditItemsFromDetails(
+  event: PaddleEvent,
+  overagePriceId: string,
+  perUnit: number,
+): OverageCreditItem[] {
+  const details = asRecord(event.data.details);
+  const lineItems = Array.isArray(details?.line_items) ? details.line_items : [];
+  const credits: OverageCreditItem[] = [];
+  for (const item of lineItems) {
+    const record = asRecord(item);
+    if (record?.price_id !== overagePriceId) continue;
+    const quantity = positiveInt(record.quantity) ?? 0;
+    const extraDrafts = quantity * perUnit;
+    if (extraDrafts <= 0) continue;
+    credits.push({
+      transactionItemId: typeof record.id === "string" && record.id !== "" ? record.id : null,
+      extraDrafts,
+      amount: transactionLineItemTotal(record, quantity),
+    });
   }
-  return Math.max(0, units * perUnit);
+  return credits;
+}
+
+function overageCreditItemsFromTransactionItems(
+  event: PaddleEvent,
+  overagePriceId: string,
+  perUnit: number,
+): OverageCreditItem[] {
+  const items = Array.isArray(event.data.items) ? event.data.items : [];
+  const credits: OverageCreditItem[] = [];
+  for (const item of items) {
+    const record = asRecord(item);
+    if (asRecord(record?.price)?.id !== overagePriceId) continue;
+    const quantity = positiveInt(record?.quantity) ?? 0;
+    const extraDrafts = quantity * perUnit;
+    if (extraDrafts <= 0) continue;
+    credits.push({
+      transactionItemId: typeof record?.id === "string" && record.id !== "" ? record.id : null,
+      extraDrafts,
+      amount: null,
+    });
+  }
+  return credits;
+}
+
+function transactionLineItemTotal(
+  record: Record<string, unknown>,
+  quantity: number,
+): number | null {
+  const totals = asRecord(record.totals);
+  const total = parsePaddleAmount(totals?.total);
+  if (total !== null) return total;
+
+  const unitTotals = asRecord(record.unit_totals);
+  const unitTotal = parsePaddleAmount(unitTotals?.total);
+  return unitTotal !== null ? unitTotal * quantity : null;
+}
+
+function positiveInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : null;
+}
+
+function parsePaddleAmount(value: unknown): number | null {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 // ---------------------------------------------------------------------------

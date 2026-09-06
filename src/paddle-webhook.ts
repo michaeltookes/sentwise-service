@@ -25,8 +25,9 @@ import {
   HANDLED_EVENT_TYPES,
   isAdjustmentEvent,
   isSubscriptionEvent,
-  isApprovedOverageReversal,
-  overageDraftsFromEvent,
+  isApprovedOverageAdjustment,
+  overageAdjustmentFromEvent,
+  overageCreditFromEvent,
   parsePaddleEvent,
   transactionIdFromEvent,
   verifyPaddleSignature,
@@ -75,10 +76,13 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
     return ack({ ignored: "unhandled_event_type" });
   }
 
-  if (isAdjustmentEvent(event.eventType) && !isApprovedOverageReversal(event)) {
+  if (isAdjustmentEvent(event.eventType) && !isApprovedOverageAdjustment(event)) {
     return ack({ ignored: "adjustment_not_reversal" });
   }
-  if (event.eventType === "transaction.completed" && overageDraftsFromEvent(event, env) <= 0) {
+  if (
+    event.eventType === "transaction.completed" &&
+    overageCreditFromEvent(event, env).extraDrafts <= 0
+  ) {
     return ack({ ignored: "not_overage" });
   }
 
@@ -131,8 +135,8 @@ async function applySubscriptionEvent(
 // ---------------------------------------------------------------------------
 
 async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): Promise<Response> {
-  const credit = overageDraftsFromEvent(event, env);
-  if (credit <= 0) {
+  const credit = overageCreditFromEvent(event, env);
+  if (credit.extraDrafts <= 0) {
     // Most transaction.completed events are subscription renewals, not overage.
     return ack({ ignored: "not_overage" });
   }
@@ -147,7 +151,8 @@ async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): 
       eventId: event.eventId,
       transactionId,
       customerId: customerIdFromEvent(event),
-      extraDrafts: credit,
+      extraDrafts: credit.extraDrafts,
+      credits: credit.credits,
     });
     return ack(result);
   } catch (err) {
@@ -162,7 +167,7 @@ async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): 
 }
 
 // ---------------------------------------------------------------------------
-// adjustment.* → revoke refunded/charged-back overage credit.
+// adjustment.* → revoke/restore overage credit.
 // ---------------------------------------------------------------------------
 
 async function applyOverageReversalEvent(
@@ -172,7 +177,8 @@ async function applyOverageReversalEvent(
 ): Promise<Response> {
   const adjustmentId = adjustmentIdFromEvent(event);
   const transactionId = adjustedTransactionIdFromEvent(event);
-  if (!adjustmentId || !transactionId) {
+  const adjustment = overageAdjustmentFromEvent(event);
+  if (!adjustmentId || !transactionId || !adjustment) {
     return ack({ ignored: "missing_adjustment_reference" });
   }
 
@@ -183,6 +189,9 @@ async function applyOverageReversalEvent(
       adjustmentId,
       transactionId,
       customerId: customerIdFromEvent(event),
+      action: adjustment.action,
+      adjustmentType: adjustment.adjustmentType,
+      items: adjustment.items,
     });
     return ack(result);
   } catch (err) {

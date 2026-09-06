@@ -5,7 +5,12 @@ import type { Env } from "./config";
 import { ApiError, type ErrorExtra } from "./errors";
 import type { ResolvedLimits, WindowState } from "./metering";
 import type { InterestTopic } from "./interest";
-import type { PaddleEvent } from "./paddle";
+import type {
+  OverageAdjustmentAction,
+  OverageAdjustmentItem,
+  OverageCreditItem,
+  PaddleEvent,
+} from "./paddle";
 
 export interface CheckResult {
   allowed: boolean;
@@ -51,6 +56,8 @@ export type PaddleOverageResult =
   { applied: true; extraDrafts: number } | { idempotent: true } | { mapped: false };
 export type PaddleOverageReversalResult =
   | { revoked: true; extraDrafts: number }
+  | { restored: true; extraDrafts: number }
+  | { pending: true }
   | { idempotent: true }
   | { ignored: "not_overage_reversal" }
   | { mapped: false };
@@ -186,12 +193,13 @@ export function quotaRecordPaddleOverage(
     transactionId: string;
     customerId: string | null;
     extraDrafts: number;
+    credits: OverageCreditItem[];
   },
 ): Promise<PaddleOverageResult> {
   return call<PaddleOverageResult>(env, userId, "/paddle-overage", body);
 }
 
-/** Serialize and revoke a refunded/charged-back Paddle overage entitlement. */
+/** Serialize and revoke/restore a Paddle overage entitlement adjustment. */
 export function quotaRecordPaddleOverageReversal(
   env: Env,
   userId: string,
@@ -201,6 +209,9 @@ export function quotaRecordPaddleOverageReversal(
     adjustmentId: string;
     transactionId: string;
     customerId: string | null;
+    action: OverageAdjustmentAction;
+    adjustmentType: string | null;
+    items: OverageAdjustmentItem[];
   },
 ): Promise<PaddleOverageReversalResult> {
   return call<PaddleOverageReversalResult>(env, userId, "/paddle-overage-reversal", body);

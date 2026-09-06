@@ -7,10 +7,14 @@ import {
   computeHmacSha256Hex,
   customerIdFromEvent,
   HANDLED_EVENT_TYPES,
+  isApprovedOverageAdjustment,
   isAdjustmentEvent,
   isApprovedOverageReversal,
+  isApprovedOverageRestore,
   isSubscriptionEvent,
   normalizeIso,
+  overageAdjustmentFromEvent,
+  overageCreditFromEvent,
   overageDraftsFromEvent,
   parsePaddleEvent,
   parsePaddleSignatureHeader,
@@ -349,6 +353,27 @@ describe("isApprovedOverageReversal", () => {
       isApprovedOverageReversal(adjustment({ action: "chargeback_warning", status: "approved" })!),
     ).toBe(false);
   });
+
+  it("recognizes approved restore adjustments separately", () => {
+    const restored = adjustment({ action: "chargeback_reverse", status: "approved" })!;
+    expect(isApprovedOverageReversal(restored)).toBe(false);
+    expect(isApprovedOverageRestore(restored)).toBe(true);
+    expect(isApprovedOverageAdjustment(restored)).toBe(true);
+  });
+
+  it("extracts partial adjustment item details", () => {
+    const event = adjustment({
+      action: "refund",
+      status: "approved",
+      type: "partial",
+      items: [{ item_id: "txnitm_123", type: "partial", amount: "1000" }],
+    })!;
+    expect(overageAdjustmentFromEvent(event)).toEqual({
+      action: "refund",
+      adjustmentType: "partial",
+      items: [{ transactionItemId: "txnitm_123", type: "partial", amount: 1000 }],
+    });
+  });
 });
 
 describe("normalizeIso", () => {
@@ -442,6 +467,31 @@ describe("overageDraftsFromEvent", () => {
   it("does not credit an overage-kind purchase with no matching price item", () => {
     const event = txn({ custom_data: { kind: "overage" }, items: [] })!;
     expect(overageDraftsFromEvent(event, { EXTRA_DRAFTS_PRICE_ID: "pri_overage" })).toBe(0);
+  });
+
+  it("prefers details.line_items so partial adjustments can target transaction items", () => {
+    const event = txn({
+      items: [{ price: { id: "pri_overage" }, quantity: 100 }],
+      details: {
+        line_items: [
+          {
+            id: "txnitm_123",
+            price_id: "pri_overage",
+            quantity: 2,
+            totals: { total: "5000" },
+          },
+        ],
+      },
+    })!;
+    expect(
+      overageCreditFromEvent(event, {
+        EXTRA_DRAFTS_PRICE_ID: "pri_overage",
+        EXTRA_DRAFTS_PER_UNIT: 10,
+      }),
+    ).toEqual({
+      extraDrafts: 20,
+      credits: [{ transactionItemId: "txnitm_123", extraDrafts: 20, amount: 5000 }],
+    });
   });
 });
 

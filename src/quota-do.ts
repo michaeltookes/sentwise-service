@@ -16,8 +16,8 @@
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /interest { topic } -> serialize Clerk interest metadata writes per user
 //   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
-//   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts } -> serialize Paddle overage entitlement writes
-//   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId } -> revoke refunded overage credit
+//   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts, credits } -> serialize Paddle overage entitlement writes
+//   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, items } -> revoke/restore overage credit
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /defer-release { now, reservationId, reservationWindowStart, estimatedTokens }

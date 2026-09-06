@@ -724,6 +724,20 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     mocks.getUserList.mockResolvedValue({ data: [{ id: "user_abc" }] });
   });
 
+  function overageTxnBody(data: Record<string, unknown>, eventId = "evt_txn"): string {
+    return JSON.stringify({
+      event_id: eventId,
+      event_type: "transaction.completed",
+      occurred_at: "2026-09-05T10:00:00.000Z",
+      data: {
+        id: `txn_${eventId}`,
+        customer_id: "ctm_123",
+        custom_data: { clerkUserId: "user_abc" },
+        ...data,
+      },
+    });
+  }
+
   function adjustmentBody(data: Record<string, unknown> = {}, eventId = "evt_adj"): string {
     return JSON.stringify({
       event_id: eventId,
@@ -773,7 +787,9 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         transactionId: "txn_evt_txn",
         extraDrafts: 25,
         windowStart: monday,
+        reversedDrafts: 25,
         reversedByAdjustmentId: "adj_123",
+        reversalAdjustmentIds: ["adj_123"],
       },
     ]);
   });
@@ -806,6 +822,154 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
+  it("retains an approved reversal that arrives before the overage transaction", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {},
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const reversalRes = await signedReq(adjustmentBody());
+
+    expect((await reversalRes.json()) as any).toEqual({ ok: true, pending: true });
+    expect((storedMeta.quota as Record<string, unknown>).pendingOverageReversals).toEqual([
+      {
+        eventId: "evt_adj",
+        adjustmentId: "adj_123",
+        transactionId: "txn_evt_txn",
+        action: "refund",
+        adjustmentType: null,
+        items: [],
+      },
+    ]);
+
+    const transactionRes = await signedReq(
+      overageTxnBody(
+        {
+          id: "txn_evt_txn",
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 25 }],
+        },
+        "evt_txn",
+      ),
+      { overrideEnv: { ...env, EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE } },
+    );
+
+    expect((await transactionRes.json()) as any).toEqual({
+      ok: true,
+      applied: true,
+      extraDrafts: 0,
+    });
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(0);
+    expect(quota.extraDraftsWindowStart).toBe(monday);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversedDrafts: 25,
+        reversedByAdjustmentId: "adj_123",
+        reversalAdjustmentIds: ["adj_123"],
+      },
+    ]);
+  });
+
+  it("prorates a partial adjustment for one transaction item", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 50,
+          extraDraftsWindowStart: monday,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              transactionItemId: "txnitm_1",
+              extraDrafts: 50,
+              amount: 5000,
+              windowStart: monday,
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      adjustmentBody({
+        type: "partial",
+        items: [{ item_id: "txnitm_1", type: "partial", amount: "1000" }],
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, revoked: true, extraDrafts: 10 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(40);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 50,
+        amount: 5000,
+        windowStart: monday,
+        reversedDrafts: 10,
+        reversalAdjustmentIds: ["adj_123"],
+      },
+    ]);
+  });
+
+  it("restores credits after an approved chargeback reversal", async () => {
+    const monday = mondayStartUtc(Date.now());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 0,
+          extraDraftsWindowStart: monday,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 25,
+              windowStart: monday,
+              reversedDrafts: 25,
+              reversedByAdjustmentId: "adj_chargeback",
+              reversalAdjustmentIds: ["adj_chargeback"],
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      adjustmentBody({ id: "adj_reverse", action: "chargeback_reverse", type: "full" }, "evt_rev"),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, restored: true, extraDrafts: 25 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(25);
+    expect(quota.processedOverageAdjustmentIds).toEqual(["adj_reverse"]);
+    expect(quota.overageCredits).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversalAdjustmentIds: ["adj_chargeback"],
+        restoredByAdjustmentIds: ["adj_reverse"],
+      },
+    ]);
+  });
+
   it("ignores pending or rejected adjustments until Paddle approves them", async () => {
     mocks.getUser.mockResolvedValue(userWith({ subscription: { paddleCustomerId: "ctm_123" } }));
 
@@ -820,12 +984,12 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
-  it("ignores approved adjustments for transactions without stored overage credit", async () => {
+  it("ignores approved restore adjustments when no credit was previously reversed", async () => {
     mocks.getUser.mockResolvedValue(
       userWith({ subscription: { paddleCustomerId: "ctm_123" }, quota: {} }),
     );
 
-    const res = await signedReq(adjustmentBody());
+    const res = await signedReq(adjustmentBody({ action: "chargeback_reverse" }));
 
     expect((await res.json()) as any).toEqual({ ok: true, ignored: "not_overage_reversal" });
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
