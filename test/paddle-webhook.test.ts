@@ -2500,6 +2500,84 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
       },
     ]);
   });
+
+  it("keeps replayed pending restores when reversal metadata writes fail", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let failChargebackWrite = true;
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {
+        extraDrafts: 25,
+        extraDraftsWindowStart: monday,
+        overageCredits: [
+          {
+            eventId: "evt_txn",
+            transactionId: "txn_evt_txn",
+            extraDrafts: 25,
+            windowStart: monday,
+          },
+        ],
+      },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      const quota = update.privateMetadata.quota as Record<string, unknown> | undefined;
+      const processedAdjustmentIds = Array.isArray(quota?.processedOverageAdjustmentIds)
+        ? quota.processedOverageAdjustmentIds
+        : [];
+      if (processedAdjustmentIds.includes("adj_chargeback") && failChargebackWrite) {
+        failChargebackWrite = false;
+        throw new Error("clerk write failed");
+      }
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    const restoreRes = await signedReq(
+      adjustmentBody({ id: "adj_restore", action: "chargeback_reverse" }, "evt_restore"),
+    );
+
+    expect((await restoreRes.json()) as any).toEqual({ ok: true, pending: true });
+    expect(await storedPaddlePendingOverageReversals()).toHaveLength(1);
+
+    const failedChargebackRes = await signedReq(
+      adjustmentBody({ id: "adj_chargeback", action: "chargeback" }, "evt_chargeback"),
+    );
+
+    expect(failedChargebackRes.status).toBe(502);
+    expect(await storedPaddlePendingOverageReversals()).toHaveLength(1);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+      },
+    ]);
+
+    const retryRes = await signedReq(
+      adjustmentBody({ id: "adj_chargeback", action: "chargeback" }, "evt_chargeback"),
+    );
+
+    expect((await retryRes.json()) as any).toEqual({
+      ok: true,
+      revoked: true,
+      extraDrafts: 25,
+    });
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(25);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddlePendingOverageReversals()).toEqual([]);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        extraDrafts: 25,
+        windowStart: monday,
+        reversalAdjustmentIds: ["adj_chargeback"],
+        restoredByAdjustmentIds: ["adj_restore"],
+      },
+    ]);
+  });
 });
 
 describe("POST /v1/paddle/webhook — user resolution", () => {
