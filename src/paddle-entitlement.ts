@@ -9,11 +9,15 @@ import type { OverageAdjustmentAction } from "./paddle";
 const PROCESSED_OVERAGE_EVENT_ID_LIMIT = 100;
 const PROCESSED_OVERAGE_ADJUSTMENT_ID_LIMIT = 100;
 const PENDING_OVERAGE_REVERSAL_LIMIT = 100;
+const LEDGER_STORAGE_BULK_OPERATION_LIMIT = 128;
 export const PADDLE_OVERAGE_CREDITS_STORAGE_KEY = "paddle_overage_credits";
+export const PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX = "paddle_overage_credit:";
 
 export interface PaddleOverageLedgerStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put<T = unknown>(key: string, value: T): Promise<void>;
+  list?<T = unknown>(options?: { prefix?: string }): Promise<Map<string, T>>;
+  delete?(keyOrKeys: string | string[]): Promise<unknown>;
 }
 
 export interface PaddleOverageCreditInput {
@@ -868,10 +872,11 @@ async function loadOverageCredits(
 ): Promise<StoredOverageCredit[]> {
   const legacyCredits = overageCreditsFromValue(quota.overageCredits);
   if (!ledgerStore) return mergeOverageCredits(legacyCredits);
-  const storedCredits = overageCreditsFromValue(
+  const aggregateCredits = overageCreditsFromValue(
     await ledgerStore.get<unknown>(PADDLE_OVERAGE_CREDITS_STORAGE_KEY),
   );
-  return mergeOverageCredits([...legacyCredits, ...storedCredits]);
+  const shardedCredits = await loadShardedOverageCredits(ledgerStore);
+  return mergeOverageCredits([...legacyCredits, ...aggregateCredits, ...shardedCredits]);
 }
 
 async function saveOverageCredits(
@@ -879,7 +884,30 @@ async function saveOverageCredits(
   credits: StoredOverageCredit[],
 ): Promise<void> {
   if (!ledgerStore) return;
-  await ledgerStore.put(PADDLE_OVERAGE_CREDITS_STORAGE_KEY, mergeOverageCredits(credits));
+  const mergedCredits = mergeOverageCredits(credits);
+  if (!ledgerStore.list || !ledgerStore.delete) {
+    await ledgerStore.put(PADDLE_OVERAGE_CREDITS_STORAGE_KEY, mergedCredits);
+    return;
+  }
+  const listStorage = ledgerStore.list.bind(ledgerStore);
+  const deleteStorage = ledgerStore.delete.bind(ledgerStore);
+
+  const nextByStorageKey = new Map(
+    mergedCredits.map((credit) => [overageCreditStorageKey(credit), credit] as const),
+  );
+  const stored = await listStorage<unknown>({
+    prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+  });
+
+  for (const [key, credit] of nextByStorageKey) {
+    await ledgerStore.put(key, credit);
+  }
+
+  const staleKeys = [...stored.keys()].filter((key) => !nextByStorageKey.has(key));
+  if (staleKeys.length > 0) {
+    await deleteStorageKeys(deleteStorage, staleKeys);
+  }
+  await deleteStorage(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
 }
 
 function fallbackOverageCredits(
@@ -913,6 +941,31 @@ function creditsMissingFromLedger(
 
 function overageCreditKey(credit: StoredOverageCredit): string {
   return `${credit.eventId}:${credit.transactionId}:${credit.transactionItemId ?? ""}`;
+}
+
+async function loadShardedOverageCredits(
+  ledgerStore: PaddleOverageLedgerStore,
+): Promise<StoredOverageCredit[]> {
+  if (!ledgerStore.list) return [];
+  const stored = await ledgerStore.list<unknown>({
+    prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+  });
+  return [...stored.values()].flatMap((value): StoredOverageCredit[] =>
+    isStoredOverageCredit(value) ? [value] : [],
+  );
+}
+
+function overageCreditStorageKey(credit: StoredOverageCredit): string {
+  return `${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}${encodeURIComponent(overageCreditKey(credit))}`;
+}
+
+async function deleteStorageKeys(
+  deleteStorage: (keyOrKeys: string | string[]) => Promise<unknown>,
+  keys: string[],
+): Promise<void> {
+  for (let i = 0; i < keys.length; i += LEDGER_STORAGE_BULK_OPERATION_LIMIT) {
+    await deleteStorage(keys.slice(i, i + LEDGER_STORAGE_BULK_OPERATION_LIMIT));
+  }
 }
 
 function processedOverageEventIds(quota: Record<string, unknown>): string[] {

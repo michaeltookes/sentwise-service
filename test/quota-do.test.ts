@@ -617,6 +617,29 @@ describe("AccountQuota Durable Object", () => {
     expect(next).toEqual({ reserved: true, reservationId: "checkout-next" });
   });
 
+  it("keeps a subscription checkout reservation after the former timeout window", async () => {
+    const uid = "checkout-reservation-no-timeout";
+    const first = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON,
+        reservationId: "checkout-open",
+      },
+    );
+    expect(first).toEqual({ reserved: true, reservationId: "checkout-open" });
+
+    const second = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 31 * 60_000,
+        reservationId: "checkout-later",
+      },
+    );
+    expect(second).toEqual({ pending: true });
+  });
+
   it("persists the deletion tombstone before scheduling cleanup retry", async () => {
     const calls: string[] = [];
     const values = new Map<string, unknown>();

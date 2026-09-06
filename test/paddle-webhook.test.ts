@@ -24,7 +24,10 @@ vi.mock("@clerk/backend", () => ({
 
 import worker from "../src/index";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
-import { PADDLE_OVERAGE_CREDITS_STORAGE_KEY } from "../src/paddle-entitlement";
+import {
+  PADDLE_OVERAGE_CREDITS_STORAGE_KEY,
+  PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+} from "../src/paddle-entitlement";
 
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
@@ -149,13 +152,22 @@ async function clearPaddleOverageCredits(userId = "user_abc"): Promise<void> {
   const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
   await runInDurableObject(stub, async (_instance, state) => {
     await state.storage.delete(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
+    const sharded = await state.storage.list({
+      prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+    });
+    const keys = [...sharded.keys()];
+    if (keys.length > 0) await state.storage.delete(keys);
   });
 }
 
 async function storedPaddleOverageCredits(userId = "user_abc"): Promise<unknown[]> {
   const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
   return runInDurableObject(stub, async (_instance, state) => {
-    return (await state.storage.get<unknown[]>(PADDLE_OVERAGE_CREDITS_STORAGE_KEY)) ?? [];
+    const legacy = await state.storage.get<unknown[]>(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
+    const sharded = await state.storage.list<unknown>({
+      prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+    });
+    return [...(Array.isArray(legacy) ? legacy : []), ...sharded.values()];
   });
 }
 
@@ -163,6 +175,20 @@ async function putPaddleOverageCredits(credits: unknown[], userId = "user_abc"):
   const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
   await runInDurableObject(stub, async (_instance, state) => {
     await state.storage.put(PADDLE_OVERAGE_CREDITS_STORAGE_KEY, credits);
+  });
+}
+
+async function storedPaddleOverageCreditKeys(userId = "user_abc"): Promise<string[]> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  return runInDurableObject(stub, async (_instance, state) => {
+    const sharded = await state.storage.list({
+      prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+    });
+    const keys = [...sharded.keys()];
+    if ((await state.storage.get(PADDLE_OVERAGE_CREDITS_STORAGE_KEY)) !== undefined) {
+      keys.push(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
+    }
+    return keys.sort();
   });
 }
 
@@ -307,6 +333,46 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     expect(res.status).toBe(200);
     expect((await res.json()) as any).toEqual({ ok: true, ignored: "unknown_price" });
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("applies a terminal event for the stored subscription even when its price is no longer mapped", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+          priceId: PRO_PRICE,
+          lastEventId: "evt_old",
+          updatedAt: "2026-09-05T00:00:00.000Z",
+        },
+        quota: { weeklyDraftLimit: 120, weeklyTokenLimit: 500000 },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.canceled",
+        eventId: "evt_removed_price_cancel",
+        status: "canceled",
+        priceId: "pri_removed_from_catalog",
+        occurredAt: "2026-09-06T00:00:00.000Z",
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(lastWrite()?.subscription).toMatchObject({
+      plan: "pro",
+      status: "canceled",
+      paddleSubscriptionId: "sub_123",
+      priceId: PRO_PRICE,
+      lastEventId: "evt_removed_price_cancel",
+    });
+    expect(lastWrite()?.quota).toEqual({
+      weeklyDraftLimit: null,
+      weeklyTokenLimit: 500000,
+    });
   });
 
   it("ignores an unhandled event type (200, no Clerk lookup)", async () => {
@@ -702,6 +768,9 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
         windowStart: mondayStartUtc(Date.now()),
       },
     ]);
+    expect(await storedPaddleOverageCreditKeys()).toEqual([
+      expect.stringMatching(new RegExp(`^${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}`)),
+    ]);
   });
 
   it("accumulates a second purchase within the same window", async () => {
@@ -796,6 +865,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
         reversedDraftsByAdjustment: [{ adjustmentId: "adj_refund", action: "refund", drafts: 10 }],
       },
     ]);
+    expect(await storedPaddleOverageCreditKeys()).not.toContain(PADDLE_OVERAGE_CREDITS_STORAGE_KEY);
   });
 
   it("is idempotent when replaying any retained processed overage event id", async () => {
@@ -962,13 +1032,18 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.overageCredits).toBeUndefined();
     const credits = await storedPaddleOverageCredits();
     expect(credits).toHaveLength(101);
-    expect(credits[0]).toEqual(existingCredits[0]);
-    expect(credits[credits.length - 1]).toEqual({
-      eventId: "evt_new",
-      transactionId: "txn_evt_new",
-      extraDrafts: 1,
-      windowStart: monday,
-    });
+    expect(credits).toEqual(
+      expect.arrayContaining([
+        existingCredits[0],
+        {
+          eventId: "evt_new",
+          transactionId: "txn_evt_new",
+          extraDrafts: 1,
+          windowStart: monday,
+        },
+      ]),
+    );
+    expect(await storedPaddleOverageCreditKeys()).toHaveLength(101);
   });
 
   it("serializes overlapping subscription and overage writes through the account Durable Object", async () => {

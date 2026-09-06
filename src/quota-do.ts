@@ -138,7 +138,6 @@ const SETTLEMENT_RETRY_BASE_DELAY_MS = 60_000;
 const SETTLEMENT_RETRY_MAX_DELAY_MS = 15 * 60_000;
 const SETTLEMENT_MARKER_RETENTION_MS = RESERVATION_TTL_MS + SETTLEMENT_RETRY_MAX_DELAY_MS;
 const SETTLEMENT_MARKER_PRUNE_INTERVAL_MS = SETTLEMENT_RETRY_MAX_DELAY_MS;
-const PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_TTL_MS = 30 * 60_000;
 const ACCOUNT_DELETION_FINALIZATION_RETRY_DELAY_MS = 60_000;
 const LEGACY_DELETION_ATTEMPT_ID = "legacy-deletion-attempt";
 const STORAGE_BULK_OPERATION_LIMIT = 128;
@@ -549,14 +548,13 @@ export class AccountQuota {
       const reservation = await txn.get<unknown>(
         PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
       );
-      if (isActivePaddleSubscriptionCheckoutReservation(reservation, now)) {
+      if (isPaddleSubscriptionCheckoutReservation(reservation)) {
         return Response.json({ pending: true });
       }
 
       await txn.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
         reservationId,
         createdAt: now,
-        expiresAt: now + PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_TTL_MS,
       });
       return Response.json({ reserved: true, reservationId });
     });
@@ -1032,13 +1030,14 @@ function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
   );
 }
 
-function isActivePaddleSubscriptionCheckoutReservation(v: unknown, now: number): boolean {
+function isPaddleSubscriptionCheckoutReservation(v: unknown): boolean {
   const reservation = asRecord(v);
   return (
     !!reservation &&
-    typeof reservation.expiresAt === "number" &&
-    Number.isFinite(reservation.expiresAt) &&
-    reservation.expiresAt > now
+    typeof reservation.reservationId === "string" &&
+    reservation.reservationId !== "" &&
+    typeof reservation.createdAt === "number" &&
+    Number.isFinite(reservation.createdAt)
   );
 }
 
@@ -1053,15 +1052,18 @@ function parsePaddleSubscriptionCheckoutReservation(
     !reservationId ||
     typeof reservation?.createdAt !== "number" ||
     !Number.isFinite(reservation.createdAt) ||
-    typeof reservation.expiresAt !== "number" ||
-    !Number.isFinite(reservation.expiresAt)
+    (reservation.expiresAt !== undefined &&
+      (typeof reservation.expiresAt !== "number" || !Number.isFinite(reservation.expiresAt)))
   ) {
     return null;
   }
   return {
     reservationId,
     createdAt: reservation.createdAt,
-    expiresAt: reservation.expiresAt,
+    expiresAt:
+      typeof reservation.expiresAt === "number" && Number.isFinite(reservation.expiresAt)
+        ? reservation.expiresAt
+        : Number.POSITIVE_INFINITY,
   };
 }
 

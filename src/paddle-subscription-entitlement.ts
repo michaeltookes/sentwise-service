@@ -1,6 +1,6 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
-import { type Env } from "./config";
+import { type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import {
   paddleCheckoutBindingMatchesEvent,
@@ -18,6 +18,7 @@ import {
   subscriptionIdFromEvent,
   type PaddleEvent,
 } from "./paddle";
+import type { SubscriptionPlan } from "./subscription";
 
 const SUPERSEDED_SUBSCRIPTION_ID_LIMIT = 20;
 
@@ -75,11 +76,6 @@ export async function recordPaddleSubscriptionInClerk(
   body: PaddleSubscriptionBody,
   env: Env,
 ): Promise<PaddleSubscriptionResult> {
-  const mapped = planFromEvent(body.event);
-  if (!mapped) {
-    return { ignored: "unknown_price" };
-  }
-
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
   let user;
@@ -96,6 +92,11 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const existingSub = asRecord(meta.subscription);
+  const mapped = planMappingForSubscriptionEvent(body.event, existingSub);
+  if (!mapped) {
+    return { ignored: "unknown_price" };
+  }
+
   if (existingSub && existingSub.lastEventId === body.event.eventId) {
     return { idempotent: true };
   }
@@ -134,7 +135,7 @@ export async function recordPaddleSubscriptionInClerk(
   const quota = quotaForSubscriptionStatus(
     asRecord(meta.quota) ?? {},
     record.status,
-    mapped.plan,
+    mapped.quotaPlan,
     env,
   );
 
@@ -148,6 +149,28 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   return { applied: true };
+}
+
+function planMappingForSubscriptionEvent(
+  event: PaddleEvent,
+  existingSub: Record<string, unknown> | null,
+): { plan: SubscriptionPlan; priceId: string | null; quotaPlan: PaidPlan | null } | null {
+  const mapped = planFromEvent(event);
+  if (mapped) return { ...mapped, quotaPlan: mapped.plan };
+  if (!isTerminalSubscriptionEvent(event)) return null;
+
+  const plan = storedSubscriptionPlan(existingSub);
+  if (!plan || plan === "trial" || plan === "none") return null;
+  return {
+    plan,
+    priceId: storedSubscriptionPriceId(existingSub),
+    quotaPlan: isKnownPaidPlan(plan) ? plan : null,
+  };
+}
+
+function isTerminalSubscriptionEvent(event: PaddleEvent): boolean {
+  const status = paddleSubscriptionStatusFromEvent(event);
+  return status === "canceled" || status === "paused";
 }
 
 async function subscriptionEventMatchesAccount(
@@ -211,16 +234,43 @@ function isPaddleSubscriptionStatus(value: unknown): value is string {
 function quotaForSubscriptionStatus(
   existingQuota: Record<string, unknown>,
   status: string,
-  plan: "starter" | "pro" | "unlimited",
+  plan: PaidPlan | null,
   env: Env,
 ): Record<string, unknown> {
   const quota = { ...existingQuota };
-  if (status === "active" || status === "trialing" || status === "past_due") {
+  if (plan && (status === "active" || status === "trialing" || status === "past_due")) {
     quota.weeklyDraftLimit = resolvePlanDraftLimit(env, plan);
   } else {
     quota.weeklyDraftLimit = null;
   }
   return quota;
+}
+
+function storedSubscriptionPlan(
+  existingSub: Record<string, unknown> | null,
+): SubscriptionPlan | null {
+  const plan = existingSub?.plan;
+  return isStoredSubscriptionPlan(plan) ? plan : null;
+}
+
+function storedSubscriptionPriceId(existingSub: Record<string, unknown> | null): string | null {
+  const priceId = existingSub?.priceId;
+  return typeof priceId === "string" && priceId !== "" ? priceId : null;
+}
+
+function isKnownPaidPlan(plan: SubscriptionPlan): plan is PaidPlan {
+  return plan === "starter" || plan === "pro" || plan === "unlimited";
+}
+
+function isStoredSubscriptionPlan(value: unknown): value is SubscriptionPlan {
+  return (
+    value === "trial" ||
+    value === "starter" ||
+    value === "pro" ||
+    value === "unlimited" ||
+    value === "team" ||
+    value === "none"
+  );
 }
 
 function supersededSubscriptionHistory(
