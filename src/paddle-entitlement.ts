@@ -101,6 +101,13 @@ interface StoredPendingOverageReversal {
   adjustmentType: string | null;
   hasAdjustmentItems?: boolean;
   items: PaddleOverageAdjustmentItemInput[];
+  quotaAppliedCreditKeys?: string[];
+}
+
+interface AppliedOverageAdjustment {
+  creditKey: string;
+  drafts: number;
+  currentWindow: boolean;
 }
 
 interface StoredOverageCreditTransaction {
@@ -265,6 +272,7 @@ export async function recordPaddleOverageInClerk(
       try {
         await savePendingOverageReversals(ledgerStore, pending);
         await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
+        await savePendingOverageReversals(ledgerStore, replayed.pendingAfterQuotaWrite);
       } catch (err) {
         if (isClerkNotFoundError(err)) return { mapped: false };
         throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase.");
@@ -329,6 +337,7 @@ export async function recordPaddleOverageInClerk(
   try {
     await savePendingOverageReversals(ledgerStore, pending);
     await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
+    await savePendingOverageReversals(ledgerStore, replayed.pendingAfterQuotaWrite);
   } catch (err) {
     if (isClerkNotFoundError(err)) return { mapped: false };
     throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase.");
@@ -391,6 +400,7 @@ export async function revokePaddleOverageInClerk(
   const creditTransactions = overageCreditTransactions(existingQuota);
   const wasPreviouslyApplied = adjustmentAlreadyAppliedToAnyCredit(credits, body);
   let applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
+  const currentAdjustmentApplications = applied.applications;
 
   if (applied.extraDrafts === 0 && wasPreviouslyApplied) {
     await saveOverageCredits(ledgerStore, credits);
@@ -450,8 +460,15 @@ export async function revokePaddleOverageInClerk(
     extraDrafts: applied.extraDrafts,
     currentWindowExtraDrafts: applied.currentWindowExtraDrafts,
     processed: applied.processed,
+    applications: applied.applications,
   };
   nextExtras = replayed.currentExtras ?? nextExtras;
+  const retainedCurrentPending = remainingPending.find(
+    (pending) => pending.adjustmentId === body.adjustmentId,
+  );
+  const currentPendingAfterQuotaWrite = retainedCurrentPending
+    ? pendingWithQuotaAppliedCreditKeys(retainedCurrentPending, currentAdjustmentApplications)
+    : null;
 
   const quota = {
     ...quotaWithoutOverageCredits(existingQuota),
@@ -470,6 +487,14 @@ export async function revokePaddleOverageInClerk(
       boundedPendingOverageReversals([...pending, ...remainingPending]),
     );
     await clerk.users.updateUserMetadata(userId, { privateMetadata: { quota } });
+    await savePendingOverageReversals(
+      ledgerStore,
+      boundedPendingOverageReversals([
+        ...pending,
+        ...replayed.pendingAfterQuotaWrite,
+        ...(currentPendingAfterQuotaWrite ? [currentPendingAfterQuotaWrite] : []),
+      ]),
+    );
   } catch (err) {
     if (isClerkNotFoundError(err)) return { mapped: false };
     throw new ApiError(502, "entitlement_write_failed", "Could not record the purchase reversal.");
@@ -620,18 +645,28 @@ function applyAdjustmentToCredits(
   extraDrafts: number;
   currentWindowExtraDrafts: number;
   processed: boolean;
+  applications: AppliedOverageAdjustment[];
 } {
   let extraDrafts = 0;
   let currentWindowExtraDrafts = 0;
   let processed = false;
+  const applications: AppliedOverageAdjustment[] = [];
   const adjustedCredits = credits.map((credit) => {
     const application = adjustmentApplicationForCredit(credit, adjustment);
     if (application.drafts <= 0 && application.adjustedAmount === undefined) return credit;
 
     processed = true;
     extraDrafts += application.drafts;
-    if (credit.windowStart === currentWindowStart) {
+    const currentWindow = credit.windowStart === currentWindowStart;
+    if (currentWindow) {
       currentWindowExtraDrafts += application.drafts;
+    }
+    if (application.drafts > 0) {
+      applications.push({
+        creditKey: overageCreditKey(credit),
+        drafts: application.drafts,
+        currentWindow,
+      });
     }
 
     return isRestoreAction(adjustment.action)
@@ -650,7 +685,13 @@ function applyAdjustmentToCredits(
           application.adjustedAmount,
         );
   });
-  return { credits: adjustedCredits, extraDrafts, currentWindowExtraDrafts, processed };
+  return {
+    credits: adjustedCredits,
+    extraDrafts,
+    currentWindowExtraDrafts,
+    processed,
+    applications,
+  };
 }
 
 function replayPendingAdjustments(
@@ -662,12 +703,16 @@ function replayPendingAdjustments(
 ): {
   credits: StoredOverageCredit[];
   remainingPending: StoredPendingOverageReversal[];
+  pendingAfterQuotaWrite: StoredPendingOverageReversal[];
   currentExtras: number | null;
 } {
   let nextCredits = credits;
   let nextCurrentExtras = currentExtras;
   const remaining = pending.filter((item) => item.transactionId !== transactionId);
   let candidates = pending.filter((item) => item.transactionId === transactionId);
+  const pendingAfterQuotaWrite = new Map(
+    remaining.map((item) => [item.adjustmentId, item] as const),
+  );
 
   let madeProgress = true;
   while (candidates.length > 0 && madeProgress) {
@@ -680,28 +725,61 @@ function replayPendingAdjustments(
           madeProgress = true;
           continue;
         }
+        pendingAfterQuotaWrite.set(candidate.adjustmentId, candidate);
         deferred.push(candidate);
         continue;
       }
 
       nextCredits = applied.credits;
+      const currentWindowApplications = unappliedCurrentWindowApplications(candidate, applied);
       if (nextCurrentExtras !== null) {
         nextCurrentExtras = applyCurrentWindowAdjustment(
           nextCurrentExtras,
           candidate.action,
-          applied.currentWindowExtraDrafts,
+          currentWindowApplications.reduce((sum, application) => sum + application.drafts, 0),
         );
       }
+      pendingAfterQuotaWrite.set(
+        candidate.adjustmentId,
+        pendingWithQuotaAppliedCreditKeys(candidate, currentWindowApplications),
+      );
       madeProgress = true;
     }
     candidates = deferred;
+  }
+  for (const candidate of candidates) {
+    pendingAfterQuotaWrite.set(candidate.adjustmentId, candidate);
   }
 
   return {
     credits: nextCredits,
     remainingPending: [...remaining, ...candidates],
+    pendingAfterQuotaWrite: boundedPendingOverageReversals([...pendingAfterQuotaWrite.values()]),
     currentExtras: nextCurrentExtras,
   };
+}
+
+function unappliedCurrentWindowApplications(
+  pending: StoredPendingOverageReversal,
+  applied: { applications: AppliedOverageAdjustment[] },
+): AppliedOverageAdjustment[] {
+  const alreadyApplied = new Set(pending.quotaAppliedCreditKeys ?? []);
+  return applied.applications.filter(
+    (application) => application.currentWindow && !alreadyApplied.has(application.creditKey),
+  );
+}
+
+function pendingWithQuotaAppliedCreditKeys(
+  pending: StoredPendingOverageReversal,
+  applications: AppliedOverageAdjustment[],
+): StoredPendingOverageReversal {
+  const keys = uniqueIdList([
+    ...(pending.quotaAppliedCreditKeys ?? []),
+    ...applications
+      .filter((application) => application.currentWindow)
+      .map((application) => application.creditKey),
+  ]);
+  return keys.length > 0 ? { ...pending, quotaAppliedCreditKeys: keys } : pending;
 }
 
 function adjustmentApplicationForCredit(
@@ -1465,7 +1543,10 @@ function isStoredPendingOverageReversal(value: unknown): value is StoredPendingO
       record.adjustmentType === undefined ||
       typeof record.adjustmentType === "string") &&
     (record.hasAdjustmentItems === undefined || typeof record.hasAdjustmentItems === "boolean") &&
-    Array.isArray(record.items)
+    Array.isArray(record.items) &&
+    (record.quotaAppliedCreditKeys === undefined ||
+      (Array.isArray(record.quotaAppliedCreditKeys) &&
+        record.quotaAppliedCreditKeys.every((key) => typeof key === "string" && key !== "")))
   );
 }
 

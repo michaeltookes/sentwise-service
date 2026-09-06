@@ -110,12 +110,9 @@ export async function recordPaddleSubscriptionInClerk(
   const isDifferentSubscription =
     !!existingSubscriptionId &&
     (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
-  if (isDifferentSubscription && isActiveStoredSubscription(existingSub)) {
-    return { stale: true };
-  }
   if (
     isDifferentSubscription &&
-    !(await isCurrentSubscriptionReplacement(body.event, userId, env))
+    !(await isCurrentSubscriptionReplacement(body.event, userId, env, existingSub))
   ) {
     return { stale: true };
   }
@@ -209,6 +206,7 @@ async function isCurrentSubscriptionReplacement(
   event: PaddleEvent,
   userId: string,
   env: Env,
+  existingSub: Record<string, unknown> | null,
 ): Promise<boolean> {
   if (!(await paddleCheckoutBindingMatchesEvent(event, userId, env))) return false;
 
@@ -220,11 +218,34 @@ async function isCurrentSubscriptionReplacement(
 
   const incomingCustomerId = customerIdFromEvent(event);
   if (incomingCustomerId && snapshot.customerId !== incomingCustomerId) return false;
-  return snapshot.status !== null && snapshot.status === paddleSubscriptionStatusFromEvent(event);
+  if (snapshot.status === null || snapshot.status !== paddleSubscriptionStatusFromEvent(event)) {
+    return false;
+  }
+
+  const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
+  if (
+    existingSubscriptionId &&
+    existingSubscriptionId !== incomingSubscriptionId &&
+    isActiveStoredSubscription(existingSub)
+  ) {
+    const existingSnapshot = await fetchPaddleSubscriptionSnapshot(env, existingSubscriptionId);
+    if (!existingSnapshot || isActivePaddleSubscriptionStatus(existingSnapshot.status)) {
+      return false;
+    }
+    if (incomingCustomerId && existingSnapshot.customerId !== incomingCustomerId) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function isActiveStoredSubscription(existingSub: Record<string, unknown> | null): boolean {
   const status = existingSub?.status;
+  return isActivePaddleSubscriptionStatus(status);
+}
+
+function isActivePaddleSubscriptionStatus(status: unknown): boolean {
   return status === "active" || status === "trialing" || status === "past_due";
 }
 

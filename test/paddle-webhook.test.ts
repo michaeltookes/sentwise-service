@@ -746,9 +746,26 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     });
   });
 
-  it("skips a terminal event from another subscription while the stored one is active", async () => {
+  it("skips a terminal event from another subscription while Paddle still reports the stored one active", async () => {
     const customData = await buildPaddleCheckoutCustomData("user_abc", env);
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/subscriptions/sub_current")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "canceled" } }), {
+            status: 200,
+          }),
+        );
+      }
+      if (url.includes("/subscriptions/sub_old")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "active" } }), {
+            status: 200,
+          }),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
     vi.stubGlobal("fetch", fetchMock);
     mocks.getUser.mockResolvedValue(
       userWith({
@@ -775,8 +792,77 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     );
 
     expect((await res.json()) as any).toEqual({ ok: true, stale: true });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_current",
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_old",
+      expect.any(Object),
+    );
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("allows a terminal replacement subscription event when the stored active subscription is no longer active in Paddle", async () => {
+    const customData = await buildPaddleCheckoutCustomData("user_abc", env);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL): Promise<Response> => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/subscriptions/sub_current")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "canceled" } }), {
+              status: 200,
+            }),
+          );
+        }
+        if (url.includes("/subscriptions/sub_old")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "canceled" } }), {
+              status: 200,
+            }),
+          );
+        }
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      }),
+    );
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "starter",
+          status: "active",
+          paddleSubscriptionId: "sub_old",
+          paddleCustomerId: "ctm_123",
+          lastEventId: "evt_old",
+          updatedAt: "2026-09-05T00:00:00.000Z",
+        },
+        quota: { weeklyDraftLimit: 30, weeklyTokenLimit: 500000 },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.canceled",
+        eventId: "evt_new_sub_canceled",
+        subscriptionId: "sub_current",
+        status: "canceled",
+        occurredAt: "2026-09-06T00:00:00.000Z",
+        customData,
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(lastWrite()?.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_current",
+      status: "canceled",
+      lastEventId: "evt_new_sub_canceled",
+      supersededPaddleSubscriptionIds: ["sub_old"],
+    });
+    expect(lastWrite()?.quota).toEqual({
+      weeklyDraftLimit: null,
+      weeklyTokenLimit: 500000,
+    });
   });
 
   it("serializes overlapping subscription writes before the ordering check", async () => {
@@ -1788,6 +1874,113 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
       },
     ]);
+  });
+
+  it("does not apply retained pending reversals twice while repairing a processed purchase", async () => {
+    const monday = mondayStartUtc(Date.now());
+    const creditKey = "evt_txn:txn_evt_txn:";
+    const pending = {
+      eventId: "evt_adj",
+      adjustmentId: "adj_123",
+      transactionId: "txn_evt_txn",
+      action: "refund" as const,
+      adjustmentType: null,
+      items: [],
+    };
+    const values = new Map<string, unknown>([
+      [
+        `${PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX}${encodeURIComponent("adj_123")}`,
+        pending,
+      ],
+    ]);
+    let failCreditWrite = true;
+    const ledgerStore: PaddleOverageLedgerStore = {
+      get: <T = unknown>(key: string) => Promise.resolve(values.get(key) as T | undefined),
+      put: (key, value) => {
+        if (key.startsWith(PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX) && failCreditWrite) {
+          failCreditWrite = false;
+          throw new Error("credit shard failed");
+        }
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      list: <T = unknown>(options?: { prefix?: string }) =>
+        Promise.resolve(
+          new Map(
+            [...values].filter(([key]) => !options?.prefix || key.startsWith(options.prefix)),
+          ) as Map<string, T>,
+        ),
+      delete: (keyOrKeys) => {
+        for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+          values.delete(key);
+        }
+        return Promise.resolve();
+      },
+    };
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123", status: "active", plan: "pro" },
+      quota: { extraDrafts: 100, extraDraftsWindowStart: monday },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    await expect(
+      recordPaddleOverageInClerk(
+        "user_abc",
+        {
+          now: monday + 60_000,
+          eventWindowStart: monday,
+          eventId: "evt_txn",
+          transactionId: "txn_evt_txn",
+          customerId: "ctm_123",
+          extraDrafts: 25,
+          credits: [{ transactionItemId: null, extraDrafts: 25, amount: null }],
+        },
+        env,
+        ledgerStore,
+      ),
+    ).rejects.toThrow("credit shard failed");
+
+    expect((storedMeta.quota as Record<string, unknown>).extraDrafts).toBe(100);
+    expect(values.get(`${PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX}adj_123`)).toEqual({
+      ...pending,
+      quotaAppliedCreditKeys: [creditKey],
+    });
+
+    const retry = await recordPaddleOverageInClerk(
+      "user_abc",
+      {
+        now: monday + 60_000,
+        eventWindowStart: monday,
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        customerId: "ctm_123",
+        extraDrafts: 25,
+        credits: [{ transactionItemId: null, extraDrafts: 25, amount: null }],
+      },
+      env,
+      ledgerStore,
+    );
+
+    expect(retry).toEqual({ idempotent: true });
+    expect((storedMeta.quota as Record<string, unknown>).extraDrafts).toBe(100);
+    expect(
+      await ledgerStore.list?.({ prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX }),
+    ).toEqual(new Map());
+    expect(
+      values.get(`${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}${encodeURIComponent(creditKey)}`),
+    ).toEqual({
+      eventId: "evt_txn",
+      transactionId: "txn_evt_txn",
+      extraDrafts: 25,
+      windowStart: monday,
+      reversedDrafts: 25,
+      reversedByAdjustmentId: "adj_123",
+      reversalAdjustmentIds: ["adj_123"],
+      reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
+    });
   });
 
   it("replays pending adjustments when repairing a processed overage purchase credit", async () => {
