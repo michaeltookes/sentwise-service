@@ -61,12 +61,19 @@ interface StoredOverageCredit {
   reversalAdjustmentIds?: string[];
   restoredByAdjustmentIds?: string[];
   reversedDraftsByAdjustment?: StoredOverageCreditReversal[];
+  adjustedAmountsByAdjustment?: StoredOverageCreditAdjustmentAmount[];
 }
 
 interface StoredOverageCreditReversal {
   adjustmentId: string;
   action: "refund" | "chargeback" | "credit";
   drafts: number;
+}
+
+interface StoredOverageCreditAdjustmentAmount {
+  adjustmentId: string;
+  action: "refund" | "chargeback" | "credit";
+  amount: number;
 }
 
 interface StoredPendingOverageReversal {
@@ -270,7 +277,7 @@ export async function revokePaddleOverageInClerk(
         : null;
     const credits = await loadOverageCredits(existingQuota, ledgerStore);
     const applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
-    if (applied.extraDrafts > 0) {
+    if (applied.processed) {
       await saveOverageCredits(ledgerStore, applied.credits);
     }
     return { idempotent: true };
@@ -294,7 +301,7 @@ export async function revokePaddleOverageInClerk(
     return { idempotent: true };
   }
 
-  if (applied.extraDrafts === 0) {
+  if (applied.extraDrafts === 0 && !applied.processed) {
     await saveOverageCredits(ledgerStore, credits);
     const quota = {
       ...quotaWithoutOverageCredits(existingQuota),
@@ -337,6 +344,7 @@ export async function revokePaddleOverageInClerk(
     credits: replayed.credits,
     extraDrafts: applied.extraDrafts,
     currentWindowExtraDrafts: applied.currentWindowExtraDrafts,
+    processed: applied.processed,
   };
   nextExtras = replayed.currentExtras ?? nextExtras;
 
@@ -455,23 +463,32 @@ function applyAdjustmentToCredits(
   credits: StoredOverageCredit[];
   extraDrafts: number;
   currentWindowExtraDrafts: number;
+  processed: boolean;
 } {
   let extraDrafts = 0;
   let currentWindowExtraDrafts = 0;
+  let processed = false;
   const adjustedCredits = credits.map((credit) => {
-    const amount = adjustmentDraftsForCredit(credit, adjustment);
-    if (amount <= 0) return credit;
+    const application = adjustmentApplicationForCredit(credit, adjustment);
+    if (application.drafts <= 0 && application.adjustedAmount === undefined) return credit;
 
-    extraDrafts += amount;
+    processed = true;
+    extraDrafts += application.drafts;
     if (credit.windowStart === currentWindowStart) {
-      currentWindowExtraDrafts += amount;
+      currentWindowExtraDrafts += application.drafts;
     }
 
     return isRestoreAction(adjustment.action)
-      ? restoreCredit(credit, amount, adjustment.action, adjustment.adjustmentId)
-      : reverseCredit(credit, amount, adjustment.action, adjustment.adjustmentId);
+      ? restoreCredit(credit, application.drafts, adjustment.action, adjustment.adjustmentId)
+      : reverseCredit(
+          credit,
+          application.drafts,
+          adjustment.action,
+          adjustment.adjustmentId,
+          application.adjustedAmount,
+        );
   });
-  return { credits: adjustedCredits, extraDrafts, currentWindowExtraDrafts };
+  return { credits: adjustedCredits, extraDrafts, currentWindowExtraDrafts, processed };
 }
 
 function replayPendingAdjustments(
@@ -496,7 +513,7 @@ function replayPendingAdjustments(
     const deferred: StoredPendingOverageReversal[] = [];
     for (const candidate of candidates) {
       const applied = applyAdjustmentToCredits(nextCredits, candidate, currentWindowStart);
-      if (applied.extraDrafts <= 0) {
+      if (applied.extraDrafts <= 0 && !applied.processed) {
         deferred.push(candidate);
         continue;
       }
@@ -521,30 +538,40 @@ function replayPendingAdjustments(
   };
 }
 
-function adjustmentDraftsForCredit(
+function adjustmentApplicationForCredit(
   credit: StoredOverageCredit,
   adjustment: StoredPendingOverageReversal | PaddleOverageReversalBody,
-): number {
-  if (credit.transactionId !== adjustment.transactionId) return 0;
-  if (creditAlreadyAppliedAdjustment(credit, adjustment)) return 0;
+): { drafts: number; adjustedAmount?: number } {
+  if (credit.transactionId !== adjustment.transactionId) return { drafts: 0 };
+  if (creditAlreadyAppliedAdjustment(credit, adjustment)) return { drafts: 0 };
 
   const available = isRestoreAction(adjustment.action)
     ? restorableDrafts(credit, adjustment.action)
     : availableDrafts(credit);
-  if (available <= 0) return 0;
-  if (coversFullTransaction(adjustment)) return available;
+  if (available <= 0) return { drafts: 0 };
+  if (coversFullTransaction(adjustment)) return { drafts: available };
 
   const item = adjustment.items.find(
     (candidate) =>
       !!credit.transactionItemId && candidate.transactionItemId === credit.transactionItemId,
   );
-  if (!item) return 0;
-  if (item.type === "full") return available;
+  if (!item) return { drafts: 0 };
+  if (item.type === "full") return { drafts: available };
   if (item.amount !== null && credit.amount && credit.amount > 0) {
-    const prorated = Math.ceil((credit.extraDrafts * item.amount) / credit.amount);
-    return Math.min(available, Math.max(1, prorated));
+    const previousAdjustedAmount = adjustedAmountForAction(credit, adjustment.action);
+    const cumulativeAdjustedAmount = Math.min(credit.amount, previousAdjustedAmount + item.amount);
+    const cumulativeDrafts = proratedDrafts(
+      credit.extraDrafts,
+      cumulativeAdjustedAmount,
+      credit.amount,
+    );
+    const previouslyReversedDrafts = reversedDraftsForAction(credit, adjustment.action);
+    return {
+      drafts: Math.min(available, Math.max(0, cumulativeDrafts - previouslyReversedDrafts)),
+      adjustedAmount: item.amount,
+    };
   }
-  return available;
+  return { drafts: available };
 }
 
 function adjustmentAlreadyAppliedToAnyCredit(
@@ -568,7 +595,8 @@ function creditAlreadyAppliedAdjustment(
   return (
     credit.reversedByAdjustmentId === adjustment.adjustmentId ||
     (credit.reversalAdjustmentIds ?? []).includes(adjustment.adjustmentId) ||
-    reversedDraftEntries(credit).some((entry) => entry.adjustmentId === adjustment.adjustmentId)
+    reversedDraftEntries(credit).some((entry) => entry.adjustmentId === adjustment.adjustmentId) ||
+    adjustedAmountEntries(credit).some((entry) => entry.adjustmentId === adjustment.adjustmentId)
   );
 }
 
@@ -577,6 +605,7 @@ function reverseCredit(
   amount: number,
   action: OverageAdjustmentAction,
   adjustmentId: string,
+  adjustedAmount?: number,
 ): StoredOverageCredit {
   const previousReversed = reversedDrafts(credit);
   const nextReversed = Math.min(credit.extraDrafts, previousReversed + amount);
@@ -592,6 +621,12 @@ function reverseCredit(
       adjustmentId,
       action,
       appliedDrafts,
+    ),
+    adjustedAmountsByAdjustment: addAdjustedAmountEntry(
+      adjustedAmountEntries(credit),
+      adjustmentId,
+      action,
+      adjustedAmount,
     ),
   });
 }
@@ -635,6 +670,12 @@ function cleanCredit(credit: StoredOverageCredit): StoredOverageCredit {
   }
   if (!out.reversalAdjustmentIds?.length) delete out.reversalAdjustmentIds;
   if (!out.restoredByAdjustmentIds?.length) delete out.restoredByAdjustmentIds;
+  const adjustedAmounts = adjustedAmountEntries(out);
+  if (adjustedAmounts.length > 0) {
+    out.adjustedAmountsByAdjustment = adjustedAmounts;
+  } else {
+    delete out.adjustedAmountsByAdjustment;
+  }
   return out;
 }
 
@@ -661,6 +702,34 @@ function restorableDrafts(credit: StoredOverageCredit, action: OverageAdjustment
   return Math.min(reversedDrafts(credit), drafts);
 }
 
+function proratedDrafts(extraDrafts: number, adjustedAmount: number, totalAmount: number): number {
+  if (adjustedAmount <= 0 || totalAmount <= 0) return 0;
+  const prorated = Math.ceil((extraDrafts * adjustedAmount) / totalAmount);
+  return Math.min(extraDrafts, Math.max(1, prorated));
+}
+
+function reversedDraftsForAction(
+  credit: StoredOverageCredit,
+  action: OverageAdjustmentAction,
+): number {
+  if (!isStoredReversalAction(action)) return 0;
+  return reversedDraftEntries(credit).reduce(
+    (sum, entry) => sum + (entry.action === action ? entry.drafts : 0),
+    0,
+  );
+}
+
+function adjustedAmountForAction(
+  credit: StoredOverageCredit,
+  action: OverageAdjustmentAction,
+): number {
+  if (!isStoredReversalAction(action)) return 0;
+  return adjustedAmountEntries(credit).reduce(
+    (sum, entry) => sum + (entry.action === action ? entry.amount : 0),
+    0,
+  );
+}
+
 function restoredReversalAction(
   action: OverageAdjustmentAction,
 ): StoredOverageCreditReversal["action"] | null {
@@ -682,6 +751,23 @@ function addReversalEntry(
     existing.drafts += drafts;
   } else {
     next.push({ adjustmentId, action, drafts });
+  }
+  return next;
+}
+
+function addAdjustedAmountEntry(
+  entries: StoredOverageCreditAdjustmentAmount[],
+  adjustmentId: string,
+  action: OverageAdjustmentAction,
+  amount: number | undefined,
+): StoredOverageCreditAdjustmentAmount[] {
+  if (!amount || amount <= 0 || !isStoredReversalAction(action)) return entries;
+  const next = [...entries];
+  const existing = next.find((entry) => entry.adjustmentId === adjustmentId);
+  if (existing) {
+    existing.amount = amount;
+  } else {
+    next.push({ adjustmentId, action, amount });
   }
   return next;
 }
@@ -749,6 +835,21 @@ function reversedDraftEntries(credit: StoredOverageCredit): StoredOverageCreditR
     const drafts = positiveInt(record.drafts);
     if (!adjustmentId || !action || !drafts) return [];
     return [{ adjustmentId, action, drafts }];
+  });
+}
+
+function adjustedAmountEntries(credit: StoredOverageCredit): StoredOverageCreditAdjustmentAmount[] {
+  const entries = Array.isArray(credit.adjustedAmountsByAdjustment)
+    ? credit.adjustedAmountsByAdjustment
+    : [];
+  return entries.flatMap((entry): StoredOverageCreditAdjustmentAmount[] => {
+    const record = asRecord(entry);
+    if (!record) return [];
+    const adjustmentId = nullableId(record.adjustmentId);
+    const action = isStoredReversalAction(record.action) ? record.action : null;
+    const amount = positiveInt(record.amount);
+    if (!adjustmentId || !action || !amount) return [];
+    return [{ adjustmentId, action, amount }];
   });
 }
 

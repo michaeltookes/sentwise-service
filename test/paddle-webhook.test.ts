@@ -268,6 +268,7 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     const res = await signedReq(subBody({ eventType: "subscription.paused", status: "paused" }));
     expect(res.status).toBe(200);
     expect(lastWrite()?.subscription).toMatchObject({ status: "canceled", plan: "pro" });
+    expect(lastWrite()?.quota.weeklyDraftLimit).toBeNull();
   });
 
   it("records resumed subscriptions as active", async () => {
@@ -286,7 +287,11 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     await signedReq(subBody({ eventType: "subscription.canceled", status: "canceled" }));
     const write = lastWrite();
     expect(write?.subscription).toMatchObject({ status: "canceled", plan: "pro" });
-    expect(write?.quota).toEqual({ weeklyTokenLimit: 500000, extraDrafts: 7 });
+    expect(write?.quota).toEqual({
+      weeklyDraftLimit: null,
+      weeklyTokenLimit: 500000,
+      extraDrafts: 7,
+    });
   });
 
   it("ignores an unknown price id (200, no write)", async () => {
@@ -1316,6 +1321,88 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         reversedDrafts: 10,
         reversalAdjustmentIds: ["adj_123"],
         reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 10 }],
+        adjustedAmountsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", amount: 1000 }],
+      },
+    ]);
+  });
+
+  it("prorates cumulative partial adjustments before rounding", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+      quota: {
+        extraDrafts: 10,
+        extraDraftsWindowStart: monday,
+        overageCredits: [
+          {
+            eventId: "evt_txn",
+            transactionId: "txn_evt_txn",
+            transactionItemId: "txnitm_1",
+            extraDrafts: 10,
+            amount: 5000,
+            windowStart: monday,
+          },
+        ],
+      },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...update.privateMetadata };
+    });
+
+    for (let i = 0; i < 5; i++) {
+      const res = await signedReq(
+        adjustmentBody(
+          {
+            id: `adj_small_${i}`,
+            type: "partial",
+            items: [{ item_id: "txnitm_1", type: "partial", amount: "100" }],
+          },
+          `evt_adj_small_${i}`,
+        ),
+      );
+
+      expect((await res.json()) as any).toEqual({
+        ok: true,
+        revoked: true,
+        extraDrafts: i === 0 ? 1 : 0,
+      });
+    }
+
+    const quota = storedMeta.quota as Record<string, unknown>;
+    expect(quota.extraDrafts).toBe(9);
+    expect(quota.processedOverageAdjustmentIds).toEqual([
+      "adj_small_0",
+      "adj_small_1",
+      "adj_small_2",
+      "adj_small_3",
+      "adj_small_4",
+    ]);
+    expect(quota.pendingOverageReversals).toEqual([]);
+    expect(await storedPaddleOverageCredits()).toEqual([
+      {
+        eventId: "evt_txn",
+        transactionId: "txn_evt_txn",
+        transactionItemId: "txnitm_1",
+        extraDrafts: 10,
+        amount: 5000,
+        windowStart: monday,
+        reversedDrafts: 1,
+        reversalAdjustmentIds: [
+          "adj_small_0",
+          "adj_small_1",
+          "adj_small_2",
+          "adj_small_3",
+          "adj_small_4",
+        ],
+        reversedDraftsByAdjustment: [{ adjustmentId: "adj_small_0", action: "refund", drafts: 1 }],
+        adjustedAmountsByAdjustment: [
+          { adjustmentId: "adj_small_0", action: "refund", amount: 100 },
+          { adjustmentId: "adj_small_1", action: "refund", amount: 100 },
+          { adjustmentId: "adj_small_2", action: "refund", amount: 100 },
+          { adjustmentId: "adj_small_3", action: "refund", amount: 100 },
+          { adjustmentId: "adj_small_4", action: "refund", amount: 100 },
+        ],
       },
     ]);
   });

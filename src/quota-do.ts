@@ -20,8 +20,8 @@
 //   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
 //   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts, credits } -> serialize Paddle overage entitlement writes
 //   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, hasAdjustmentItems, items } -> revoke/restore overage credit
-//   POST /paddle-subscription-checkout-reserve { now } -> reserve one pending subscription checkout
-//   POST /paddle-subscription-checkout-release {} -> release a pending subscription checkout after failed creation
+//   POST /paddle-subscription-checkout-reserve { now, reservationId } -> reserve one pending subscription checkout
+//   POST /paddle-subscription-checkout-release { reservationId } -> release a matching pending subscription checkout after failed creation
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
 //   POST /defer-release { now, reservationId, reservationWindowStart, estimatedTokens }
@@ -113,6 +113,7 @@ interface AccountDeletionMarker {
   attempts?: AccountDeletionAttempt[];
 }
 interface PaddleSubscriptionCheckoutReservation {
+  reservationId: string;
   createdAt: number;
   expiresAt: number;
 }
@@ -205,7 +206,7 @@ export class AccountQuota {
       case "/paddle-subscription-checkout-reserve":
         return this.handlePaddleSubscriptionCheckoutReserve(await request.json<unknown>());
       case "/paddle-subscription-checkout-release":
-        return this.handlePaddleSubscriptionCheckoutRelease();
+        return this.handlePaddleSubscriptionCheckoutRelease(await request.json<unknown>());
       default:
         return new Response("not found", { status: 404 });
     }
@@ -493,7 +494,9 @@ export class AccountQuota {
       const result = await this.enqueuePrivateMetadataWrite(() =>
         recordPaddleSubscriptionInClerk(userId, parsed, this.env),
       );
-      await this.clearPaddleSubscriptionCheckoutReservation();
+      if ("applied" in result) {
+        await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
+      }
       return Response.json(result);
     } catch (err) {
       if (err instanceof ApiError) return err.toResponse();
@@ -532,6 +535,13 @@ export class AccountQuota {
   private async handlePaddleSubscriptionCheckoutReserve(body: unknown): Promise<Response> {
     const record = asRecord(body);
     const now = normalizedNow(typeof record?.now === "number" ? record.now : undefined);
+    const reservationId = normalizedId(
+      typeof record?.reservationId === "string" ? record.reservationId : undefined,
+    );
+    if (!reservationId) {
+      return jsonError(400, "invalid_request", "A checkout reservation id is required.");
+    }
+
     return this.storage.transaction(async (txn) => {
       const deletion = await this.loadAccountDeletionMarkerFrom(txn);
       if (deletion) return accountDeletionResponse(deletion);
@@ -544,20 +554,48 @@ export class AccountQuota {
       }
 
       await txn.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, {
+        reservationId,
         createdAt: now,
         expiresAt: now + PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_TTL_MS,
       });
-      return Response.json({ reserved: true });
+      return Response.json({ reserved: true, reservationId });
     });
   }
 
-  private async handlePaddleSubscriptionCheckoutRelease(): Promise<Response> {
-    await this.clearPaddleSubscriptionCheckoutReservation();
+  private async handlePaddleSubscriptionCheckoutRelease(body: unknown): Promise<Response> {
+    const record = asRecord(body);
+    const reservationId = normalizedId(
+      typeof record?.reservationId === "string" ? record.reservationId : undefined,
+    );
+    if (!reservationId) {
+      return jsonError(400, "invalid_request", "A checkout reservation id is required.");
+    }
+
+    await this.clearPaddleSubscriptionCheckoutReservation(reservationId);
     return Response.json({ released: true });
   }
 
-  private async clearPaddleSubscriptionCheckoutReservation(): Promise<void> {
-    await this.storage.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
+  private async clearPaddleSubscriptionCheckoutReservationForEvent(event: {
+    data: Record<string, unknown>;
+  }): Promise<void> {
+    const customData = asRecord(event.data.custom_data);
+    const reservationId = normalizedId(
+      typeof customData?.sentwiseCheckoutReservationId === "string"
+        ? customData.sentwiseCheckoutReservationId
+        : undefined,
+    );
+    if (!reservationId) return;
+    await this.clearPaddleSubscriptionCheckoutReservation(reservationId);
+  }
+
+  private async clearPaddleSubscriptionCheckoutReservation(reservationId: string): Promise<void> {
+    await this.storage.transaction(async (txn) => {
+      const reservation = parsePaddleSubscriptionCheckoutReservation(
+        await txn.get<unknown>(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY),
+      );
+      if (reservation?.reservationId !== reservationId) return;
+      await txn.delete(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY);
+    });
   }
 
   private enqueuePrivateMetadataWrite<T>(operation: () => Promise<T>): Promise<T> {
@@ -994,10 +1032,7 @@ function isAccountDeletionMarker(v: unknown): v is AccountDeletionMarker {
   );
 }
 
-function isActivePaddleSubscriptionCheckoutReservation(
-  v: unknown,
-  now: number,
-): v is PaddleSubscriptionCheckoutReservation {
+function isActivePaddleSubscriptionCheckoutReservation(v: unknown, now: number): boolean {
   const reservation = asRecord(v);
   return (
     !!reservation &&
@@ -1005,6 +1040,29 @@ function isActivePaddleSubscriptionCheckoutReservation(
     Number.isFinite(reservation.expiresAt) &&
     reservation.expiresAt > now
   );
+}
+
+function parsePaddleSubscriptionCheckoutReservation(
+  v: unknown,
+): PaddleSubscriptionCheckoutReservation | null {
+  const reservation = asRecord(v);
+  const reservationId = normalizedId(
+    typeof reservation?.reservationId === "string" ? reservation.reservationId : undefined,
+  );
+  if (
+    !reservationId ||
+    typeof reservation?.createdAt !== "number" ||
+    !Number.isFinite(reservation.createdAt) ||
+    typeof reservation.expiresAt !== "number" ||
+    !Number.isFinite(reservation.expiresAt)
+  ) {
+    return null;
+  }
+  return {
+    reservationId,
+    createdAt: reservation.createdAt,
+    expiresAt: reservation.expiresAt,
+  };
 }
 
 function activeDeletionAttempts(marker: AccountDeletionMarker): AccountDeletionAttempt[] {

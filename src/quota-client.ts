@@ -67,7 +67,8 @@ export type PaddleSubscriptionResult =
   | { stale: true }
   | { ignored: "unknown_price" }
   | { mapped: false };
-export type PaddleSubscriptionCheckoutReservationResult = { reserved: true } | { pending: true };
+export type PaddleSubscriptionCheckoutReservationResult =
+  { reserved: true; reservationId: string } | { pending: true };
 export type PaddleSubscriptionCheckoutReleaseResult = { released: true };
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
@@ -233,7 +234,7 @@ export function quotaRecordPaddleSubscription(
 export function quotaReservePaddleSubscriptionCheckout(
   env: Env,
   userId: string,
-  body: { now: number },
+  body: { now: number; reservationId: string },
 ): Promise<PaddleSubscriptionCheckoutReservationResult> {
   return call<PaddleSubscriptionCheckoutReservationResult>(
     env,
@@ -247,12 +248,13 @@ export function quotaReservePaddleSubscriptionCheckout(
 export function quotaReleasePaddleSubscriptionCheckout(
   env: Env,
   userId: string,
+  reservationId: string,
 ): Promise<PaddleSubscriptionCheckoutReleaseResult> {
   return call<PaddleSubscriptionCheckoutReleaseResult>(
     env,
     userId,
     "/paddle-subscription-checkout-release",
-    {},
+    { reservationId },
   );
 }
 

@@ -27,11 +27,15 @@ export function paddleCustomerMatchesStoredAccount(
 export async function buildPaddleCheckoutCustomData(
   userId: string,
   env: Env,
+  checkoutReservationId?: string,
 ): Promise<Record<string, string>> {
-  return {
+  const customData = {
     clerkUserId: userId,
     sentwiseCheckoutBinding: await paddleCheckoutBindingToken(userId, env),
   };
+  return checkoutReservationId
+    ? { ...customData, sentwiseCheckoutReservationId: checkoutReservationId }
+    : customData;
 }
 
 export async function paddleCheckoutBindingMatchesEvent(

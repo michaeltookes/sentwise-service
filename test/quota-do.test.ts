@@ -36,6 +36,7 @@ vi.mock("../src/auth", () => ({
 
 const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
 const OLD_BOUNDED_ARRAY_SIZE = 128;
+const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
 
 interface CheckResult {
   allowed: boolean;
@@ -45,6 +46,7 @@ interface CheckResult {
 interface WindowResult {
   window: WindowState;
 }
+type CheckoutReservationResult = { reserved: true; reservationId: string } | { pending: true };
 interface ReserveResult {
   reserved: boolean;
   blockedByQuota: boolean;
@@ -515,6 +517,104 @@ describe("AccountQuota Durable Object", () => {
     expect(await overage).toEqual({ applied: true, extraDrafts: 1 });
     expect(await finish).toEqual({ deleted: true, cleanupPending: false });
     expect([...values.keys()].sort()).toEqual([ACCOUNT_DELETION_KEY]);
+  });
+
+  it("only clears checkout reservations for matching applied subscription events", async () => {
+    const uid = "checkout-reservation-correlated-webhook";
+    await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {
+      now: MON,
+      reservationId: "checkout-current",
+    });
+
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          supersededPaddleSubscriptionIds: ["sub_old"],
+          lastEventId: "evt_current",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+        },
+        quota: {},
+      },
+    });
+    const stale = await callDO<{ stale: true }>(uid, "/paddle-subscription", {
+      now: MON + 1,
+      event: {
+        eventId: "evt_old_retry",
+        eventType: "subscription.activated",
+        occurredAt: "2024-01-01T00:00:01.000Z",
+        data: {
+          id: "sub_old",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: {
+            clerkUserId: uid,
+            sentwiseCheckoutReservationId: "checkout-old",
+          },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    expect(stale).toEqual({ stale: true });
+
+    const stillPending = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 2,
+        reservationId: "checkout-next",
+      },
+    );
+    expect(stillPending).toEqual({ pending: true });
+
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleCustomerId: "ctm_123",
+          paddleSubscriptionId: "sub_current",
+          lastEventId: "evt_current",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+        },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockResolvedValue(undefined);
+    const applied = await callDO<{ applied: true }>(uid, "/paddle-subscription", {
+      now: MON + 3,
+      event: {
+        eventId: "evt_checkout",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:03.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: {
+            clerkUserId: uid,
+            sentwiseCheckoutReservationId: "checkout-current",
+          },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    expect(applied).toEqual({ applied: true });
+
+    const next = await callDO<CheckoutReservationResult>(
+      uid,
+      "/paddle-subscription-checkout-reserve",
+      {
+        now: MON + 4,
+        reservationId: "checkout-next",
+      },
+    );
+    expect(next).toEqual({ reserved: true, reservationId: "checkout-next" });
   });
 
   it("persists the deletion tombstone before scheduling cleanup retry", async () => {

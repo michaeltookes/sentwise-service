@@ -218,7 +218,7 @@ function quotaForSubscriptionStatus(
   if (status === "active" || status === "trialing" || status === "past_due") {
     quota.weeklyDraftLimit = resolvePlanDraftLimit(env, plan);
   } else {
-    delete quota.weeklyDraftLimit;
+    quota.weeklyDraftLimit = null;
   }
   return quota;
 }

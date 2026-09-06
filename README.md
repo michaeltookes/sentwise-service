@@ -287,8 +287,9 @@ capacity is reclaimed before the weekly reset.
 `{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart?, processedOverageEventIds? }`
 — overrides the vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart`
 equals the current weekly window's Monday 00:00 UTC epoch-ms `windowStart`; stale or unscoped credits
-are ignored. These are read on the same `getUser` as the trial, so metering adds no extra Clerk
-round-trip.
+are ignored. `weeklyDraftLimit: null` is treated as absent and is used by the Paddle webhook to clear
+Clerk's deep-merged paid override. These are read on the same `getUser` as the trial, so metering
+adds no extra Clerk round-trip.
 
 **Privacy.** The Durable Object stores only integers and timestamps; it never sees prompt or draft
 content. See the [Privacy design](#privacy-design--content-stateless-by-construction) section.
@@ -351,7 +352,8 @@ quantities must be positive integers, and overage quantities are capped. Subscri
 rejected while the account already has an active/trialing/past-due Paddle subscription, so tier
 changes must go through Paddle subscription management instead of creating a second recurring
 subscription. Subscription checkout creation is also serialized per account with a short-lived
-Durable Object reservation; a second request is rejected while a checkout transaction is pending.
+Durable Object reservation id included in Paddle `custom_data`; a second request is rejected while a
+checkout transaction is pending, and only the matching applied subscription webhook clears the lock.
 Overage checkout requires an active Paddle subscription with a stored
 `paddleCustomerId`; the Worker passes that `customer_id` to Paddle so the later webhook credits the
 same bound customer.
@@ -381,11 +383,11 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 
 **Events handled** (others are acknowledged `200` and ignored):
 
-| Event                                                                                                   | Write                                                                                                                                                                                                          |
-| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids). Active/trialing/past-due statuses set `privateMetadata.quota.weeklyDraftLimit`; canceled/paused statuses remove that paid override |
-| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`                                                   |
-| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion                                                         |
+| Event                                                                                                   | Write                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids). Active/trialing/past-due statuses set `privateMetadata.quota.weeklyDraftLimit`; canceled/paused statuses write `weeklyDraftLimit: null` to clear Clerk's deep-merged paid override |
+| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`                                                                                                   |
+| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion                                                                                                         |
 
 **Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
 is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or
@@ -422,7 +424,8 @@ URL.
 `EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
 the Paddle transaction id and, when Paddle provides it, the transaction item id and item total.
 Approved Paddle refund/chargeback/credit adjustments mark matching credits as reversed and subtract
-any still-current weekly extras; partial adjustments are prorated by adjusted amount. Approved
+any still-current weekly extras; partial adjustments are prorated from the cumulative adjusted amount
+before calculating each incremental draft change. Approved
 chargeback/credit reversals restore only drafts revoked by the corresponding chargeback/credit
 action. Tax/proration-only adjustment items are ignored rather than treated as whole-overage
 reversals. If an approved reversal or restore arrives before the matching prerequisite event, it is

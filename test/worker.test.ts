@@ -852,6 +852,9 @@ describe("POST /v1/paddle/checkout", () => {
     expect(body.customer_id).toBeUndefined();
     expect(body.custom_data).toMatchObject({ clerkUserId: "user_123" });
     expect(body.custom_data.sentwiseCheckoutBinding).toMatch(/^v1:[0-9a-f]{64}$/);
+    expect(body.custom_data.sentwiseCheckoutReservationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
   });
 
   it("rejects a concurrent subscription checkout while one is pending", async () => {
@@ -1046,6 +1049,7 @@ describe("POST /v1/paddle/checkout", () => {
       items: [{ price_id: OVERAGE_PRICE, quantity: 3 }],
       checkout: { url: null },
     });
+    expect(body.custom_data.sentwiseCheckoutReservationId).toBeUndefined();
   });
 
   it("rejects explicitly invalid checkout quantities", async () => {

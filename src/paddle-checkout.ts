@@ -50,10 +50,11 @@ export async function handlePaddleCheckout(
     );
   }
 
-  const reserved = body.kind === "subscription";
-  if (reserved) {
+  const checkoutReservationId = body.kind === "subscription" ? crypto.randomUUID() : null;
+  if (checkoutReservationId) {
     const reservation = await quotaReservePaddleSubscriptionCheckout(env, userId, {
       now: Date.now(),
+      reservationId: checkoutReservationId,
     });
     if ("pending" in reservation) {
       throw new ApiError(
@@ -69,12 +70,18 @@ export async function handlePaddleCheckout(
     transaction = await createPaddleCheckoutTransaction(env, {
       priceId: body.priceId,
       quantity: body.quantity,
-      customData: await buildPaddleCheckoutCustomData(userId, env),
+      customData: await buildPaddleCheckoutCustomData(
+        userId,
+        env,
+        checkoutReservationId ?? undefined,
+      ),
       customerId,
     });
   } catch (err) {
-    if (reserved) {
-      await quotaReleasePaddleSubscriptionCheckout(env, userId).catch(() => undefined);
+    if (checkoutReservationId) {
+      await quotaReleasePaddleSubscriptionCheckout(env, userId, checkoutReservationId).catch(
+        () => undefined,
+      );
     }
     throw err;
   }
