@@ -3,8 +3,9 @@
 The managed-inference service for **[Sentwise](https://github.com/michaeltookes/sentwise)** — a
 stateless [Cloudflare Worker](https://workers.cloudflare.com/) that lets a signed-in Sentwise user
 draft email through the model provider **without ever holding an API key**. It is the server half of
-backlog items **56a** (account + proxy), **56b** (metering + limits), and the account-management
-half of **73** (subscription display + account deletion).
+backlog items **56a** (account + proxy), **56b** (metering + limits), **56c** (checkout + licensing —
+the Paddle webhook + entitlement writes), and the account-management half of **73** (subscription
+display + account deletion).
 
 **Deployed:** `https://sentwise-inference.sentwise-service.workers.dev`
 
@@ -24,7 +25,9 @@ reply to) to this Worker with a short-lived Clerk session token. The Worker:
 4. Returns the drafted text and token usage.
 
 Metering, weekly caps, and rate-limiting ship in **56b** (see [Metering](#metering-56b) below).
-Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)` in the source.
+Checkout / licensing (**56c**) is handled by the Paddle webhook that writes the account's entitlement
+(see [Checkout & licensing](#checkout--licensing-56c)); an active paid subscription grants drafting
+access past the 14-day trial.
 
 ## Privacy design — content-stateless by construction
 
@@ -37,8 +40,8 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
   `console.*` call appears in `src/`.
 - **The only persisted state is counters, timestamps, random reservation IDs, and one hash — never
   content:**
-  1. `trialStartedAt` (and, once 56c ships, `subscription`) in the user's Clerk `privateMetadata`
-     (trial enforcement, 56a; subscription display, 73).
+  1. `trialStartedAt` and `subscription` in the user's Clerk `privateMetadata` (trial enforcement,
+     56a; subscription/licensing written by the Paddle webhook, 56c; subscription display, 73).
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
      weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
      reservation IDs keyed by Clerk userId. No prompts, no drafts, no emails.
@@ -65,13 +68,15 @@ Checkout / licensing (**56c**) is still out of scope and marked with `TODO(56c)`
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, /admin/margin
-  -> src/auth.ts          verify Clerk JWT, check/init the trial + read quota/subscription; delete user
-  -> src/subscription.ts  derive the account's subscription (trial placeholder until 56c) — pure
-  -> src/anthropic.ts     forward to Anthropic, map the response — no logging, no storage
-  -> src/quota-do.ts      per-account usage counters (Durable Object) — counters only; deletion tombstone
-  -> src/analytics.ts     one aggregate hashed metric per draft — no content
-  -> src/interest.ts      record demand for a parked capability — a topic key + timestamp, no content
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/webhook, /admin/margin
+  -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
+  -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
+  -> src/anthropic.ts       forward to Anthropic, map the response — no logging, no storage
+  -> src/quota-do.ts        per-account usage counters (Durable Object) — counters only; deletion tombstone
+  -> src/analytics.ts       one aggregate hashed metric per draft — no content
+  -> src/interest.ts        record demand for a parked capability — a topic key + timestamp, no content
+  -> src/paddle.ts          verify Paddle signature + map billing event -> entitlement (56c) — pure
+  -> src/paddle-webhook.ts  write the entitlement into Clerk privateMetadata (56c) — no body logging
 ```
 
 ## API
