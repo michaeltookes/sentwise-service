@@ -108,11 +108,7 @@ export default {
         const { userId } = await authenticate(request, env);
         const account = await resolveAccountIfExists(userId, env, { initialize: false });
         if (account && hasPaidAccess(account.subscription)) {
-          throw new ApiError(
-            409,
-            "billing_subscription_active",
-            "Cancel your Paddle subscription before deleting your account.",
-          );
+          throw activeSubscriptionDeletionError();
         }
         if (account && (await hasOpenPaddleSubscriptionCheckout(userId, env))) {
           throw new ApiError(
@@ -123,6 +119,17 @@ export default {
         }
         const deletionAttemptId = crypto.randomUUID();
         await quotaBeginAccountDeletion(env, userId, deletionAttemptId);
+        if (account) {
+          try {
+            const latestAccount = await resolveAccountIfExists(userId, env, { initialize: false });
+            if (latestAccount && hasPaidAccess(latestAccount.subscription)) {
+              throw activeSubscriptionDeletionError();
+            }
+          } catch (err) {
+            await cancelAccountDeletionBarrier(env, userId, deletionAttemptId, ctx);
+            throw err;
+          }
+        }
         try {
           await deleteClerkUser(userId, env);
         } catch (err) {
@@ -479,4 +486,12 @@ function isAccountDeletionError(err: unknown): err is ApiError {
 
 function isAccountDeletionInProgressError(err: unknown): err is ApiError {
   return err instanceof ApiError && err.type === "account_deletion_in_progress";
+}
+
+function activeSubscriptionDeletionError(): ApiError {
+  return new ApiError(
+    409,
+    "billing_subscription_active",
+    "Cancel your Paddle subscription before deleting your account.",
+  );
 }

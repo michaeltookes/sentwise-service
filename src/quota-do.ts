@@ -762,6 +762,7 @@ export class AccountQuota {
         "Complete or cancel your pending Paddle checkout before deleting your account.",
       );
     }
+    await this.privateMetadataWriteQueue.catch(() => undefined);
     return Response.json(result);
   }
 

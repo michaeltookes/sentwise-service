@@ -530,6 +530,76 @@ describe("AccountQuota Durable Object", () => {
     expect([...values.keys()].sort()).toEqual([ACCOUNT_DELETION_KEY]);
   });
 
+  it("waits for in-flight subscription entitlement writes before begin-delete returns", async () => {
+    const uid = "delete-begin-waits-subscription";
+    const storage = fakeStorage(new Map<string, unknown>());
+    const quota = new AccountQuota(
+      { id: { name: uid }, storage } as unknown as DurableObjectState,
+      {} as Env,
+    );
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    clerkMocks.getUser.mockResolvedValue({
+      id: uid,
+      privateMetadata: {
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {},
+      },
+    });
+    clerkMocks.updateUserMetadata.mockImplementation(async () => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+    });
+
+    const fetchQuota = <T>(op: string, body: unknown) =>
+      quota
+        .fetch(
+          new Request(`https://account-quota.internal${op}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+        )
+        .then((res) => res.json<T>());
+
+    const subscription = fetchQuota<{ applied: true }>("/paddle-subscription", {
+      now: MON,
+      event: {
+        eventId: "evt_subscription",
+        eventType: "subscription.updated",
+        occurredAt: "2024-01-01T00:00:01.000Z",
+        data: {
+          id: "sub_current",
+          status: "active",
+          customer_id: "ctm_123",
+          custom_data: { clerkUserId: uid },
+          items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+        },
+      },
+    });
+    await writeStarted.promise;
+
+    let beginFinished = false;
+    const begin = fetchQuota<{ deleting: true; alreadyDeleted: false }>("/begin-delete", {
+      now: MON + 1,
+      attemptId: "delete",
+    }).then((result) => {
+      beginFinished = true;
+      return result;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(beginFinished).toBe(false);
+
+    releaseWrite.resolve();
+    expect(await subscription).toEqual({ applied: true });
+    expect(await begin).toMatchObject({
+      deleting: true,
+      alreadyDeleted: false,
+      attemptId: "delete",
+    });
+  });
+
   it("only clears checkout reservations for matching applied subscription events", async () => {
     const uid = "checkout-reservation-correlated-webhook";
     await callDO<CheckoutReservationResult>(uid, "/paddle-subscription-checkout-reserve", {

@@ -1542,6 +1542,43 @@ describe("DELETE /v1/me (73 — account deletion)", () => {
     });
   });
 
+  it("cancels the deletion barrier when the post-barrier subscription recheck is paid", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-del-resumed" });
+    mocks.getUser
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "pro",
+            status: "canceled",
+            paddleSubscriptionId: "sub_123",
+            paddleCustomerId: "ctm_123",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "pro",
+            status: "active",
+            paddleSubscriptionId: "sub_123",
+            paddleCustomerId: "ctm_123",
+          },
+        }),
+      );
+    const fetchMock = vi.fn().mockResolvedValue(clerkDeleteResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+
+    expect(del.status).toBe(409);
+    expect(((await del.json()) as any).error.type).toBe("billing_subscription_active");
+    expect(fetchMock).not.toHaveBeenCalled();
+    const stub = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName("u-del-resumed"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get(ACCOUNT_DELETION_KEY)).toBeUndefined();
+    });
+  });
+
   it("rejects account deletion while a subscription checkout transaction is pending", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-del-pending-checkout" });
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
