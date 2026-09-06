@@ -4,38 +4,29 @@
 // /v1/me) and 56b (quota enforcement) pick it up. All the pure logic lives in
 // src/paddle.ts; this file owns the Clerk + Paddle-API I/O.
 //
-// PRIVACY: this endpoint handles only plan/status/timestamps/URLs and
-// price/subscription/customer ids (plus a customer email used solely to match an
-// account when the checkout did not attach a Clerk user id). It never sees, logs,
-// or stores prompt or draft content, and it never logs the raw webhook body.
+// PRIVACY: this endpoint handles only plan/status/timestamps and price/
+// subscription/customer ids (plus a customer email used solely to match an
+// account when the checkout did not attach a Clerk user id). It never sees,
+// logs, or stores prompt or draft content, and it never logs the raw webhook
+// body.
 
 import { createClerkClient } from "@clerk/backend";
-import { isClerkNotFoundError } from "./auth";
 import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, PADDLE_SANDBOX_API_BASE, type Env } from "./config";
 import { ApiError } from "./errors";
 import { numFrom } from "./metering";
 import {
-  buildSubscriptionRecord,
   clerkUserIdFromEvent,
   customerIdFromEvent,
+  HANDLED_EVENT_TYPES,
   isSubscriptionEvent,
   overageDraftsFromEvent,
   parsePaddleEvent,
-  planFromEvent,
-  resolvePlanDraftLimit,
-  subscriptionIdFromEvent,
   verifyPaddleSignature,
   type PaddleEvent,
 } from "./paddle";
-import { quotaRecordPaddleOverage } from "./quota-client";
+import { quotaRecordPaddleOverage, quotaRecordPaddleSubscription } from "./quota-client";
 
-const HANDLED = new Set([
-  "subscription.created",
-  "subscription.updated",
-  "subscription.canceled",
-  "subscription.past_due",
-  "transaction.completed",
-]);
+const HANDLED = new Set<string>(HANDLED_EVENT_TYPES);
 
 /**
  * Handle a Paddle webhook. Signature is verified against the exact raw body;
@@ -81,11 +72,7 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
   }
 
   if (isSubscriptionEvent(event.eventType)) {
-    const meta = await loadClerkPrivateMetadata(clerk, userId);
-    if (!meta) {
-      return ack({ mapped: false });
-    }
-    return await applySubscriptionEvent(event, env, clerk, userId, meta);
+    return await applySubscriptionEvent(event, env, userId);
   }
   // transaction.completed → overage credit.
   return await applyOverageEvent(event, env, userId);
@@ -98,60 +85,23 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 async function applySubscriptionEvent(
   event: PaddleEvent,
   env: Env,
-  clerk: ReturnType<typeof createClerkClient>,
   userId: string,
-  meta: Record<string, unknown>,
 ): Promise<Response> {
-  const mapped = planFromEvent(event);
-  if (!mapped) {
-    // A subscription for a price we don't recognize — nothing to entitle.
-    return ack({ ignored: "unknown_price" });
-  }
-
-  const existingSub = asRecord(meta.subscription);
-  // Idempotency: exact replay of an already-applied event.
-  if (existingSub && existingSub.lastEventId === event.eventId) {
-    return ack({ idempotent: true });
-  }
-  // Out-of-order guard: a strictly older event must not clobber a newer record.
-  const now = Date.now();
-  const incomingUpdatedAt = event.occurredAt ? Date.parse(event.occurredAt) : now;
-  if (existingSub && typeof existingSub.updatedAt === "string") {
-    const existingUpdatedAt = Date.parse(existingSub.updatedAt);
-    if (
-      !Number.isNaN(existingUpdatedAt) &&
-      !Number.isNaN(incomingUpdatedAt) &&
-      existingUpdatedAt > incomingUpdatedAt
-    ) {
-      return ack({ stale: true });
-    }
-  }
-
-  // Best-effort manage-billing URL (Paddle omits management_urls from webhooks;
-  // fetch via the API). Preserve any prior URL if the fetch is unavailable.
-  const priorUrl =
-    typeof existingSub?.manageBillingUrl === "string" ? existingSub.manageBillingUrl : null;
-  const subscriptionId = subscriptionIdFromEvent(event);
-  const fetchedUrl = subscriptionId ? await fetchManageBillingUrl(env, subscriptionId) : null;
-  const manageBillingUrl = fetchedUrl ?? priorUrl;
-
-  const record = buildSubscriptionRecord(event, mapped.plan, mapped.priceId, manageBillingUrl, now);
-
-  // Set the tier's weekly draft limit as a per-account override, preserving any
-  // other quota fields (purchased extras, token limit, overage idempotency marker).
-  const existingQuota = asRecord(meta.quota) ?? {};
-  const weeklyDraftLimit = resolvePlanDraftLimit(env, mapped.plan);
-  const quota = { ...existingQuota, weeklyDraftLimit };
-
   try {
-    await clerk.users.updateUserMetadata(userId, {
-      privateMetadata: { subscription: record, quota },
+    const result = await quotaRecordPaddleSubscription(env, userId, {
+      now: Date.now(),
+      event,
     });
+    return ack(result);
   } catch (err) {
-    if (isClerkNotFoundError(err)) return ack({ mapped: false });
-    throw new ApiError(502, "entitlement_write_failed", "Could not record the subscription.");
+    if (err instanceof ApiError && err.type === "account_deleted") {
+      return ack({ mapped: false });
+    }
+    if (err instanceof ApiError && err.type === "account_deletion_in_progress") {
+      throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
+    }
+    throw err;
   }
-  return ack({ applied: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -221,29 +171,6 @@ function paddleApiBase(env: Env): string {
     : PADDLE_SANDBOX_API_BASE;
 }
 
-async function fetchManageBillingUrl(env: Env, subscriptionId: string): Promise<string | null> {
-  if (!env.PADDLE_API_KEY) return null;
-  try {
-    const res = await fetch(
-      `${paddleApiBase(env)}/subscriptions/${encodeURIComponent(subscriptionId)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${env.PADDLE_API_KEY}`,
-          "content-type": "application/json",
-        },
-      },
-    );
-    if (!res.ok) return null;
-    const body: unknown = await res.json();
-    const data = asRecord(asRecord(body)?.data);
-    const urls = asRecord(data?.management_urls);
-    const candidate = urls?.update_payment_method ?? urls?.cancel;
-    return validHttpsUrl(candidate);
-  } catch {
-    return null;
-  }
-}
-
 async function fetchCustomerEmail(env: Env, customerId: string): Promise<string | null> {
   if (!env.PADDLE_API_KEY) return null;
   try {
@@ -267,34 +194,12 @@ async function fetchCustomerEmail(env: Env, customerId: string): Promise<string 
   }
 }
 
-async function loadClerkPrivateMetadata(
-  clerk: ReturnType<typeof createClerkClient>,
-  userId: string,
-): Promise<Record<string, unknown> | null> {
-  try {
-    const user = await clerk.users.getUser(userId);
-    return user.privateMetadata ?? {};
-  } catch (err) {
-    if (isClerkNotFoundError(err)) return null;
-    throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Small helpers.
 // ---------------------------------------------------------------------------
 
 function asRecord(v: unknown): Record<string, unknown> | null {
   return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
-}
-
-function validHttpsUrl(v: unknown): string | null {
-  if (typeof v !== "string" || v === "") return null;
-  try {
-    return new URL(v).protocol === "https:" ? v : null;
-  } catch {
-    return null;
-  }
 }
 
 /** Acknowledge a verified event. The body carries only a coarse outcome tag. */

@@ -4,9 +4,9 @@
 // here is deterministic and unit-testable: crypto is WebCrypto (no network), and
 // there is no Clerk, no storage, and no logging.
 //
-// PRIVACY: this module handles only plan/status enums, timestamps, billing URLs,
-// price/subscription/customer ids, and integer draft counts — never prompt or
-// draft content. The webhook body it verifies carries billing metadata only.
+// PRIVACY: this module handles only plan/status enums, timestamps, price/
+// subscription/customer ids, and integer draft counts — never prompt or draft
+// content. The webhook body it verifies carries billing metadata only.
 
 import {
   DEFAULT_EXTRA_DRAFTS_PER_UNIT,
@@ -26,6 +26,8 @@ export const HANDLED_EVENT_TYPES = [
   "subscription.updated",
   "subscription.canceled",
   "subscription.past_due",
+  "subscription.paused",
+  "subscription.resumed",
   "transaction.completed",
 ] as const;
 
@@ -223,9 +225,12 @@ export function statusFromEvent(event: PaddleEvent): SubscriptionStatus {
   }
   switch (event.eventType) {
     case "subscription.canceled":
+    case "subscription.paused":
       return "canceled";
     case "subscription.past_due":
       return "past_due";
+    case "subscription.resumed":
+      return "active";
     default:
       return "active";
   }
@@ -303,8 +308,9 @@ export function overageDraftsFromEvent(event: PaddleEvent, env: OverageEnv): num
 
 // ---------------------------------------------------------------------------
 // The stored `privateMetadata.subscription` record (56c writes; item 73 reads).
-// parseSubscriptionOverride reads plan/status/renewsAt/manageBillingUrl; the rest
-// is for reconciliation + idempotency.
+// parseSubscriptionOverride reads plan/status/renewsAt; the rest is for
+// reconciliation + idempotency. Billing-management URLs are fetched on demand
+// because Paddle portal links are temporary.
 // ---------------------------------------------------------------------------
 
 export interface StoredSubscriptionRecord {
@@ -321,21 +327,20 @@ export interface StoredSubscriptionRecord {
 
 /**
  * Build the subscription record to store for a subscription.* event. `plan` and
- * `priceId` come from planFromEvent; `manageBillingUrl` is fetched separately
- * (webhook side) and passed in, preserving a prior URL when the fetch is skipped.
+ * `priceId` come from planFromEvent. `manageBillingUrl` is intentionally not
+ * persisted; callers fetch Paddle's temporary portal URLs on demand.
  */
 export function buildSubscriptionRecord(
   event: PaddleEvent,
   plan: SubscriptionPlan,
   priceId: string | null,
-  manageBillingUrl: string | null,
   now: number,
 ): StoredSubscriptionRecord {
   return {
     plan,
     status: statusFromEvent(event),
     renewsAt: normalizeIso(event.data.next_billed_at),
-    manageBillingUrl,
+    manageBillingUrl: null,
     paddleSubscriptionId: subscriptionIdFromEvent(event),
     paddleCustomerId: customerIdFromEvent(event),
     priceId,

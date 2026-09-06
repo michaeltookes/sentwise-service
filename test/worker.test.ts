@@ -632,7 +632,7 @@ describe("GET /v1/me", () => {
     expect(body.subscription.manageBillingUrl).toBeNull();
   });
 
-  it("uses a valid privateMetadata.subscription override verbatim", async () => {
+  it("uses a valid privateMetadata.subscription override without exposing stored billing URLs", async () => {
     const override = {
       plan: "pro",
       status: "active",
@@ -648,7 +648,97 @@ describe("GET /v1/me", () => {
     );
     const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
     const body = (await res.json()) as any;
-    expect(body.subscription).toEqual(override);
+    expect(body.subscription).toEqual({ ...override, manageBillingUrl: null });
+  });
+});
+
+describe("GET /v1/paddle/manage-billing", () => {
+  const paddleEnv: Env = {
+    ...env,
+    PADDLE_API_KEY: "pdl_apikey",
+    PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+  };
+
+  it("redirects to a fresh Paddle management URL", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+        },
+      }),
+    );
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: {
+              management_urls: {
+                update_payment_method: "https://portal.paddle.com/manage/sub_123",
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing", { headers: bearer() }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(303);
+    expect(res.headers.get("Location")).toBe("https://portal.paddle.com/manage/sub_123");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_123",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer pdl_apikey" }),
+      }),
+    );
+  });
+
+  it("404s when the account has no Paddle subscription id", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({ subscription: { plan: "trial", status: "trialing" } }),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing", { headers: bearer() }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_not_found");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 502 when Paddle does not provide a valid management URL", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { plan: "pro", status: "active", paddleSubscriptionId: "sub_123" },
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response(JSON.stringify({ data: {} }), { status: 200 }))),
+    );
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing", { headers: bearer() }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("billing_portal_unavailable");
   });
 });
 

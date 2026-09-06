@@ -5,6 +5,7 @@ import type { Env } from "./config";
 import { ApiError, type ErrorExtra } from "./errors";
 import type { ResolvedLimits, WindowState } from "./metering";
 import type { InterestTopic } from "./interest";
+import type { PaddleEvent } from "./paddle";
 
 export interface CheckResult {
   allowed: boolean;
@@ -48,6 +49,12 @@ export interface RecordInterestResult {
 }
 export type PaddleOverageResult =
   { applied: true; extraDrafts: number } | { idempotent: true } | { mapped: false };
+export type PaddleSubscriptionResult =
+  | { applied: true }
+  | { idempotent: true }
+  | { stale: true }
+  | { ignored: "unknown_price" }
+  | { mapped: false };
 
 async function call<T>(env: Env, userId: string, op: string, body: unknown): Promise<T> {
   const id = env.ACCOUNT_QUOTA.idFromName(userId);
@@ -171,6 +178,15 @@ export function quotaRecordPaddleOverage(
   body: { now: number; eventId: string; extraDrafts: number },
 ): Promise<PaddleOverageResult> {
   return call<PaddleOverageResult>(env, userId, "/paddle-overage", body);
+}
+
+/** Serialize and record a Paddle subscription entitlement through the user's Durable Object. */
+export function quotaRecordPaddleSubscription(
+  env: Env,
+  userId: string,
+  body: { now: number; event: PaddleEvent },
+): Promise<PaddleSubscriptionResult> {
+  return call<PaddleSubscriptionResult>(env, userId, "/paddle-subscription", body);
 }
 
 /** Set a deletion barrier before attempting Clerk deletion. Does not wipe counters. */

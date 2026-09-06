@@ -204,6 +204,20 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     expect(lastWrite()?.subscription).toMatchObject({ status: "past_due", plan: "pro" });
   });
 
+  it("records paused subscriptions as canceled for access purposes", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const res = await signedReq(subBody({ eventType: "subscription.paused", status: "paused" }));
+    expect(res.status).toBe(200);
+    expect(lastWrite()?.subscription).toMatchObject({ status: "canceled", plan: "pro" });
+  });
+
+  it("records resumed subscriptions as active", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const res = await signedReq(subBody({ eventType: "subscription.resumed", status: "active" }));
+    expect(res.status).toBe(200);
+    expect(lastWrite()?.subscription).toMatchObject({ status: "active", plan: "pro" });
+  });
+
   it("records canceled status on subscription.canceled (keeping the tier for period access)", async () => {
     mocks.getUser.mockResolvedValue(userWith({}));
     await signedReq(subBody({ eventType: "subscription.canceled", status: "canceled" }));
@@ -286,6 +300,58 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     );
     expect(res.status).toBe(200);
     expect(lastWrite()?.subscription).toMatchObject({ plan: "pro", lastEventId: "evt_new" });
+  });
+
+  it("serializes overlapping subscription writes before the ordering check", async () => {
+    let storedMeta: Record<string, unknown> = {
+      subscription: {
+        plan: "starter",
+        status: "active",
+        lastEventId: "evt_initial",
+        updatedAt: "2026-09-01T00:00:00.000Z",
+      },
+      quota: { weeklyTokenLimit: 500000 },
+    };
+    const newWrite = deferred<void>();
+    const newWriteStarted = deferred<void>();
+
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation(async (_userId, update) => {
+      const privateMetadata = update.privateMetadata as Record<string, unknown>;
+      const subscription = privateMetadata.subscription as Record<string, unknown> | undefined;
+      if (subscription?.lastEventId === "evt_new") {
+        newWriteStarted.resolve();
+        await newWrite.promise;
+      }
+      storedMeta = { ...storedMeta, ...privateMetadata };
+    });
+
+    const newer = signedReq(
+      subBody({
+        eventId: "evt_new",
+        priceId: PRO_PRICE,
+        occurredAt: "2026-09-06T00:00:00.000Z",
+      }),
+    );
+    await newWriteStarted.promise;
+
+    const older = signedReq(
+      subBody({
+        eventId: "evt_old",
+        priceId: STARTER_PRICE,
+        occurredAt: "2026-09-05T00:00:00.000Z",
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.getUser).toHaveBeenCalledTimes(1);
+
+    newWrite.resolve();
+    const [, olderRes] = await Promise.all([newer, older]);
+
+    expect((await olderRes.json()) as any).toEqual({ ok: true, stale: true });
+    expect(storedMeta.subscription).toMatchObject({ plan: "pro", lastEventId: "evt_new" });
+    expect(storedMeta.quota).toMatchObject({ weeklyTokenLimit: 500000, weeklyDraftLimit: 120 });
   });
 });
 
@@ -460,6 +526,57 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.processedOverageEventIds).toEqual(["evt_a", "evt_b"]);
   });
 
+  it("serializes overlapping subscription and overage writes through the account Durable Object", async () => {
+    const monday = mondayStartUtc(Date.now());
+    let storedMeta: Record<string, unknown> = {
+      quota: { extraDrafts: 0, extraDraftsWindowStart: monday },
+    };
+    const subscriptionWrite = deferred<void>();
+    const subscriptionWriteStarted = deferred<void>();
+
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation(async (_userId, update) => {
+      const privateMetadata = update.privateMetadata as Record<string, unknown>;
+      const subscription = privateMetadata.subscription as Record<string, unknown> | undefined;
+      if (subscription?.lastEventId === "evt_sub") {
+        subscriptionWriteStarted.resolve();
+        await subscriptionWrite.promise;
+      }
+      storedMeta = { ...storedMeta, ...privateMetadata };
+    });
+
+    const subscription = signedReq(subBody({ eventId: "evt_sub", priceId: PRO_PRICE }));
+    await subscriptionWriteStarted.promise;
+
+    const overage = signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+        },
+        "evt_overage",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.getUser).toHaveBeenCalledTimes(1);
+
+    subscriptionWrite.resolve();
+    await Promise.all([subscription, overage]);
+
+    expect(storedMeta.subscription).toMatchObject({ plan: "pro", lastEventId: "evt_sub" });
+    expect(storedMeta.quota).toMatchObject({
+      extraDrafts: 5,
+      extraDraftsWindowStart: monday,
+      lastOverageEventId: "evt_overage",
+      weeklyDraftLimit: 120,
+    });
+    expect((storedMeta.quota as Record<string, unknown>).processedOverageEventIds).toEqual([
+      "evt_overage",
+    ]);
+  });
+
   it("ignores a plain renewal transaction (no overage markers)", async () => {
     mocks.getUser.mockResolvedValue(userWith({}));
     const res = await signedReq(txnBody({ items: [{ price: { id: PRO_PRICE }, quantity: 1 }] }));
@@ -532,8 +649,11 @@ describe("POST /v1/paddle/webhook — user resolution", () => {
     expect(res.status).toBe(200);
     expect(mocks.getUserList).toHaveBeenCalledWith({ emailAddress: ["marcus@example.com"] });
     expect(mocks.getUser).toHaveBeenCalledWith("user_matched");
-    // manage-billing URL fetched from the Paddle API and stored.
-    expect(lastWrite()?.subscription.manageBillingUrl).toBe("https://portal.paddle.com/manage/abc");
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/subscriptions/"),
+      expect.anything(),
+    );
+    expect(lastWrite()?.subscription.manageBillingUrl).toBeNull();
   });
 
   it("returns 502 when the Clerk email fallback lookup fails transiently", async () => {

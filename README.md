@@ -68,15 +68,16 @@ access past the 14-day trial.
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/webhook, /admin/margin
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin
   -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
   -> src/anthropic.ts       forward to Anthropic, map the response — no logging, no storage
-  -> src/quota-do.ts        per-account usage counters (Durable Object) — counters only; deletion tombstone
+  -> src/quota-do.ts        per-account usage counters + serialized metadata writes (Durable Object)
   -> src/analytics.ts       one aggregate hashed metric per draft — no content
   -> src/interest.ts        record demand for a parked capability — a topic key + timestamp, no content
   -> src/paddle.ts          verify Paddle signature + map billing event -> entitlement (56c) — pure
-  -> src/paddle-webhook.ts  write the entitlement into Clerk privateMetadata (56c) — no body logging
+  -> src/paddle-management.ts  fresh Paddle billing-management redirects — no URL persistence
+  -> src/paddle-webhook.ts  dispatch signed events to serialized entitlement writes (56c) — no body logging
 ```
 
 ## API
@@ -123,7 +124,8 @@ The account's plan for the Settings account pane:
 - `plan`: `"trial" | "starter" | "pro" | "unlimited" | "team" | "none"`
 - `status`: `"trialing" | "active" | "past_due" | "canceled" | "lapsed"`
 - `renewsAt`: ISO 8601 timestamp, or `null`
-- `manageBillingUrl`: an `https` URL to the billing portal, or `null`
+- `manageBillingUrl`: compatibility field; always `null` because Paddle billing portal URLs are
+  temporary and fetched on demand
 
 **Trial fallback.** Before checkout, the field is **derived from the trial** on the same Clerk
 `getUser` as `trial`/`quota` (no extra round-trip):
@@ -136,13 +138,22 @@ The account's plan for the Settings account pane:
 
 **Override (written by 56c).** After checkout, the Paddle webhook (see
 [Checkout & licensing](#checkout--licensing-56c)) writes a `subscription` record into the Clerk
-user's `privateMetadata`. When a **valid** record is present it is used verbatim (and wins over the
-trial derivation). Validation is strict: `plan` and `status` must each match the enums above or the
-whole record is ignored (the trial fallback applies); a malformed `renewsAt` or a non-`https`
-`manageBillingUrl` is dropped to `null` rather than poisoning an otherwise-valid record. The stored
+user's `privateMetadata`. When a **valid** record is present it wins over the trial derivation.
+Validation is strict: `plan` and `status` must each match the enums above or the whole record is
+ignored (the trial fallback applies); a malformed `renewsAt` is dropped to `null` rather than
+poisoning an otherwise-valid record. Any legacy stored `manageBillingUrl` is ignored. The stored
 record carries extra reconciliation/idempotency fields (`paddleSubscriptionId`, `paddleCustomerId`,
-`priceId`, `updatedAt`, `lastEventId`) that this endpoint reads past — only the four wire fields above
-are returned.
+`priceId`, `updatedAt`, `lastEventId`) that this endpoint reads past — only the public wire fields
+above are returned.
+
+### `GET /v1/paddle/manage-billing`
+
+Requires `Authorization: Bearer <clerk-session-token>`. Reads the account's stored
+`paddleSubscriptionId`, fetches a fresh Paddle `management_urls` link, and returns **`303`** with
+`Location: <fresh Paddle URL>` and `Cache-Control: no-store`.
+
+Returns **`404 billing_subscription_not_found`** when the account has no Paddle subscription id, and
+**`502 billing_portal_unavailable`** when Paddle does not return a valid temporary management URL.
 
 ### `DELETE /v1/me` (item 73)
 
@@ -345,10 +356,10 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 
 **Events handled** (others are acknowledged `200` and ignored):
 
-| Event                                                           | Write                                                                                                                                                           |
-| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subscription.created` / `.updated` / `.canceled` / `.past_due` | `privateMetadata.subscription` (plan/status/renewsAt/manageBillingUrl + reconciliation ids) **and** `privateMetadata.quota.weeklyDraftLimit` = the tier's limit |
-| `transaction.completed` (overage / "buy more drafts")           | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`    |
+| Event                                                                                    | Write                                                                                                                                                        |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `subscription.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids) **and** `privateMetadata.quota.weeklyDraftLimit` = the tier's limit               |
+| `transaction.completed` (overage / "buy more drafts")                                    | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID` |
 
 **Account mapping.** `data.custom_data.clerkUserId` (attached by the app's checkout) is primary; the
 fallback looks the Paddle customer's email up in Clerk (`GET /customers/{id}` → `getUserList`). If no
@@ -369,27 +380,29 @@ landing page says "per **month**", but 56b enforces a **weekly** window — the 
 per-tier numbers are unresolved. The plumbing is deliberately window-agnostic (it writes whatever the
 var holds and stamps overage to the 56b Monday window); it does not encode a final answer.
 
-**`manageBillingUrl`** (the app's "Manage billing" button) is fetched from the Paddle API
-(`GET /subscriptions/{id}` → `data.management_urls`) because webhooks omit management URLs. Best-effort:
-if `PADDLE_API_KEY` is unset or the fetch fails, a previously stored URL is preserved, else `null`.
+**Billing management.** Paddle portal URLs are temporary authenticated links, so the webhook never
+persists them. The app should open `GET /v1/paddle/manage-billing`, which fetches
+`GET /subscriptions/{id}` → `data.management_urls` on demand and redirects to the fresh URL.
 
 **Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
 `EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored.
 
-**Idempotency & ordering.** Subscription writes are skipped when the incoming `event_id` equals the
-stored `lastEventId`, or when a strictly older `occurred_at` would clobber a newer stored record.
-Overage writes run through the per-user Durable Object so overlapping purchases are serialized, and
-are skipped when the `event_id` is in the bounded `processedOverageEventIds` list (the legacy
+**Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
+Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
+updated. Subscription writes are skipped when the incoming `event_id` equals the stored `lastEventId`,
+or when a strictly older `occurred_at` would clobber a newer stored record. Overage writes are skipped
+when the `event_id` is in the bounded `processedOverageEventIds` list (the legacy
 `lastOverageEventId` is still honored). A transient Clerk failure returns **`502`** so Paddle retries.
 
-**Privacy.** This endpoint handles only plan/status/timestamps/URLs and price/subscription/customer
-ids (plus a customer email used solely to match an account). It never sees prompt or draft content
-and **never logs the raw webhook body** (enforced by `scripts/check-no-body-logging.sh`).
+**Privacy.** This endpoint handles only plan/status/timestamps and price/subscription/customer ids
+(plus a customer email used solely to match an account). It never sees prompt or draft content and
+**never logs the raw webhook body** (enforced by `scripts/check-no-body-logging.sh`).
 
 **Going live (owner, after the app half lands).** Nothing is live until the owner: (1) sets the two
 Paddle secrets (below); (2) in the Paddle dashboard creates a **notification destination** pointing at
-`https://sentwise-inference.sentwise-service.workers.dev/v1/paddle/webhook`, subscribed to the four
-`subscription.*` events + `transaction.completed`, and copies its signing secret into
+`https://sentwise-inference.sentwise-service.workers.dev/v1/paddle/webhook`, subscribed to
+`subscription.created`, `subscription.updated`, `subscription.canceled`, `subscription.past_due`,
+`subscription.paused`, `subscription.resumed`, and `transaction.completed`, and copies its signing secret into
 `PADDLE_WEBHOOK_SECRET`; (3) when moving off sandbox, flips `PADDLE_API_BASE` to
 `https://api.paddle.com` and swaps the sandbox price ids in `PRICE_TO_PLAN` for live ids. End-to-end
 verification (a real Paddle test event → a real entitlement write) happens then.
@@ -422,9 +435,9 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   (`pdl_ntfset_…`) that verifies `POST /v1/paddle/webhook`. When unset, every webhook is rejected
   `401` (nothing is entitled).
 - `PADDLE_API_KEY` — **56c, optional-but-recommended.** A Paddle API key (`subscription.read` +
-  `customer.read`) used to fetch a subscription's `manageBillingUrl` and, in the email fallback, the
-  customer's email. When unset, "Manage billing" stays `null` and only `custom_data.clerkUserId`
-  mapping works.
+  `customer.read`) used by `GET /v1/paddle/manage-billing` to fetch a fresh temporary portal URL and,
+  in the email fallback, the customer's email. When unset, billing management cannot redirect and only
+  `custom_data.clerkUserId` mapping works.
 
 Push them to the Worker with (values are read from the file, never printed):
 

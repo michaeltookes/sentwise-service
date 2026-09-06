@@ -52,7 +52,10 @@ describe("deriveSubscription (privateMetadata.subscription override)", () => {
       manageBillingUrl: "https://billing.example.com/portal/abc",
     };
     // Even with an active trial, a valid override wins.
-    expect(deriveSubscription(activeTrial, override)).toEqual(override);
+    expect(deriveSubscription(activeTrial, override)).toEqual({
+      ...override,
+      manageBillingUrl: null,
+    });
   });
 
   it("accepts each launch tier as a valid plan", () => {
@@ -66,9 +69,10 @@ describe("deriveSubscription (privateMetadata.subscription override)", () => {
     }
   });
 
-  it("ignores unknown reconciliation fields the webhook stores alongside the wire fields", () => {
+  it("ignores unknown reconciliation fields and legacy management URLs", () => {
     // The 56c webhook stores paddleSubscriptionId/priceId/updatedAt/lastEventId
-    // etc.; parseSubscriptionOverride reads only the four wire fields.
+    // etc.; parseSubscriptionOverride reads only the public wire fields. Stored
+    // management URLs are temporary Paddle links, so they are not exposed.
     expect(
       deriveSubscription(activeTrial, {
         plan: "starter",
@@ -85,7 +89,7 @@ describe("deriveSubscription (privateMetadata.subscription override)", () => {
       plan: "starter",
       status: "active",
       renewsAt: "2026-10-01T00:00:00.000Z",
-      manageBillingUrl: "https://billing.example.com/p/1",
+      manageBillingUrl: null,
     });
   });
 
@@ -170,20 +174,19 @@ describe("parseSubscriptionOverride", () => {
     });
   });
 
-  it("drops a non-https manageBillingUrl to null", () => {
-    expect(
-      parseSubscriptionOverride({
-        plan: "pro",
-        status: "active",
-        manageBillingUrl: "http://insecure.example.com",
-      }),
-    ).toEqual({ plan: "pro", status: "active", renewsAt: null, manageBillingUrl: null });
-    expect(
-      parseSubscriptionOverride({
-        plan: "pro",
-        status: "active",
-        manageBillingUrl: "javascript:alert(1)",
-      }),
-    ).toEqual({ plan: "pro", status: "active", renewsAt: null, manageBillingUrl: null });
+  it("ignores legacy manageBillingUrl values", () => {
+    for (const manageBillingUrl of [
+      "https://billing.example.com/portal/abc",
+      "http://insecure.example.com",
+      "javascript:alert(1)",
+    ]) {
+      expect(
+        parseSubscriptionOverride({
+          plan: "pro",
+          status: "active",
+          manageBillingUrl,
+        }),
+      ).toEqual({ plan: "pro", status: "active", renewsAt: null, manageBillingUrl: null });
+    }
   });
 });

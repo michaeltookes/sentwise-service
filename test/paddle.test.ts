@@ -4,6 +4,7 @@ import {
   clerkUserIdFromEvent,
   computeHmacSha256Hex,
   customerIdFromEvent,
+  HANDLED_EVENT_TYPES,
   isSubscriptionEvent,
   normalizeIso,
   overageDraftsFromEvent,
@@ -198,6 +199,13 @@ describe("field extraction", () => {
   });
 });
 
+describe("handled event types", () => {
+  it("includes paused and resumed subscription lifecycle events", () => {
+    expect(HANDLED_EVENT_TYPES).toContain("subscription.paused");
+    expect(HANDLED_EVENT_TYPES).toContain("subscription.resumed");
+  });
+});
+
 describe("planFromEvent (price -> tier map)", () => {
   it("maps each sandbox price id to its tier", () => {
     for (const [price, plan] of [
@@ -265,6 +273,18 @@ describe("statusFromEvent", () => {
       data: { id: "s", items: [{ price: { id: PRO_PRICE } }] },
     });
     expect(statusFromEvent(parsePaddleEvent(pastDue)!)).toBe("past_due");
+    const paused = JSON.stringify({
+      event_id: "e",
+      event_type: "subscription.paused",
+      data: { id: "s", items: [{ price: { id: PRO_PRICE } }] },
+    });
+    expect(statusFromEvent(parsePaddleEvent(paused)!)).toBe("canceled");
+    const resumed = JSON.stringify({
+      event_id: "e",
+      event_type: "subscription.resumed",
+      data: { id: "s", items: [{ price: { id: PRO_PRICE } }] },
+    });
+    expect(statusFromEvent(parsePaddleEvent(resumed)!)).toBe("active");
   });
 });
 
@@ -367,14 +387,13 @@ describe("buildSubscriptionRecord", () => {
       event,
       "pro",
       PRO_PRICE,
-      "https://sandbox-customer-portal.paddle.com/manage/abc",
       Date.parse("2026-09-05T10:00:05.000Z"),
     );
     expect(record).toEqual({
       plan: "pro",
       status: "active",
       renewsAt: "2026-10-05T10:00:00.500Z",
-      manageBillingUrl: "https://sandbox-customer-portal.paddle.com/manage/abc",
+      manageBillingUrl: null,
       paddleSubscriptionId: "sub_123",
       paddleCustomerId: "ctm_123",
       priceId: PRO_PRICE,
@@ -391,7 +410,7 @@ describe("buildSubscriptionRecord", () => {
     });
     const event = parsePaddleEvent(raw)!;
     const now = Date.parse("2026-09-05T12:00:00.000Z");
-    const record = buildSubscriptionRecord(event, "starter", STARTER_PRICE, null, now);
+    const record = buildSubscriptionRecord(event, "starter", STARTER_PRICE, now);
     expect(record.updatedAt).toBe("2026-09-05T12:00:00.000Z");
     expect(record.renewsAt).toBeNull();
     expect(record.manageBillingUrl).toBeNull();

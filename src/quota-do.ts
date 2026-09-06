@@ -15,6 +15,7 @@
 //   POST /reserve { now, reservationId, estimatedTokens, limits } -> { reserved, ... }
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /interest { topic } -> serialize Clerk interest metadata writes per user
+//   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
 //   POST /paddle-overage { now, eventId, extraDrafts } -> serialize Paddle overage entitlement writes
 //   POST /defer-settlement { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /release { now, reservationId, reservationWindowStart, estimatedTokens } -> { window }
@@ -30,6 +31,10 @@ import { clerkUserExists, deleteClerkUser } from "./auth";
 import { ApiError, jsonError } from "./errors";
 import { parseInterestTopic, recordInterestInClerk } from "./interest";
 import { parsePaddleOverageBody, recordPaddleOverageInClerk } from "./paddle-entitlement";
+import {
+  parsePaddleSubscriptionBody,
+  recordPaddleSubscriptionInClerk,
+} from "./paddle-subscription-entitlement";
 import {
   activeReservations,
   pruneStamps,
@@ -174,6 +179,8 @@ export class AccountQuota {
         return this.handlePeek(await request.json<PeekBody>());
       case "/interest":
         return this.handleInterest(await request.json<unknown>());
+      case "/paddle-subscription":
+        return this.handlePaddleSubscription(await request.json<unknown>());
       case "/paddle-overage":
         return this.handlePaddleOverage(await request.json<unknown>());
       default:
@@ -448,6 +455,20 @@ export class AccountQuota {
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(() =>
         recordInterestInClerk(userId, topic, this.env),
+      );
+      return Response.json(result);
+    } catch (err) {
+      if (err instanceof ApiError) return err.toResponse();
+      throw err;
+    }
+  }
+
+  private async handlePaddleSubscription(body: unknown): Promise<Response> {
+    try {
+      const parsed = parsePaddleSubscriptionBody(body);
+      const userId = this.requireUserId();
+      const result = await this.enqueuePrivateMetadataWrite(() =>
+        recordPaddleSubscriptionInClerk(userId, parsed, this.env),
       );
       return Response.json(result);
     } catch (err) {
