@@ -261,12 +261,16 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     expect(lastWrite()?.subscription).toMatchObject({ status: "active", plan: "pro" });
   });
 
-  it("records canceled status on subscription.canceled (keeping the tier for period access)", async () => {
-    mocks.getUser.mockResolvedValue(userWith({}));
+  it("records canceled status and removes the paid tier quota limit", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: { weeklyDraftLimit: 120, weeklyTokenLimit: 500000, extraDrafts: 7 },
+      }),
+    );
     await signedReq(subBody({ eventType: "subscription.canceled", status: "canceled" }));
     const write = lastWrite();
     expect(write?.subscription).toMatchObject({ status: "canceled", plan: "pro" });
-    expect(write?.quota).toEqual({ weeklyDraftLimit: 120 });
+    expect(write?.quota).toEqual({ weeklyTokenLimit: 500000, extraDrafts: 7 });
   });
 
   it("ignores an unknown price id (200, no write)", async () => {

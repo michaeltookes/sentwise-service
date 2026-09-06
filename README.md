@@ -346,11 +346,13 @@ webhook, which turns billing events into the account's entitlement — the `subs
 
 **Clerk bearer required.** The request body is `{ "priceId": "pri_...", "quantity": 1 }`.
 `priceId` must be one of the configured subscription tier prices or `EXTRA_DRAFTS_PRICE_ID`.
-Subscription quantities must be `1`; overage quantities are capped. Subscription checkout is rejected
-while the account already has an active/trialing/past-due Paddle subscription, so tier changes must
-go through Paddle subscription management instead of creating a second recurring subscription. Overage
-checkout requires an active Paddle subscription with a stored `paddleCustomerId`; the Worker passes
-that `customer_id` to Paddle so the later webhook credits the same bound customer.
+Subscription quantities must be `1`; omitted quantities default to `1`, explicitly supplied
+quantities must be positive integers, and overage quantities are capped. Subscription checkout is
+rejected while the account already has an active/trialing/past-due Paddle subscription, so tier
+changes must go through Paddle subscription management instead of creating a second recurring
+subscription. Overage checkout requires an active Paddle subscription with a stored
+`paddleCustomerId`; the Worker passes that `customer_id` to Paddle so the later webhook credits the
+same bound customer.
 
 The Worker creates `POST /transactions` in Paddle with server-minted `custom_data` and returns:
 
@@ -377,11 +379,11 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 
 **Events handled** (others are acknowledged `200` and ignored):
 
-| Event                                                                                                   | Write                                                                                                                                                        |
-| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids) **and** `privateMetadata.quota.weeklyDraftLimit` = the tier's limit               |
-| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID` |
-| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion       |
+| Event                                                                                                   | Write                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids). Active/trialing/past-due statuses set `privateMetadata.quota.weeklyDraftLimit`; canceled/paused statuses remove that paid override |
+| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`                                                   |
+| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion                                                         |
 
 **Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
 is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or

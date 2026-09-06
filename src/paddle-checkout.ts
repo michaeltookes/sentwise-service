@@ -71,7 +71,7 @@ async function parseCheckoutRequest(request: Request, env: Env): Promise<Checkou
 
   const body = asRecord(raw);
   const priceId = body?.priceId;
-  if (typeof priceId !== "string" || priceId === "") {
+  if (!body || typeof priceId !== "string" || priceId === "") {
     throw new ApiError(400, "invalid_request", "Missing Paddle price id.");
   }
   const kind = checkoutKindForPrice(priceId, env);
@@ -79,7 +79,7 @@ async function parseCheckoutRequest(request: Request, env: Env): Promise<Checkou
     throw new ApiError(400, "invalid_request", "Unsupported Paddle price id.");
   }
 
-  const quantity = positiveInt(body?.quantity) ?? 1;
+  const quantity = parseCheckoutQuantity(body);
   if (kind === "subscription" && quantity !== 1) {
     throw new ApiError(400, "invalid_request", "Subscription checkouts must use quantity 1.");
   }
@@ -126,10 +126,13 @@ function isPaidPlan(value: unknown): boolean {
   return value === "starter" || value === "pro" || value === "unlimited" || value === "team";
 }
 
-function positiveInt(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
-    ? Math.floor(value)
-    : null;
+function parseCheckoutQuantity(body: Record<string, unknown>): number {
+  if (!Object.prototype.hasOwnProperty.call(body, "quantity")) return 1;
+  const quantity = body.quantity;
+  if (typeof quantity === "number" && Number.isInteger(quantity) && quantity > 0) {
+    return quantity;
+  }
+  throw new ApiError(400, "invalid_request", "Checkout quantity must be a positive integer.");
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

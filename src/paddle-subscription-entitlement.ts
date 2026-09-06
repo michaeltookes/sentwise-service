@@ -131,10 +131,12 @@ export async function recordPaddleSubscriptionInClerk(
       isDifferentSubscription ? existingSubscriptionId : null,
     ),
   };
-  const quota = {
-    ...(asRecord(meta.quota) ?? {}),
-    weeklyDraftLimit: resolvePlanDraftLimit(env, mapped.plan),
-  };
+  const quota = quotaForSubscriptionStatus(
+    asRecord(meta.quota) ?? {},
+    record.status,
+    mapped.plan,
+    env,
+  );
 
   try {
     await clerk.users.updateUserMetadata(userId, {
@@ -204,6 +206,21 @@ function isPaddleSubscriptionStatus(value: unknown): value is string {
     value === "paused" ||
     value === "canceled"
   );
+}
+
+function quotaForSubscriptionStatus(
+  existingQuota: Record<string, unknown>,
+  status: string,
+  plan: "starter" | "pro" | "unlimited",
+  env: Env,
+): Record<string, unknown> {
+  const quota = { ...existingQuota };
+  if (status === "active" || status === "trialing" || status === "past_due") {
+    quota.weeklyDraftLimit = resolvePlanDraftLimit(env, plan);
+  } else {
+    delete quota.weeklyDraftLimit;
+  }
+  return quota;
 }
 
 function supersededSubscriptionHistory(

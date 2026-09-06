@@ -944,6 +944,28 @@ describe("POST /v1/paddle/checkout", () => {
     });
   });
 
+  it("rejects explicitly invalid checkout quantities", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const quantity of [0, -1, 1.5, "3", null]) {
+      const res = await worker.fetch(
+        req("/v1/paddle/checkout", {
+          method: "POST",
+          headers: bearer(),
+          body: JSON.stringify({ priceId: OVERAGE_PRICE, quantity }),
+        }),
+        paddleEnv,
+      );
+
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    }
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects unsupported checkout prices before calling Paddle", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     const fetchMock = vi.fn();
