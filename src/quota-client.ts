@@ -203,6 +203,7 @@ export function quotaRecordPaddleOverage(
   userId: string,
   body: {
     now: number;
+    eventWindowStart?: number;
     eventId: string;
     transactionId: string;
     customerId: string | null;

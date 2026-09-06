@@ -8,7 +8,6 @@ import type { OverageAdjustmentAction } from "./paddle";
 
 const PROCESSED_OVERAGE_EVENT_ID_LIMIT = 100;
 const PROCESSED_OVERAGE_ADJUSTMENT_ID_LIMIT = 100;
-const PENDING_OVERAGE_REVERSAL_LIMIT = 100;
 const LEDGER_STORAGE_BULK_OPERATION_LIMIT = 128;
 export const PADDLE_OVERAGE_CREDITS_STORAGE_KEY = "paddle_overage_credits";
 export const PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX = "paddle_overage_credit:";
@@ -28,6 +27,7 @@ export interface PaddleOverageCreditInput {
 
 export interface PaddleOverageBody {
   now: number;
+  eventWindowStart?: number;
   eventId: string;
   transactionId: string;
   customerId: string | null;
@@ -99,6 +99,13 @@ interface StoredPendingOverageReversal {
   items: PaddleOverageAdjustmentItemInput[];
 }
 
+interface StoredOverageCreditTransaction {
+  eventId: string;
+  transactionId: string;
+  windowStart: number;
+  creditKeys: string[];
+}
+
 export type PaddleOverageResult =
   { applied: true; extraDrafts: number } | { idempotent: true } | { mapped: false };
 export type PaddleOverageReversalResult =
@@ -124,6 +131,7 @@ export function parsePaddleOverageBody(body: unknown): PaddleOverageBody {
   }
   const customerId = nullableId(record.customerId);
   const now = positiveInt(record.now) ?? Date.now();
+  const eventWindowStart = positiveInt(record.eventWindowStart);
   const extraDrafts = positiveInt(record.extraDrafts) ?? 0;
   if (extraDrafts <= 0) {
     throw new ApiError(400, "invalid_request", "Missing overage credit.");
@@ -131,6 +139,7 @@ export function parsePaddleOverageBody(body: unknown): PaddleOverageBody {
   const credits = parseOverageCreditInputs(record.credits, extraDrafts);
   return {
     now,
+    ...(eventWindowStart !== null ? { eventWindowStart } : {}),
     eventId,
     transactionId,
     customerId,
@@ -197,36 +206,55 @@ export async function recordPaddleOverageInClerk(
   const existingQuota = asRecord(meta.quota) ?? {};
   const processedIds = processedOverageEventIds(existingQuota);
   if (processedIds.includes(body.eventId)) {
-    const repairWindowStart =
+    const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
+    const creditTransactions = overageCreditTransactions(existingQuota);
+    const repairWindowStart = overageCreditRepairWindowStart(
+      body,
+      existingCredits,
+      creditTransactions,
+    );
+    const currentWindowStart =
       typeof existingQuota.extraDraftsWindowStart === "number"
         ? existingQuota.extraDraftsWindowStart
-        : mondayStartUtc(body.now);
+        : null;
     const currentExtras =
       typeof existingQuota.extraDrafts === "number"
         ? Math.max(0, Math.floor(existingQuota.extraDrafts))
         : null;
     const pending = pendingOverageReversals(existingQuota);
-    const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
     const repairedCredits = body.credits.map((credit) =>
       storedCreditFromInput(body.eventId, body.transactionId, credit, repairWindowStart),
     );
-    const repairedLedger = mergeOverageCredits([
-      ...existingCredits,
-      ...creditsMissingFromLedger(repairedCredits, existingCredits),
-    ]);
+    const missingCredits = creditsMissingFromLedger(repairedCredits, existingCredits);
+    const repairedLedger = mergeOverageCredits([...existingCredits, ...missingCredits]);
     const replayed = replayPendingAdjustments(
       repairedLedger,
       pending,
       body.transactionId,
-      repairWindowStart,
+      currentWindowStart,
       currentExtras,
     );
     const pendingChanged = JSON.stringify(replayed.remainingPending) !== JSON.stringify(pending);
     const currentExtrasChanged = replayed.currentExtras !== currentExtras;
-    if (pendingChanged || currentExtrasChanged) {
+    const nextCreditTransactions =
+      missingCredits.length > 0
+        ? boundedOverageCreditTransactions([
+            ...creditTransactions,
+            storedOverageCreditTransactionFromCredits(
+              body.eventId,
+              body.transactionId,
+              repairWindowStart,
+              repairedCredits,
+            ),
+          ])
+        : creditTransactions;
+    const creditTransactionsChanged =
+      JSON.stringify(nextCreditTransactions) !== JSON.stringify(creditTransactions);
+    if (pendingChanged || currentExtrasChanged || creditTransactionsChanged) {
       const quota = {
         ...quotaWithoutOverageCredits(existingQuota),
         ...(replayed.currentExtras !== null ? { extraDrafts: replayed.currentExtras } : {}),
+        overageCreditTransactions: nextCreditTransactions,
         pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
         ...fallbackOverageCredits(ledgerStore, replayed.credits),
       };
@@ -249,9 +277,10 @@ export async function recordPaddleOverageInClerk(
       : 0;
   const pending = pendingOverageReversals(existingQuota);
   const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
-  let newCredits = body.credits.map((credit) =>
+  const expectedCredits = body.credits.map((credit) =>
     storedCreditFromInput(body.eventId, body.transactionId, credit, windowStart),
   );
+  let newCredits = expectedCredits;
   newCredits = creditsMissingFromLedger(newCredits, existingCredits);
   if (newCredits.length === 0) {
     await saveOverageCredits(ledgerStore, existingCredits);
@@ -274,6 +303,15 @@ export async function recordPaddleOverageInClerk(
     extraDraftsWindowStart: windowStart,
     lastOverageEventId: body.eventId,
     processedOverageEventIds: boundedProcessedOverageEventIds([...processedIds, body.eventId]),
+    overageCreditTransactions: boundedOverageCreditTransactions([
+      ...overageCreditTransactions(existingQuota),
+      storedOverageCreditTransactionFromCredits(
+        body.eventId,
+        body.transactionId,
+        windowStart,
+        expectedCredits,
+      ),
+    ]),
     pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
     ...fallbackOverageCredits(ledgerStore, allCredits),
   };
@@ -338,6 +376,7 @@ export async function revokePaddleOverageInClerk(
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
       : 0;
   const pending = pendingOverageReversals(existingQuota);
+  const creditTransactions = overageCreditTransactions(existingQuota);
   const wasPreviouslyApplied = adjustmentAlreadyAppliedToAnyCredit(credits, body);
   let applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
 
@@ -385,6 +424,13 @@ export async function revokePaddleOverageInClerk(
     currentWindowStart,
     nextExtras,
   );
+  const remainingPending = pendingOverageReversalsAfterAppliedAdjustment(
+    replayed.remainingPending,
+    body,
+    applied.processed,
+    replayed.credits,
+    creditTransactions,
+  );
   applied = {
     credits: replayed.credits,
     extraDrafts: applied.extraDrafts,
@@ -400,7 +446,7 @@ export async function revokePaddleOverageInClerk(
       ...processedAdjustmentIds,
       body.adjustmentId,
     ]),
-    pendingOverageReversals: boundedPendingOverageReversals(replayed.remainingPending),
+    pendingOverageReversals: boundedPendingOverageReversals(remainingPending),
     ...fallbackOverageCredits(ledgerStore, applied.credits),
   };
 
@@ -486,6 +532,37 @@ function storedCreditFromInput(
   });
 }
 
+function overageCreditRepairWindowStart(
+  body: PaddleOverageBody,
+  existingCredits: StoredOverageCredit[],
+  creditTransactions: StoredOverageCreditTransaction[],
+): number {
+  const matchingCredit = existingCredits.find(
+    (credit) => credit.eventId === body.eventId && credit.transactionId === body.transactionId,
+  );
+  if (matchingCredit) return matchingCredit.windowStart;
+  const matchingTransaction = creditTransactions.find(
+    (transaction) =>
+      transaction.eventId === body.eventId && transaction.transactionId === body.transactionId,
+  );
+  if (matchingTransaction) return matchingTransaction.windowStart;
+  return body.eventWindowStart ?? mondayStartUtc(body.now);
+}
+
+function storedOverageCreditTransactionFromCredits(
+  eventId: string,
+  transactionId: string,
+  windowStart: number,
+  credits: StoredOverageCredit[],
+): StoredOverageCreditTransaction {
+  return {
+    eventId,
+    transactionId,
+    windowStart,
+    creditKeys: credits.map(overageCreditKey),
+  };
+}
+
 function pendingOverageReversalFromBody(
   body: PaddleOverageReversalBody,
 ): StoredPendingOverageReversal {
@@ -498,6 +575,21 @@ function pendingOverageReversalFromBody(
     ...(body.hasAdjustmentItems ? { hasAdjustmentItems: true } : {}),
     items: body.items,
   };
+}
+
+function pendingOverageReversalsAfterAppliedAdjustment(
+  pending: StoredPendingOverageReversal[],
+  body: PaddleOverageReversalBody,
+  processed: boolean,
+  credits: StoredOverageCredit[],
+  creditTransactions: StoredOverageCreditTransaction[],
+): StoredPendingOverageReversal[] {
+  if (!processed || !coversFullTransaction(body)) return pending;
+  const transaction = creditTransactions.find(
+    (candidate) => candidate.transactionId === body.transactionId,
+  );
+  if (!transaction || !overageCreditTransactionIncomplete(transaction, credits)) return pending;
+  return boundedPendingOverageReversals([...pending, pendingOverageReversalFromBody(body)]);
 }
 
 function applyAdjustmentToCredits(
@@ -565,6 +657,10 @@ function replayPendingAdjustments(
     for (const candidate of candidates) {
       const applied = applyAdjustmentToCredits(nextCredits, candidate, currentWindowStart);
       if (applied.extraDrafts <= 0 && !applied.processed) {
+        if (adjustmentAlreadyAppliedToAnyCredit(nextCredits, candidate)) {
+          madeProgress = true;
+          continue;
+        }
         deferred.push(candidate);
         continue;
       }
@@ -1128,6 +1224,18 @@ function creditsMissingFromLedger(
   return credits.filter((credit) => !existingKeys.has(overageCreditKey(credit)));
 }
 
+function overageCreditTransactionIncomplete(
+  transaction: StoredOverageCreditTransaction,
+  credits: StoredOverageCredit[],
+): boolean {
+  const storedKeys = new Set(
+    credits
+      .filter((credit) => credit.transactionId === transaction.transactionId)
+      .map(overageCreditKey),
+  );
+  return transaction.creditKeys.some((key) => !storedKeys.has(key));
+}
+
 function overageCreditKey(credit: StoredOverageCredit): string {
   return `${credit.eventId}:${credit.transactionId}:${credit.transactionItemId ?? ""}`;
 }
@@ -1191,6 +1299,25 @@ function boundedProcessedOverageAdjustmentIds(ids: string[]): string[] {
   return [...new Set(ids)].slice(-PROCESSED_OVERAGE_ADJUSTMENT_ID_LIMIT);
 }
 
+function overageCreditTransactions(
+  quota: Record<string, unknown>,
+): StoredOverageCreditTransaction[] {
+  const transactions = Array.isArray(quota.overageCreditTransactions)
+    ? quota.overageCreditTransactions.filter(isStoredOverageCreditTransaction)
+    : [];
+  return boundedOverageCreditTransactions(transactions);
+}
+
+function boundedOverageCreditTransactions(
+  transactions: StoredOverageCreditTransaction[],
+): StoredOverageCreditTransaction[] {
+  const byTransactionId = new Map<string, StoredOverageCreditTransaction>();
+  for (const transaction of transactions) {
+    byTransactionId.set(transaction.transactionId, transaction);
+  }
+  return [...byTransactionId.values()].slice(-PROCESSED_OVERAGE_EVENT_ID_LIMIT);
+}
+
 function pendingOverageReversals(quota: Record<string, unknown>): StoredPendingOverageReversal[] {
   const pending = Array.isArray(quota.pendingOverageReversals) ? quota.pendingOverageReversals : [];
   return boundedPendingOverageReversals(pending.filter(isStoredPendingOverageReversal));
@@ -1203,7 +1330,7 @@ function boundedPendingOverageReversals(
   for (const item of pending) {
     byAdjustmentId.set(item.adjustmentId, item);
   }
-  return [...byAdjustmentId.values()].slice(-PENDING_OVERAGE_REVERSAL_LIMIT);
+  return [...byAdjustmentId.values()];
 }
 
 function isStoredPendingOverageReversal(value: unknown): value is StoredPendingOverageReversal {
@@ -1223,6 +1350,24 @@ function isStoredPendingOverageReversal(value: unknown): value is StoredPendingO
       typeof record.adjustmentType === "string") &&
     (record.hasAdjustmentItems === undefined || typeof record.hasAdjustmentItems === "boolean") &&
     Array.isArray(record.items)
+  );
+}
+
+function isStoredOverageCreditTransaction(value: unknown): value is StoredOverageCreditTransaction {
+  const record = asRecord(value);
+  if (!record) return false;
+  const creditKeys = Array.isArray(record.creditKeys)
+    ? record.creditKeys.filter((key): key is string => typeof key === "string" && key !== "")
+    : [];
+  return (
+    typeof record.eventId === "string" &&
+    record.eventId !== "" &&
+    typeof record.transactionId === "string" &&
+    record.transactionId !== "" &&
+    typeof record.windowStart === "number" &&
+    Number.isFinite(record.windowStart) &&
+    record.windowStart > 0 &&
+    creditKeys.length > 0
   );
 }
 

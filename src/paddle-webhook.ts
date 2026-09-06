@@ -14,7 +14,7 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, type Env } from "./config";
 import { ApiError } from "./errors";
-import { numFrom } from "./metering";
+import { mondayStartUtc, numFrom } from "./metering";
 import {
   paddleCheckoutBindingMatchesCustomData,
   paddleCheckoutBindingMatchesEvent,
@@ -153,6 +153,7 @@ async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): 
     }
     const result = await quotaRecordPaddleOverage(env, userId, {
       now: Date.now(),
+      eventWindowStart: overageEventWindowStart(event),
       eventId: event.eventId,
       transactionId,
       customerId: customerIdFromEvent(event),
@@ -306,4 +307,10 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 /** Acknowledge a verified event. The body carries only a coarse outcome tag. */
 function ack(extra: Record<string, unknown>): Response {
   return Response.json({ ok: true, ...extra });
+}
+
+function overageEventWindowStart(event: PaddleEvent): number | undefined {
+  if (!event.occurredAt) return undefined;
+  const occurredAt = Date.parse(event.occurredAt);
+  return Number.isFinite(occurredAt) ? mondayStartUtc(occurredAt) : undefined;
 }
