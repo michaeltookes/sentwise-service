@@ -11,9 +11,11 @@
 // body.
 
 import { createClerkClient } from "@clerk/backend";
+import { isClerkNotFoundError } from "./auth";
 import { DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC, type Env } from "./config";
 import { ApiError } from "./errors";
 import { numFrom } from "./metering";
+import { paddleCustomerMatchesAccount } from "./paddle-account";
 import { fetchPaddleCustomerEmail } from "./paddle-api";
 import {
   adjustedTransactionIdFromEvent,
@@ -75,6 +77,9 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 
   if (isAdjustmentEvent(event.eventType) && !isApprovedOverageReversal(event)) {
     return ack({ ignored: "adjustment_not_reversal" });
+  }
+  if (event.eventType === "transaction.completed" && overageDraftsFromEvent(event, env) <= 0) {
+    return ack({ ignored: "not_overage" });
   }
 
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
@@ -201,7 +206,21 @@ async function resolveClerkUserId(
   clerk: ReturnType<typeof createClerkClient>,
 ): Promise<string | null> {
   const fromCustomData = clerkUserIdFromEvent(event);
-  if (fromCustomData) return fromCustomData;
+  if (fromCustomData) {
+    const customerId = customerIdFromEvent(event);
+    if (!customerId) return null;
+    let user;
+    try {
+      user = await clerk.users.getUser(fromCustomData);
+    } catch (err) {
+      if (isClerkNotFoundError(err)) return null;
+      throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
+    }
+    const meta = user.privateMetadata ?? {};
+    return (await paddleCustomerMatchesAccount(user, meta, customerId, env))
+      ? fromCustomData
+      : null;
+  }
 
   // Fallback: look the customer's email up in Clerk.
   const customerId = customerIdFromEvent(event);

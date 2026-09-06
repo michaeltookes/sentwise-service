@@ -96,6 +96,7 @@ function subBody(fields: {
   priceId?: string;
   clerkUserId?: string | null;
   customerId?: string;
+  subscriptionId?: string;
   nextBilledAt?: string;
 }): string {
   const custom =
@@ -105,7 +106,7 @@ function subBody(fields: {
     event_type: fields.eventType ?? "subscription.created",
     occurred_at: fields.occurredAt ?? "2026-09-05T10:00:00.000Z",
     data: {
-      id: "sub_123",
+      id: fields.subscriptionId ?? "sub_123",
       status: fields.status ?? "active",
       customer_id: fields.customerId ?? "ctm_123",
       next_billed_at: fields.nextBilledAt ?? "2026-10-05T10:00:00.000Z",
@@ -322,6 +323,66 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     expect(lastWrite()?.subscription).toMatchObject({ plan: "pro", lastEventId: "evt_new" });
   });
 
+  it("skips a newer canceled event from a superseded Paddle subscription", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_current",
+          paddleCustomerId: "ctm_123",
+          lastEventId: "evt_current",
+          updatedAt: "2026-09-05T00:00:00.000Z",
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.canceled",
+        eventId: "evt_old_cancel",
+        subscriptionId: "sub_old",
+        status: "canceled",
+        occurredAt: "2026-09-06T00:00:00.000Z",
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, stale: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("allows a fresh active subscription to replace a different stored subscription", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "starter",
+          status: "canceled",
+          paddleSubscriptionId: "sub_old",
+          paddleCustomerId: "ctm_123",
+          lastEventId: "evt_old",
+          updatedAt: "2026-09-06T00:00:00.000Z",
+        },
+      }),
+    );
+
+    const res = await signedReq(
+      subBody({
+        eventType: "subscription.created",
+        eventId: "evt_new_sub",
+        subscriptionId: "sub_current",
+        status: "active",
+        occurredAt: "2026-09-05T00:00:00.000Z",
+      }),
+    );
+
+    expect((await res.json()) as any).toEqual({ ok: true, applied: true });
+    expect(lastWrite()?.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_current",
+      status: "active",
+      lastEventId: "evt_new_sub",
+    });
+  });
+
   it("serializes overlapping subscription writes before the ordering check", async () => {
     let storedMeta: Record<string, unknown> = {
       subscription: {
@@ -364,7 +425,7 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     );
     await Promise.resolve();
     await Promise.resolve();
-    expect(mocks.getUser).toHaveBeenCalledTimes(1);
+    expect(mocks.updateUserMetadata).toHaveBeenCalledTimes(1);
 
     newWrite.resolve();
     const [, olderRes] = await Promise.all([newer, older]);
@@ -556,7 +617,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     await Promise.resolve();
     await Promise.resolve();
-    expect(mocks.getUser).toHaveBeenCalledTimes(1);
+    expect(mocks.updateUserMetadata).toHaveBeenCalledTimes(1);
 
     firstWrite.resolve();
     await Promise.all([first, second]);
@@ -605,7 +666,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     await Promise.resolve();
     await Promise.resolve();
-    expect(mocks.getUser).toHaveBeenCalledTimes(1);
+    expect(mocks.updateUserMetadata).toHaveBeenCalledTimes(1);
 
     subscriptionWrite.resolve();
     await Promise.all([subscription, overage]);

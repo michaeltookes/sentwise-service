@@ -2,13 +2,15 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { paddleCustomerMatchesAccount } from "./paddle-account";
+import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
 import {
   buildSubscriptionRecord,
   customerIdFromEvent,
   isSubscriptionEvent,
   planFromEvent,
   resolvePlanDraftLimit,
+  statusFromEvent,
+  subscriptionIdFromEvent,
   type PaddleEvent,
 } from "./paddle";
 
@@ -91,8 +93,17 @@ export async function recordPaddleSubscriptionInClerk(
     return { idempotent: true };
   }
 
+  const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
+  const incomingSubscriptionId = subscriptionIdFromEvent(body.event);
+  const isDifferentSubscription =
+    !!existingSubscriptionId &&
+    (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
+  if (isDifferentSubscription && !isPromotableSubscriptionReplacement(body.event)) {
+    return { stale: true };
+  }
+
   const incomingUpdatedAt = body.event.occurredAt ? Date.parse(body.event.occurredAt) : body.now;
-  if (existingSub && typeof existingSub.updatedAt === "string") {
+  if (!isDifferentSubscription && existingSub && typeof existingSub.updatedAt === "string") {
     const existingUpdatedAt = Date.parse(existingSub.updatedAt);
     if (
       !Number.isNaN(existingUpdatedAt) &&
@@ -119,6 +130,14 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   return { applied: true };
+}
+
+function isPromotableSubscriptionReplacement(event: PaddleEvent): boolean {
+  if (event.eventType !== "subscription.created" && event.eventType !== "subscription.activated") {
+    return false;
+  }
+  const status = statusFromEvent(event);
+  return status === "active" || status === "trialing";
 }
 
 function positiveInt(value: unknown): number | null {
