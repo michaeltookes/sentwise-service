@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from "vitest";
 import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { computeHmacSha256Hex } from "../src/paddle";
@@ -55,6 +55,21 @@ const env: Env = {
   PRO_DRAFT_LIMIT: "120",
   UNLIMITED_DRAFT_LIMIT: "100000",
 };
+
+// Freeze the clock to the fixtures' week. The overage-credit fixtures pin
+// occurred_at to 2026-09-05, while assertions derive the expected Monday window
+// from the current clock; without a fixed "now" those agree only during that week
+// (the credit-repair path stamps a historical credit to the event's own week, not
+// the current one), so the suite would drift red every later week. Fake ONLY Date
+// so Durable Object alarm timers keep running on the real clock.
+beforeAll(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-09-05T12:00:00.000Z"));
+});
+
+afterAll(() => {
+  vi.useRealTimers();
+});
 
 beforeEach(async () => {
   vi.unstubAllGlobals();
