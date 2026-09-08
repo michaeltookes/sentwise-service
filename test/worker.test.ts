@@ -1866,7 +1866,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(res.headers.get("Cache-Control")).toBe("no-store");
 
     // PATCHes the subscription with the new price at qty 1 + immediate proration.
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://sandbox-api.paddle.com/subscriptions/sub_123");
     expect(init.method).toBe("PATCH");
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer pdl_apikey");
@@ -1908,7 +1908,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, plan: "starter", status: "active" });
 
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(JSON.parse(init.body as string).proration_billing_mode).toBe("prorated_immediately");
     expect(JSON.parse(init.body as string).items).toEqual([
       { price_id: STARTER_PRICE, quantity: 1 },
