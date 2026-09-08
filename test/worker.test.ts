@@ -1813,6 +1813,227 @@ describe("POST /v1/paddle/checkout", () => {
   });
 });
 
+describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
+  const paddleEnv: Env = {
+    ...env,
+    PADDLE_API_KEY: "pdl_apikey",
+    PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+  };
+
+  function changePlanReq(priceId: unknown): Request {
+    return req("/v1/paddle/change-plan", {
+      method: "POST",
+      headers: bearer(),
+      body: JSON.stringify({ priceId }),
+    });
+  }
+
+  function paddleSubscriptionOk(priceId: string, status = "active") {
+    return new Response(
+      JSON.stringify({ data: { status, items: [{ price: { id: priceId } }] } }),
+      { status: 200 },
+    );
+  }
+
+  function lastMetadataWrite(): any {
+    const calls = mocks.updateUserMetadata.mock.calls;
+    return calls[calls.length - 1][1];
+  }
+
+  it("upgrades an active subscription to a higher tier with immediate proration", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "starter",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          priceId: STARTER_PRICE,
+          paddleCustomerId: "ctm_1",
+          lastEventId: "evt_old",
+          paddleOccurredAt: "2024-01-01T00:00:00.000000Z",
+        },
+        quota: { weeklyDraftLimit: 30 },
+      }),
+    );
+    mocks.updateUserMetadata.mockResolvedValue({});
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, plan: "pro", status: "active" });
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+
+    // PATCHes the subscription with the new price at qty 1 + immediate proration.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://sandbox-api.paddle.com/subscriptions/sub_123");
+    expect(init.method).toBe("PATCH");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer pdl_apikey");
+    expect(JSON.parse(init.body as string)).toEqual({
+      proration_billing_mode: "prorated_immediately",
+      items: [{ price_id: PRO_PRICE, quantity: 1 }],
+    });
+
+    // Optimistic entitlement write: new plan/price + PRO weekly limit, preserving
+    // reconciliation/idempotency fields for the subscription.updated webhook.
+    const write = lastMetadataWrite();
+    expect(write.privateMetadata.subscription.plan).toBe("pro");
+    expect(write.privateMetadata.subscription.priceId).toBe(PRO_PRICE);
+    expect(write.privateMetadata.subscription.lastEventId).toBe("evt_old");
+    expect(write.privateMetadata.subscription.paddleSubscriptionId).toBe("sub_123");
+    expect(write.privateMetadata.subscription.paddleOccurredAt).toBe(
+      "2024-01-01T00:00:00.000000Z",
+    );
+    expect(write.privateMetadata.quota.weeklyDraftLimit).toBe(120);
+  });
+
+  it("downgrades an active subscription to a lower tier with immediate proration", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          priceId: PRO_PRICE,
+        },
+        quota: { weeklyDraftLimit: 120 },
+      }),
+    );
+    mocks.updateUserMetadata.mockResolvedValue({});
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(STARTER_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(STARTER_PRICE), paddleEnv);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, plan: "starter", status: "active" });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).proration_billing_mode).toBe("prorated_immediately");
+    expect(JSON.parse(init.body as string).items).toEqual([
+      { price_id: STARTER_PRICE, quantity: 1 },
+    ]);
+
+    const write = lastMetadataWrite();
+    expect(write.privateMetadata.subscription.plan).toBe("starter");
+    expect(write.privateMetadata.quota.weeklyDraftLimit).toBe(30);
+  });
+
+  it("rejects an unknown price without touching Clerk or Paddle", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq("pri_unknown"), paddleEnv);
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing price id", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/change-plan", { method: "POST", headers: bearer(), body: "{}" }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects switching to the plan already active (same price) as a no-op", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          priceId: PRO_PRICE,
+        },
+      }),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.type).toBe("invalid_request");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("404s when the account has no Paddle subscription id", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({ subscription: { plan: "trial", status: "trialing" } }),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_not_found");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 502 when the Paddle plan change fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "starter",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          priceId: STARTER_PRICE,
+        },
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("server error", { status: 500 }))),
+    );
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("subscription_change_failed");
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("503s when Paddle is not configured (no API key)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), {
+      ...env,
+      PADDLE_API_KEY: undefined,
+    });
+
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as any).error.type).toBe("checkout_unavailable");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("405s a GET to the change-plan route", async () => {
+    const res = await worker.fetch(req("/v1/paddle/change-plan", { method: "GET" }), paddleEnv);
+    expect(res.status).toBe(405);
+  });
+});
+
 describe("DELETE /v1/me (73 — account deletion)", () => {
   const deletePaddleEnv: Env = {
     ...env,
