@@ -1851,6 +1851,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
           priceId: STARTER_PRICE,
           paddleCustomerId: "ctm_1",
           lastEventId: "evt_old",
+          updatedAt: "2024-01-01T00:00:00.000Z",
           paddleOccurredAt: "2024-01-01T00:00:00.000000Z",
         },
         quota: { weeklyDraftLimit: 30 },
@@ -1883,6 +1884,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(write.privateMetadata.subscription.priceId).toBe(PRO_PRICE);
     expect(write.privateMetadata.subscription.lastEventId).toBe("evt_old");
     expect(write.privateMetadata.subscription.paddleSubscriptionId).toBe("sub_123");
+    expect(write.privateMetadata.subscription.updatedAt).toBe("2024-01-01T00:00:00.000Z");
     expect(write.privateMetadata.subscription.paddleOccurredAt).toBe("2024-01-01T00:00:00.000000Z");
     expect(write.privateMetadata.quota.weeklyDraftLimit).toBe(120);
   });
@@ -1902,6 +1904,8 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
                   paddleSubscriptionId: "sub_123",
                   priceId: STARTER_PRICE,
                   lastEventId: "evt_old",
+                  updatedAt: "2026-09-08T17:00:00.000Z",
+                  paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
                 },
                 quota: { weeklyDraftLimit: 30, extraDrafts: 1 },
               }
@@ -1911,8 +1915,9 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
                   status: "active",
                   paddleSubscriptionId: "sub_123",
                   priceId: STARTER_PRICE,
-                  lastEventId: "evt_webhook",
-                  paddleOccurredAt: "2026-09-08T17:20:00.000000Z",
+                  lastEventId: "evt_old",
+                  updatedAt: "2026-09-08T17:00:00.000Z",
+                  paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
                 },
                 quota: {
                   weeklyDraftLimit: 30,
@@ -1936,8 +1941,9 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(write.privateMetadata.subscription).toMatchObject({
       plan: "pro",
       priceId: PRO_PRICE,
-      lastEventId: "evt_webhook",
-      paddleOccurredAt: "2026-09-08T17:20:00.000000Z",
+      lastEventId: "evt_old",
+      updatedAt: "2026-09-08T17:00:00.000Z",
+      paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
     });
     expect(write.privateMetadata.quota).toMatchObject({
       weeklyDraftLimit: 120,
@@ -2026,6 +2032,51 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(((await res.json()) as any).error.type).toBe("billing_subscription_changed");
     expect(fetchMock).toHaveBeenCalledWith(
       "https://sandbox-api.paddle.com/subscriptions/sub_old",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite the same previous price when the stored subscription version changed", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "starter",
+            status: "active",
+            paddleSubscriptionId: "sub_123",
+            priceId: STARTER_PRICE,
+            lastEventId: "evt_old",
+            updatedAt: "2026-09-08T17:00:00.000Z",
+            paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
+          },
+          quota: { weeklyDraftLimit: 30 },
+        }),
+      )
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "starter",
+            status: "active",
+            paddleSubscriptionId: "sub_123",
+            priceId: STARTER_PRICE,
+            lastEventId: "evt_newer",
+            updatedAt: "2026-09-08T17:30:00.000Z",
+            paddleOccurredAt: "2026-09-08T17:30:00.000000Z",
+          },
+          quota: { weeklyDraftLimit: 30 },
+        }),
+      );
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_changed");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_123",
       expect.objectContaining({ method: "PATCH" }),
     );
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
@@ -2187,6 +2238,52 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
       "fetch",
       vi.fn(() => Promise.resolve(new Response("server error", { status: 500 }))),
     );
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("subscription_change_failed");
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Paddle plan change response with the wrong recurring price", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "starter",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          priceId: STARTER_PRICE,
+        },
+      }),
+    );
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(STARTER_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error.type).toBe("subscription_change_failed");
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Paddle plan change response without a recurring price", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "starter",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          priceId: STARTER_PRICE,
+        },
+      }),
+    );
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(new Response(JSON.stringify({ data: { status: "active", items: [] } }))),
+    );
+    vi.stubGlobal("fetch", fetchMock);
 
     const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
 

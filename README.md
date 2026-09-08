@@ -407,14 +407,17 @@ Behavior:
   single immediate mode keeps this endpoint's optimistic entitlement write and the
   `subscription.updated` webhook's reconciliation in agreement, avoiding a "takes effect next period"
   state where the stored weekly limit would disagree with the tier actually being paid for.
+- Confirms Paddle's successful response reports the requested recurring price before granting the
+  optimistic entitlement; missing or mismatched returned items fail as `502 subscription_change_failed`.
 - Queues the optimistic entitlement write through the account Durable Object, re-reading the latest
   Clerk metadata there before bumping the stored `subscription` record's `plan`/`priceId` and the
   active paid tier's `privateMetadata.quota.weeklyDraftLimit`. The queued write is skipped if the
-  latest Clerk subscription no longer has the initially observed price, unless it already has the
-  requested target price. Every reconciliation/idempotency field (`lastEventId`, `paddleOccurredAt`,
-  `paddleSubscriptionId`, `paddleCustomerId`, superseded ids) is preserved; the
-  `subscription.updated` webhook Paddle fires for this change carries a newer `occurredAt` and
-  reconciles authoritatively. The two paths are serialized, consistent, and idempotent.
+  latest Clerk subscription no longer has the initially observed price and ordering timestamp,
+  unless it already has the requested target price. Every reconciliation/idempotency field
+  (`updatedAt`, `lastEventId`, `paddleOccurredAt`, `paddleSubscriptionId`, `paddleCustomerId`,
+  superseded ids) is preserved; the `subscription.updated` webhook Paddle fires for this change
+  carries a newer `occurredAt` and reconciles authoritatively. The two paths are serialized,
+  consistent, and idempotent.
 
 Returns **`200`** with `Cache-Control: no-store` and:
 

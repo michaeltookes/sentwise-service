@@ -61,16 +61,21 @@ export async function handlePaddleChangePlan(
   if (currentPriceId && currentPriceId === priceId) {
     throw new ApiError(400, "invalid_request", "You're already on that plan.");
   }
+  const currentOrderTimestamp = storedSubscriptionOrderTimestamp(account.subscription);
 
   const result = await changePaddleSubscription(env, subscriptionId, {
     priceId,
     prorationBillingMode: PLAN_CHANGE_PRORATION_BILLING_MODE,
   });
+  if (result.priceId !== priceId) {
+    throw new ApiError(502, "subscription_change_failed", "Could not change your plan.");
+  }
 
   const entitlement = await recordChangedPlanEntitlement(
     userId,
     subscriptionId,
     currentPriceId,
+    currentOrderTimestamp,
     targetPlan,
     priceId,
     env,
@@ -135,6 +140,7 @@ async function recordChangedPlanEntitlement(
   userId: string,
   subscriptionId: string,
   previousPriceId: string | null,
+  previousOrderTimestamp: string | null,
   plan: PaidPlan,
   priceId: string,
   env: Env,
@@ -142,6 +148,7 @@ async function recordChangedPlanEntitlement(
   return quotaRecordPaddlePlanChange(env, userId, {
     subscriptionId,
     previousPriceId,
+    previousOrderTimestamp,
     plan,
     priceId,
   });
@@ -155,6 +162,14 @@ function storedSubscriptionPriceId(rawSubscription: unknown): string | null {
 function storedSubscriptionStatus(rawSubscription: unknown): string | null {
   const status = asRecord(rawSubscription)?.status;
   return typeof status === "string" && status !== "" ? status : null;
+}
+
+function storedSubscriptionOrderTimestamp(rawSubscription: unknown): string | null {
+  const subscription = asRecord(rawSubscription);
+  const paddleOccurredAt = subscription?.paddleOccurredAt;
+  if (typeof paddleOccurredAt === "string" && paddleOccurredAt !== "") return paddleOccurredAt;
+  const updatedAt = subscription?.updatedAt;
+  return typeof updatedAt === "string" && updatedAt !== "" ? updatedAt : null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

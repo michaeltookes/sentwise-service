@@ -19,7 +19,8 @@
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /interest { topic } -> serialize Clerk interest metadata writes per user
 //   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
-//   POST /paddle-plan-change { subscriptionId, previousPriceId, plan, priceId } -> serialize in-app plan-change entitlement writes
+//   POST /paddle-plan-change { subscriptionId, previousPriceId, previousOrderTimestamp, plan, priceId }
+//     -> serialize in-app plan-change entitlement writes
 //   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts, credits } -> serialize Paddle overage entitlement writes
 //   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, hasAdjustmentItems, items } -> revoke/restore overage credit
 //   POST /paddle-subscription-checkout-reserve { now, reservationId, priceId, quantity } -> reserve one pending subscription checkout

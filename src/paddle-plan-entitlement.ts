@@ -8,6 +8,7 @@ import { storedPaddleSubscriptionId } from "./paddle-account";
 export interface PaddlePlanChangeEntitlementBody {
   subscriptionId: string;
   previousPriceId: string | null;
+  previousOrderTimestamp: string | null;
   plan: PaidPlan;
   priceId: string;
 }
@@ -21,6 +22,7 @@ export function parsePaddlePlanChangeEntitlementBody(
   const record = asRecord(body);
   const subscriptionId = record?.subscriptionId;
   const previousPriceId = record?.previousPriceId;
+  const previousOrderTimestamp = record?.previousOrderTimestamp;
   const plan = record?.plan;
   const priceId = record?.priceId;
   if (
@@ -28,6 +30,7 @@ export function parsePaddlePlanChangeEntitlementBody(
     typeof subscriptionId !== "string" ||
     subscriptionId === "" ||
     !isNullablePriceId(previousPriceId) ||
+    !isNullableNonEmptyString(previousOrderTimestamp) ||
     !isPaidPlan(plan) ||
     typeof priceId !== "string" ||
     priceId === "" ||
@@ -35,7 +38,7 @@ export function parsePaddlePlanChangeEntitlementBody(
   ) {
     throw new ApiError(400, "invalid_request", "Invalid plan-change entitlement.");
   }
-  return { subscriptionId, previousPriceId, plan, priceId };
+  return { subscriptionId, previousPriceId, previousOrderTimestamp, plan, priceId };
 }
 
 /**
@@ -72,7 +75,11 @@ export async function recordPaddlePlanChangeInClerk(
     return { stale: true, status };
   }
   const latestPriceId = storedSubscriptionPriceId(existingSub);
-  if (latestPriceId !== body.previousPriceId && latestPriceId !== body.priceId) {
+  const latestOrderTimestamp = storedSubscriptionOrderTimestamp(existingSub);
+  const isAlreadyTarget = latestPriceId === body.priceId;
+  const isStillObservedVersion =
+    latestPriceId === body.previousPriceId && latestOrderTimestamp === body.previousOrderTimestamp;
+  if (!isAlreadyTarget && !isStillObservedVersion) {
     return { stale: true, status };
   }
 
@@ -80,7 +87,6 @@ export async function recordPaddlePlanChangeInClerk(
     ...existingSub,
     plan: body.plan,
     priceId: body.priceId,
-    updatedAt: new Date().toISOString(),
   };
   const quota = quotaForLatestSubscriptionStatus(
     asRecord(meta.quota) ?? {},
@@ -128,7 +134,18 @@ function storedSubscriptionPriceId(rawSubscription: Record<string, unknown>): st
   return typeof priceId === "string" && priceId !== "" ? priceId : null;
 }
 
+function storedSubscriptionOrderTimestamp(rawSubscription: Record<string, unknown>): string | null {
+  const paddleOccurredAt = rawSubscription.paddleOccurredAt;
+  if (typeof paddleOccurredAt === "string" && paddleOccurredAt !== "") return paddleOccurredAt;
+  const updatedAt = rawSubscription.updatedAt;
+  return typeof updatedAt === "string" && updatedAt !== "" ? updatedAt : null;
+}
+
 function isNullablePriceId(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && value !== "");
+}
+
+function isNullableNonEmptyString(value: unknown): value is string | null {
   return value === null || (typeof value === "string" && value !== "");
 }
 
