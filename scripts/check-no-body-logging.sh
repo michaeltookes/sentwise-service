@@ -4,7 +4,8 @@
 # This backstops the "nothing logged" claim; run in CI. The check is a recursive
 # scan of the whole src/ tree, so it automatically covers the 56b metering
 # modules (metering.ts, quota-do.ts, quota-client.ts, analytics.ts, admin.ts) and
-# the 56c checkout/licensing modules (paddle.ts, paddle-webhook.ts) — none of
+# the 56c checkout/licensing modules (paddle.ts, paddle-webhook.ts) and the item-90
+# plan-management modules (paddle-plan.ts, paddle-management.ts) — none of
 # which may log content either (they handle only counters, ids, and billing
 # metadata; the webhook must never log the raw request body).
 set -euo pipefail

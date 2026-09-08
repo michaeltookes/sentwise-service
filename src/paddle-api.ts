@@ -240,6 +240,67 @@ export async function fetchPaddleManagementUrl(
   }
 }
 
+export interface PaddleSubscriptionChangeResult {
+  status: string | null;
+  priceId: string | null;
+}
+
+/**
+ * PATCH Paddle `/subscriptions/{id}` to switch the recurring item to a new price
+ * (quantity 1) with proration. Used by the in-app plan-change endpoint (item 90).
+ * Replaces the subscription's items list wholesale, so any prior recurring item
+ * is dropped in favour of the single target price. Returns the resulting Paddle
+ * status and the new recurring price id for the response + optimistic entitlement
+ * write; the `subscription.updated` webhook reconciles authoritatively afterwards.
+ */
+export async function changePaddleSubscription(
+  env: Env,
+  subscriptionId: string,
+  input: { priceId: string; prorationBillingMode: string },
+): Promise<PaddleSubscriptionChangeResult> {
+  const apiKey = requirePaddleApiKey(
+    "subscription_change_failed",
+    "Could not change your plan.",
+    env,
+  );
+  try {
+    const res = await fetch(
+      `${paddleApiBase(env)}/subscriptions/${encodeURIComponent(subscriptionId)}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          proration_billing_mode: input.prorationBillingMode,
+          items: [{ price_id: input.priceId, quantity: 1 }],
+        }),
+      },
+    );
+    if (res.status === 404) {
+      throw new ApiError(
+        404,
+        "billing_subscription_not_found",
+        "No active Paddle subscription was found.",
+      );
+    }
+    if (!res.ok) {
+      throw new ApiError(502, "subscription_change_failed", "Could not change your plan.");
+    }
+    const body: unknown = await res.json();
+    const data = asRecord(asRecord(body)?.data);
+    const status = data?.status;
+    return {
+      status: typeof status === "string" && status !== "" ? status : null,
+      priceId: firstSubscriptionItemPriceId(data),
+    };
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(502, "subscription_change_failed", "Could not change your plan.");
+  }
+}
+
 export async function fetchPaddleTransactionSnapshot(
   env: Env,
   transactionId: string,
@@ -354,6 +415,16 @@ function parsePaddleTransactionSnapshot(
     checkoutUrl: validHttpsUrl(data ? asRecord(data.checkout)?.url : undefined),
     items: parseTransactionItems(data?.items),
   };
+}
+
+function firstSubscriptionItemPriceId(data: Record<string, unknown> | null): string | null {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  for (const item of items) {
+    const price = asRecord(asRecord(item)?.price);
+    const id = price?.id ?? asRecord(item)?.price_id;
+    if (typeof id === "string" && id !== "") return id;
+  }
+  return null;
 }
 
 function validHttpsUrl(v: unknown): string | null {
