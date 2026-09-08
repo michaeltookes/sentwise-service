@@ -407,12 +407,13 @@ Behavior:
   single immediate mode keeps this endpoint's optimistic entitlement write and the
   `subscription.updated` webhook's reconciliation in agreement, avoiding a "takes effect next period"
   state where the stored weekly limit would disagree with the tier actually being paid for.
-- Writes the new tier's weekly draft limit into `privateMetadata.quota.weeklyDraftLimit` (via the same
-  `resolvePlanDraftLimit` the webhook uses) so 56b enforcement uses it immediately, and bumps the
-  stored `subscription` record's `plan`/`priceId`. Every reconciliation/idempotency field
+- Queues the optimistic entitlement write through the account Durable Object, re-reading the latest
+  Clerk metadata there before bumping the stored `subscription` record's `plan`/`priceId` and the
+  active paid tier's `privateMetadata.quota.weeklyDraftLimit`. Every reconciliation/idempotency field
   (`lastEventId`, `paddleOccurredAt`, `paddleSubscriptionId`, `paddleCustomerId`, superseded ids) is
   preserved; the `subscription.updated` webhook Paddle fires for this change carries a newer
-  `occurredAt` and reconciles authoritatively. The two paths are consistent and idempotent.
+  `occurredAt` and reconciles authoritatively. The two paths are serialized, consistent, and
+  idempotent.
 
 Returns **`200`** with `Cache-Control: no-store` and:
 
@@ -498,9 +499,10 @@ so later Paddle adjustments can still find older overage transactions without gr
 ledger for the refundable lifetime of the credit, so an old adjustment replay is still idempotent
 after the small processed-id ring buffer has rotated.
 
-**Idempotency & ordering.** Subscription and overage entitlement writes run through the per-user
-Durable Object so overlapping events for one account are serialized before Clerk metadata is read and
-updated. Subscription writes are skipped when the incoming `event_id` equals the stored `lastEventId`,
+**Idempotency & ordering.** Subscription, in-app plan-change, and overage entitlement writes run
+through the per-user Durable Object so overlapping updates for one account are serialized before
+Clerk metadata is read and updated. Subscription writes are skipped when the incoming `event_id`
+equals the stored `lastEventId`,
 when a strictly older `occurred_at` would clobber a newer stored record, or when a different
 subscription id is already known as superseded. A different subscription may replace the stored one
 only with a signed checkout binding and a live Paddle subscription lookup confirming the event's

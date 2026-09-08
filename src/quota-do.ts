@@ -19,6 +19,7 @@
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /interest { topic } -> serialize Clerk interest metadata writes per user
 //   POST /paddle-subscription { now, event } -> serialize Paddle subscription entitlement writes
+//   POST /paddle-plan-change { subscriptionId, plan, priceId } -> serialize in-app plan-change entitlement writes
 //   POST /paddle-overage { now, eventId, transactionId, customerId, extraDrafts, credits } -> serialize Paddle overage entitlement writes
 //   POST /paddle-overage-reversal { now, eventId, adjustmentId, transactionId, customerId, action, adjustmentType, hasAdjustmentItems, items } -> revoke/restore overage credit
 //   POST /paddle-subscription-checkout-reserve { now, reservationId, priceId, quantity } -> reserve one pending subscription checkout
@@ -58,6 +59,10 @@ import {
   parsePaddleSubscriptionBody,
   recordPaddleSubscriptionInClerk,
 } from "./paddle-subscription-entitlement";
+import {
+  parsePaddlePlanChangeEntitlementBody,
+  recordPaddlePlanChangeInClerk,
+} from "./paddle-plan-entitlement";
 import { cancelPaddleTransaction } from "./paddle-api";
 import {
   activeReservations,
@@ -225,6 +230,8 @@ export class AccountQuota {
         return this.handleInterest(await request.json<unknown>());
       case "/paddle-subscription":
         return this.handlePaddleSubscription(await request.json<unknown>());
+      case "/paddle-plan-change":
+        return this.handlePaddlePlanChange(await request.json<unknown>());
       case "/paddle-overage":
         return this.handlePaddleOverage(await request.json<unknown>());
       case "/paddle-overage-reversal":
@@ -539,6 +546,20 @@ export class AccountQuota {
           await this.cancelPaddleOverageCheckoutReservation();
         }
       }
+      return Response.json(result);
+    } catch (err) {
+      if (err instanceof ApiError) return err.toResponse();
+      throw err;
+    }
+  }
+
+  private async handlePaddlePlanChange(body: unknown): Promise<Response> {
+    try {
+      const parsed = parsePaddlePlanChangeEntitlementBody(body);
+      const userId = this.requireUserId();
+      const result = await this.enqueuePrivateMetadataWrite(() =>
+        recordPaddlePlanChangeInClerk(userId, parsed, this.env),
+      );
       return Response.json(result);
     } catch (err) {
       if (err instanceof ApiError) return err.toResponse();

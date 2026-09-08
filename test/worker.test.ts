@@ -1886,6 +1886,150 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(write.privateMetadata.quota.weeklyDraftLimit).toBe(120);
   });
 
+  it("re-reads metadata inside the serialized entitlement write", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    let reads = 0;
+    mocks.getUser.mockImplementation(() => {
+      reads += 1;
+      return Promise.resolve(
+        userWith(
+          reads === 1
+            ? {
+                subscription: {
+                  plan: "starter",
+                  status: "active",
+                  paddleSubscriptionId: "sub_123",
+                  priceId: STARTER_PRICE,
+                  lastEventId: "evt_old",
+                },
+                quota: { weeklyDraftLimit: 30, extraDrafts: 1 },
+              }
+            : {
+                subscription: {
+                  plan: "starter",
+                  status: "active",
+                  paddleSubscriptionId: "sub_123",
+                  priceId: STARTER_PRICE,
+                  lastEventId: "evt_webhook",
+                  paddleOccurredAt: "2026-09-08T17:20:00.000000Z",
+                },
+                quota: {
+                  weeklyDraftLimit: 30,
+                  extraDrafts: 5,
+                  extraDraftsWindowStart: MON,
+                  lastOverageEventId: "evt_overage",
+                },
+              },
+        ),
+      );
+    });
+    mocks.updateUserMetadata.mockResolvedValue({});
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+    const write = lastMetadataWrite();
+    expect(write.privateMetadata.subscription).toMatchObject({
+      plan: "pro",
+      priceId: PRO_PRICE,
+      lastEventId: "evt_webhook",
+      paddleOccurredAt: "2026-09-08T17:20:00.000000Z",
+    });
+    expect(write.privateMetadata.quota).toMatchObject({
+      weeklyDraftLimit: 120,
+      extraDrafts: 5,
+      extraDraftsWindowStart: MON,
+      lastOverageEventId: "evt_overage",
+    });
+  });
+
+  it("keeps a concurrently canceled subscription's paid quota revoked", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "starter",
+            status: "active",
+            paddleSubscriptionId: "sub_123",
+            priceId: STARTER_PRICE,
+          },
+          quota: { weeklyDraftLimit: 30 },
+        }),
+      )
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "starter",
+            status: "canceled",
+            paddleSubscriptionId: "sub_123",
+            priceId: STARTER_PRICE,
+          },
+          quota: { weeklyDraftLimit: null, extraDrafts: 0 },
+        }),
+      );
+    mocks.updateUserMetadata.mockResolvedValue({});
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, plan: "pro", status: "canceled" });
+    const write = lastMetadataWrite();
+    expect(write.privateMetadata.subscription).toMatchObject({
+      plan: "pro",
+      priceId: PRO_PRICE,
+      status: "canceled",
+    });
+    expect(write.privateMetadata.quota).toMatchObject({
+      weeklyDraftLimit: null,
+      extraDrafts: 0,
+    });
+  });
+
+  it("does not write when the latest stored subscription changed", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "starter",
+            status: "active",
+            paddleSubscriptionId: "sub_old",
+            priceId: STARTER_PRICE,
+          },
+          quota: { weeklyDraftLimit: 30 },
+        }),
+      )
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "starter",
+            status: "active",
+            paddleSubscriptionId: "sub_new",
+            priceId: STARTER_PRICE,
+          },
+          quota: { weeklyDraftLimit: 30 },
+        }),
+      );
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_changed");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_old",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
   it("downgrades an active subscription to a lower tier with immediate proration", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(

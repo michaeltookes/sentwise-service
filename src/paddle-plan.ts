@@ -2,15 +2,18 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { PRICE_TO_PLAN, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
-import { resolvePlanDraftLimit } from "./paddle";
 import { storedPaddleSubscriptionId } from "./paddle-account";
-import { changePaddleSubscription, type PaddleSubscriptionChangeResult } from "./paddle-api";
+import { changePaddleSubscription } from "./paddle-api";
+import {
+  quotaRecordPaddlePlanChange,
+  type PaddlePlanChangeEntitlementResult,
+} from "./quota-client";
 
 // In-app plan change (item 90). Upgrades/downgrades an active Paddle subscription
-// to a different paid tier with proration, then writes the new tier's weekly draft
-// limit into the account so 56b enforcement uses it immediately. The
-// `subscription.updated` webhook fires in parallel and reconciles authoritatively;
-// the two paths are kept consistent + idempotent (see recordChangedPlanEntitlement).
+// to a different paid tier with proration, then queues an optimistic entitlement
+// update so 56b enforcement uses it immediately. The `subscription.updated`
+// webhook fires in parallel and reconciles authoritatively; the two paths are
+// serialized, consistent, and idempotent.
 //
 // PRORATION: both upgrades and downgrades use `prorated_immediately`. A single
 // immediate mode keeps this endpoint's optimistic quota write and the webhook's
@@ -64,12 +67,29 @@ export async function handlePaddleChangePlan(
     prorationBillingMode: PLAN_CHANGE_PRORATION_BILLING_MODE,
   });
 
-  await recordChangedPlanEntitlement(clerk, userId, account, targetPlan, priceId, result, env);
+  const entitlement = await recordChangedPlanEntitlement(
+    userId,
+    subscriptionId,
+    targetPlan,
+    priceId,
+    env,
+  );
+  if ("stale" in entitlement) {
+    throw new ApiError(
+      409,
+      "billing_subscription_changed",
+      "Your subscription changed while updating your plan. Refresh and try again.",
+    );
+  }
 
   const res = Response.json({
     ok: true,
     plan: targetPlan,
-    status: result.status ?? storedSubscriptionStatus(account.subscription) ?? "active",
+    status:
+      entitlement.status ??
+      result.status ??
+      storedSubscriptionStatus(account.subscription) ??
+      "active",
   });
   res.headers.set("Cache-Control", "no-store");
   return res;
@@ -93,11 +113,11 @@ async function parseChangePlanRequest(request: Request): Promise<string> {
 async function loadChangePlanAccount(
   clerk: ReturnType<typeof createClerkClient>,
   userId: string,
-): Promise<{ subscription: unknown; quota: unknown }> {
+): Promise<{ subscription: unknown }> {
   try {
     const user = await clerk.users.getUser(userId);
     const meta = asRecord(user.privateMetadata) ?? {};
-    return { subscription: meta.subscription, quota: meta.quota };
+    return { subscription: meta.subscription };
   } catch (err) {
     if (isClerkNotFoundError(err)) {
       throw new ApiError(404, "account_not_found", "Your account could not be found.");
@@ -110,50 +130,18 @@ async function loadChangePlanAccount(
   }
 }
 
-/**
- * Optimistically bump the stored subscription record's plan/priceId and the
- * account's weekly draft limit to the new tier, preserving every reconciliation +
- * idempotency field (`lastEventId`, `paddleOccurredAt`, `paddleSubscriptionId`,
- * `paddleCustomerId`, superseded ids). The subscription.updated webhook that
- * Paddle fires for this change carries a newer `occurredAt` than what we leave in
- * place, so it always wins the order check and reconciles — never treating our
- * write as stale, never double-applying. Status is left untouched (a plan change
- * does not change subscription status; the webhook owns status transitions) so a
- * raw Paddle status outside our enum can't poison the stored record.
- */
 async function recordChangedPlanEntitlement(
-  clerk: ReturnType<typeof createClerkClient>,
   userId: string,
-  account: { subscription: unknown; quota: unknown },
+  subscriptionId: string,
   plan: PaidPlan,
   priceId: string,
-  _result: PaddleSubscriptionChangeResult,
   env: Env,
-): Promise<void> {
-  const existingSub = asRecord(account.subscription) ?? {};
-  const existingQuota = asRecord(account.quota) ?? {};
-
-  const subscription = {
-    ...existingSub,
+): Promise<PaddlePlanChangeEntitlementResult> {
+  return quotaRecordPaddlePlanChange(env, userId, {
+    subscriptionId,
     plan,
     priceId,
-    updatedAt: new Date().toISOString(),
-  };
-  const quota = {
-    ...existingQuota,
-    weeklyDraftLimit: resolvePlanDraftLimit(env, plan),
-  };
-
-  try {
-    await clerk.users.updateUserMetadata(userId, {
-      privateMetadata: { subscription, quota },
-    });
-  } catch (err) {
-    if (isClerkNotFoundError(err)) {
-      throw new ApiError(404, "account_not_found", "Your account could not be found.");
-    }
-    throw new ApiError(502, "entitlement_write_failed", "Could not update your plan.");
-  }
+  });
 }
 
 function storedSubscriptionPriceId(rawSubscription: unknown): string | null {

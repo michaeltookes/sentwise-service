@@ -1,7 +1,7 @@
 // Thin client the request handler uses to talk to the AccountQuota Durable
 // Object (56b). Keeps the DO-plumbing out of src/index.ts.
 
-import type { Env } from "./config";
+import type { Env, PaidPlan } from "./config";
 import { ApiError, type ErrorExtra } from "./errors";
 import type { ResolvedLimits, WindowState } from "./metering";
 import type { InterestTopic } from "./interest";
@@ -67,6 +67,8 @@ export type PaddleSubscriptionResult =
   | { stale: true }
   | { ignored: "unknown_price" }
   | { mapped: false };
+export type PaddlePlanChangeEntitlementResult =
+  { applied: true; status: string | null } | { stale: true; status: string | null };
 export type PaddleSubscriptionCheckoutReservationResult =
   | { reserved: true; reservationId: string }
   | {
@@ -249,6 +251,15 @@ export function quotaRecordPaddleSubscription(
   body: { now: number; event: PaddleEvent },
 ): Promise<PaddleSubscriptionResult> {
   return call<PaddleSubscriptionResult>(env, userId, "/paddle-subscription", body);
+}
+
+/** Serialize and record an in-app Paddle plan-change entitlement. */
+export function quotaRecordPaddlePlanChange(
+  env: Env,
+  userId: string,
+  body: { subscriptionId: string; plan: PaidPlan; priceId: string },
+): Promise<PaddlePlanChangeEntitlementResult> {
+  return call<PaddlePlanChangeEntitlementResult>(env, userId, "/paddle-plan-change", body);
 }
 
 /** Reserve a per-account subscription checkout slot before creating it in Paddle. */
