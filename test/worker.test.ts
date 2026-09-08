@@ -41,6 +41,7 @@ const env: Env = {
 
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
+const UNLIMITED_PRICE = "pri_01m1syrdg05f49kz705gbzn6tz";
 const OVERAGE_PRICE = "pri_overage";
 const PADDLE_SECRET = "pdl_ntfset_testsecret";
 const ACCOUNT_DELETION_KEY = "account_deletion";
@@ -2025,6 +2026,47 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(((await res.json()) as any).error.type).toBe("billing_subscription_changed");
     expect(fetchMock).toHaveBeenCalledWith(
       "https://sandbox-api.paddle.com/subscriptions/sub_old",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a newer plan on the same subscription", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "starter",
+            status: "active",
+            paddleSubscriptionId: "sub_123",
+            priceId: STARTER_PRICE,
+          },
+          quota: { weeklyDraftLimit: 30 },
+        }),
+      )
+      .mockResolvedValueOnce(
+        userWith({
+          subscription: {
+            plan: "unlimited",
+            status: "active",
+            paddleSubscriptionId: "sub_123",
+            priceId: UNLIMITED_PRICE,
+            lastEventId: "evt_newer",
+            paddleOccurredAt: "2026-09-08T17:30:00.000000Z",
+          },
+          quota: { weeklyDraftLimit: 100000 },
+        }),
+      );
+    const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(changePlanReq(PRO_PRICE), paddleEnv);
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_changed");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_123",
       expect.objectContaining({ method: "PATCH" }),
     );
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();

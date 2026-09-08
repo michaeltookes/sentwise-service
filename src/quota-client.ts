@@ -257,7 +257,7 @@ export function quotaRecordPaddleSubscription(
 export function quotaRecordPaddlePlanChange(
   env: Env,
   userId: string,
-  body: { subscriptionId: string; plan: PaidPlan; priceId: string },
+  body: { subscriptionId: string; previousPriceId: string | null; plan: PaidPlan; priceId: string },
 ): Promise<PaddlePlanChangeEntitlementResult> {
   return call<PaddlePlanChangeEntitlementResult>(env, userId, "/paddle-plan-change", body);
 }

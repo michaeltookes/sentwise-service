@@ -7,6 +7,7 @@ import { storedPaddleSubscriptionId } from "./paddle-account";
 
 export interface PaddlePlanChangeEntitlementBody {
   subscriptionId: string;
+  previousPriceId: string | null;
   plan: PaidPlan;
   priceId: string;
 }
@@ -19,12 +20,14 @@ export function parsePaddlePlanChangeEntitlementBody(
 ): PaddlePlanChangeEntitlementBody {
   const record = asRecord(body);
   const subscriptionId = record?.subscriptionId;
+  const previousPriceId = record?.previousPriceId;
   const plan = record?.plan;
   const priceId = record?.priceId;
   if (
     !record ||
     typeof subscriptionId !== "string" ||
     subscriptionId === "" ||
+    !isNullablePriceId(previousPriceId) ||
     !isPaidPlan(plan) ||
     typeof priceId !== "string" ||
     priceId === "" ||
@@ -32,7 +35,7 @@ export function parsePaddlePlanChangeEntitlementBody(
   ) {
     throw new ApiError(400, "invalid_request", "Invalid plan-change entitlement.");
   }
-  return { subscriptionId, plan, priceId };
+  return { subscriptionId, previousPriceId, plan, priceId };
 }
 
 /**
@@ -66,6 +69,10 @@ export async function recordPaddlePlanChangeInClerk(
   const existingSub = asRecord(meta.subscription) ?? {};
   const status = storedSubscriptionStatus(existingSub);
   if (storedPaddleSubscriptionId(existingSub) !== body.subscriptionId) {
+    return { stale: true, status };
+  }
+  const latestPriceId = storedSubscriptionPriceId(existingSub);
+  if (latestPriceId !== body.previousPriceId && latestPriceId !== body.priceId) {
     return { stale: true, status };
   }
 
@@ -114,6 +121,15 @@ function quotaForLatestSubscriptionStatus(
 function storedSubscriptionStatus(rawSubscription: Record<string, unknown>): string | null {
   const status = rawSubscription.status;
   return typeof status === "string" && status !== "" ? status : null;
+}
+
+function storedSubscriptionPriceId(rawSubscription: Record<string, unknown>): string | null {
+  const priceId = rawSubscription.priceId;
+  return typeof priceId === "string" && priceId !== "" ? priceId : null;
+}
+
+function isNullablePriceId(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && value !== "");
 }
 
 function isPaidPlan(value: unknown): value is PaidPlan {

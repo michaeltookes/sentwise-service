@@ -70,6 +70,7 @@ export async function handlePaddleChangePlan(
   const entitlement = await recordChangedPlanEntitlement(
     userId,
     subscriptionId,
+    currentPriceId,
     targetPlan,
     priceId,
     env,
@@ -133,12 +134,14 @@ async function loadChangePlanAccount(
 async function recordChangedPlanEntitlement(
   userId: string,
   subscriptionId: string,
+  previousPriceId: string | null,
   plan: PaidPlan,
   priceId: string,
   env: Env,
 ): Promise<PaddlePlanChangeEntitlementResult> {
   return quotaRecordPaddlePlanChange(env, userId, {
     subscriptionId,
+    previousPriceId,
     plan,
     priceId,
   });

@@ -409,11 +409,12 @@ Behavior:
   state where the stored weekly limit would disagree with the tier actually being paid for.
 - Queues the optimistic entitlement write through the account Durable Object, re-reading the latest
   Clerk metadata there before bumping the stored `subscription` record's `plan`/`priceId` and the
-  active paid tier's `privateMetadata.quota.weeklyDraftLimit`. Every reconciliation/idempotency field
-  (`lastEventId`, `paddleOccurredAt`, `paddleSubscriptionId`, `paddleCustomerId`, superseded ids) is
-  preserved; the `subscription.updated` webhook Paddle fires for this change carries a newer
-  `occurredAt` and reconciles authoritatively. The two paths are serialized, consistent, and
-  idempotent.
+  active paid tier's `privateMetadata.quota.weeklyDraftLimit`. The queued write is skipped if the
+  latest Clerk subscription no longer has the initially observed price, unless it already has the
+  requested target price. Every reconciliation/idempotency field (`lastEventId`, `paddleOccurredAt`,
+  `paddleSubscriptionId`, `paddleCustomerId`, superseded ids) is preserved; the
+  `subscription.updated` webhook Paddle fires for this change carries a newer `occurredAt` and
+  reconciles authoritatively. The two paths are serialized, consistent, and idempotent.
 
 Returns **`200`** with `Cache-Control: no-store` and:
 
