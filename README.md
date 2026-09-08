@@ -68,7 +68,7 @@ access past the 14-day trial.
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin
   -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
   -> src/anthropic.ts       forward to Anthropic, map the response — no logging, no storage
@@ -77,6 +77,7 @@ src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/inter
   -> src/interest.ts        record demand for a parked capability — a topic key + timestamp, no content
   -> src/paddle.ts          verify Paddle signature + map billing event -> entitlement (56c) — pure
   -> src/paddle-management.ts  fresh Paddle billing-management redirects — no URL persistence
+  -> src/paddle-plan.ts     in-app plan change: PATCH the Paddle subscription + write the new tier limit (90)
   -> src/paddle-webhook.ts  dispatch signed events to serialized entitlement writes (56c) — no body logging
 ```
 
@@ -149,9 +150,23 @@ above are returned.
 ### `GET /v1/paddle/manage-billing`
 
 Requires `Authorization: Bearer <clerk-session-token>`. Reads the account's stored
-`paddleSubscriptionId`, fetches a fresh Paddle `management_urls` link, and returns **`200`** with
-`{ "managementUrl": "<fresh Paddle URL>" }` and `Cache-Control: no-store`. The app should navigate
-the browser to the returned URL.
+`paddleSubscriptionId`, fetches a **fresh** Paddle `management_urls` link **on demand**, and returns
+**`200`** with `{ "managementUrl": "<fresh Paddle URL>" }` and `Cache-Control: no-store`. The app
+should navigate the browser to the returned URL.
+
+The optional **`?action=`** query param selects which management link to return:
+
+- `action=update_payment_method` (the default when omitted) → Paddle's `management_urls.update_payment_method`
+  (the payment-method / billing portal link).
+- `action=cancel` → Paddle's `management_urls.cancel` (the cancellation link).
+
+Any other `action` value returns **`400 invalid_request`**.
+
+This on-demand fetch is the **reliable** source of the management URL. The stored
+`subscription.manageBillingUrl` is intentionally always `null`: Paddle's `management_urls` are
+temporary links present on the `GET /subscriptions/{id}` read, not persisted from the webhook payload,
+so the webhook never stores them and `/v1/me` never returns one. Clients must call this endpoint each
+time they need a portal link rather than caching one.
 
 Returns **`404 billing_subscription_not_found`** when the account has no Paddle subscription id, and
 **`502 billing_portal_unavailable`** when Paddle does not return a valid temporary management URL.
@@ -352,8 +367,9 @@ webhook, which turns billing events into the account's entitlement — the `subs
 Subscription quantities must be `1`; omitted quantities default to `1`, explicitly supplied
 quantities must be positive integers, and overage quantities are capped. Subscription checkout is
 rejected while the account already has an active/trialing/past-due Paddle subscription, so tier
-changes must go through Paddle subscription management instead of creating a second recurring
-subscription. Subscription checkout creation is also serialized per account with a short-lived
+changes must go through [`POST /v1/paddle/change-plan`](#post-v1paddlechange-plan) (an in-place
+Paddle subscription update) instead of creating a second recurring subscription. Subscription
+checkout creation is also serialized per account with a short-lived
 Durable Object reservation id included in Paddle `custom_data`; a second request is rejected while a
 checkout transaction is pending, a retry resumes only a matching requested price/quantity, and only
 the matching applied subscription webhook clears the lock.
@@ -369,6 +385,45 @@ The Worker creates `POST /transactions` in Paddle with server-minted `custom_dat
 
 The app should open the returned `transactionId` with Paddle.js. `checkoutUrl` is present when Paddle
 returns its hosted payment link.
+
+### `POST /v1/paddle/change-plan`
+
+**Clerk bearer required.** In-app upgrade/downgrade of the account's existing paid subscription to a
+different tier (item 90). The request body is `{ "priceId": "pri_..." }`, where `priceId` is the
+**target tier's** subscription price (one of the configured `PRICE_TO_PLAN` prices). Unlike
+`POST /v1/paddle/checkout`, this changes the current subscription in place rather than starting a new
+one.
+
+Behavior:
+
+- Resolves the target tier from `PRICE_TO_PLAN` (an unknown price is rejected).
+- Loads the account's stored `paddleSubscriptionId`; a `404` is returned if the account has no Paddle
+  subscription to change.
+- Rejects a no-op change to the price the account is already on.
+- `PATCH`es Paddle `/subscriptions/{id}`, replacing the recurring item with the target price at
+  quantity `1`. **Proration:** both upgrades and downgrades use
+  `proration_billing_mode: "prorated_immediately"` — the new tier applies immediately (the higher
+  tier is charged pro rata on an upgrade; the lower tier is credited pro rata on a downgrade). A
+  single immediate mode keeps this endpoint's optimistic entitlement write and the
+  `subscription.updated` webhook's reconciliation in agreement, avoiding a "takes effect next period"
+  state where the stored weekly limit would disagree with the tier actually being paid for.
+- Writes the new tier's weekly draft limit into `privateMetadata.quota.weeklyDraftLimit` (via the same
+  `resolvePlanDraftLimit` the webhook uses) so 56b enforcement uses it immediately, and bumps the
+  stored `subscription` record's `plan`/`priceId`. Every reconciliation/idempotency field
+  (`lastEventId`, `paddleOccurredAt`, `paddleSubscriptionId`, `paddleCustomerId`, superseded ids) is
+  preserved; the `subscription.updated` webhook Paddle fires for this change carries a newer
+  `occurredAt` and reconciles authoritatively. The two paths are consistent and idempotent.
+
+Returns **`200`** with `Cache-Control: no-store` and:
+
+```json
+{ "ok": true, "plan": "pro", "status": "active" }
+```
+
+Errors: **`400 invalid_request`** (missing/unknown/same-tier price), **`404
+billing_subscription_not_found`** (no Paddle subscription id on the account), **`502
+subscription_change_failed`** (Paddle API failure), and **`503 checkout_unavailable`** when
+`PADDLE_API_KEY` is not configured. Raw Paddle/Clerk detail is never leaked.
 
 ### `POST /v1/paddle/webhook`
 

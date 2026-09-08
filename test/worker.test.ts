@@ -1829,10 +1829,9 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
   }
 
   function paddleSubscriptionOk(priceId: string, status = "active") {
-    return new Response(
-      JSON.stringify({ data: { status, items: [{ price: { id: priceId } }] } }),
-      { status: 200 },
-    );
+    return new Response(JSON.stringify({ data: { status, items: [{ price: { id: priceId } }] } }), {
+      status: 200,
+    });
   }
 
   function lastMetadataWrite(): any {
@@ -1883,9 +1882,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(write.privateMetadata.subscription.priceId).toBe(PRO_PRICE);
     expect(write.privateMetadata.subscription.lastEventId).toBe("evt_old");
     expect(write.privateMetadata.subscription.paddleSubscriptionId).toBe("sub_123");
-    expect(write.privateMetadata.subscription.paddleOccurredAt).toBe(
-      "2024-01-01T00:00:00.000000Z",
-    );
+    expect(write.privateMetadata.subscription.paddleOccurredAt).toBe("2024-01-01T00:00:00.000000Z");
     expect(write.privateMetadata.quota.weeklyDraftLimit).toBe(120);
   });
 
