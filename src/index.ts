@@ -36,6 +36,7 @@ import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
 import { handlePaddleManageBilling } from "./paddle-management";
 import { handlePaddleChangePlan } from "./paddle-plan";
 import { handlePaddleWebhook } from "./paddle-webhook";
+import { isCallbackPath, renderCallbackPage } from "./callback";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -45,6 +46,8 @@ export { AccountQuota } from "./quota-do";
  *
  * Routes:
  *   GET    /healthz       -> liveness, no auth
+ *   GET    /auth/callback, /openrouter/callback -> browser landing pages that hand
+ *          the OAuth / key-provisioning result to the Mac app's sentwise:// scheme (89)
  *   GET    /v1/me         -> { userId, email, trial, subscription, quota } for account display
  *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
  *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
@@ -68,6 +71,16 @@ export default {
     try {
       if (pathname === "/healthz" && request.method === "GET") {
         return Response.json({ status: "ok" });
+      }
+
+      // Browser landing pages for the Google (Clerk) / OpenRouter OAuth
+      // round-trips (items 59 + 89). Static, unauthenticated pages: the browser
+      // reads the callback params client-side (Clerk returns the nonce in the URL
+      // fragment on HTTPS, which never reaches the server) and forwards only the
+      // allow-listed params to the Mac app's sentwise:// scheme. Nothing stored,
+      // nothing logged.
+      if (isCallbackPath(pathname) && request.method === "GET") {
+        return renderCallbackPage(pathname);
       }
 
       if (pathname === "/admin/margin" && request.method === "GET") {
@@ -274,6 +287,7 @@ export default {
         pathname === "/v1/paddle/manage-billing" ||
         pathname === "/v1/paddle/webhook" ||
         pathname === "/healthz" ||
+        isCallbackPath(pathname) ||
         (pathname === "/admin/margin" && !!env.ADMIN_TOKEN)
       ) {
         return jsonError(405, "method_not_allowed", "Method not allowed.");
