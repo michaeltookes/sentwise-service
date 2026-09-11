@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env as testEnv } from "cloudflare:test";
 import type { Env } from "../src/config";
 import worker from "../src/index";
-import { isCallbackPath } from "../src/callback";
+import { isCallbackPath, normalizeCallbackFragment } from "../src/callback";
 
 // The callback routes are static, unauthenticated landing pages: worker.fetch
 // returns before it touches Clerk/Anthropic/the quota DO, so the base test env
@@ -52,6 +52,18 @@ describe("OAuth callback landing pages (item 89)", () => {
     expect(html).toContain("location.hash");
     // Values are percent-encoded through URLSearchParams, never interpolated.
     expect(html).toContain("new URLSearchParams");
+  });
+
+  it("parses Clerk hash-router fragments before reading the nonce", async () => {
+    const html = await (await get("/auth/callback")).text();
+
+    expect(normalizeCallbackFragment("#/?rotating_token_nonce=nonce-123&state=state-abc")).toBe(
+      "rotating_token_nonce=nonce-123&state=state-abc",
+    );
+    expect(normalizeCallbackFragment("#rotating_token_nonce=nonce-123")).toBe(
+      "rotating_token_nonce=nonce-123",
+    );
+    expect(html).toContain("var h = read(fragmentParams(location.hash));");
   });
 
   it("GET /openrouter/callback forwards ONLY code + state to sentwise://openrouter-callback", async () => {

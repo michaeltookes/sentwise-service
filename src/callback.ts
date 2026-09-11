@@ -65,6 +65,12 @@ export function renderCallbackPage(pathname: string): Response {
   });
 }
 
+export function normalizeCallbackFragment(hash: string): string {
+  const fragment = hash.replace(/^#/, "");
+  const queryStart = fragment.indexOf("?");
+  return queryStart === -1 ? fragment : fragment.slice(queryStart + 1);
+}
+
 // route.host / route.params are compile-time constants (never user input), and
 // they are embedded via JSON.stringify so they are valid JS literals. The
 // runtime values from the URL are NEVER interpolated into the page — they are
@@ -119,8 +125,9 @@ function page(route: CallbackRoute): string {
   // Allow-list of params to forward, in output order; PARAMS[0] is required.
   var PARAMS = ${JSON.stringify(route.params)};
   function read(src) { try { return new URLSearchParams(src); } catch (e) { return new URLSearchParams(); } }
+  var fragmentParams = ${normalizeCallbackFragment.toString()};
   var q = read(location.search.replace(/^\\?/, ""));
-  var h = read(location.hash.replace(/^#/, ""));
+  var h = read(fragmentParams(location.hash));
   // Clerk returns the value in the fragment on HTTPS; prefer the query, fall back
   // to the fragment. Only the allow-listed names are ever read.
   function pick(name) {
