@@ -1,15 +1,18 @@
-// Browser landing pages for the OAuth / key-provisioning round-trips (item 59).
+// Browser landing pages for the OAuth / key-provisioning round-trips
+// (items 59 + 89).
 //
 // Clerk (Google sign-in) and OpenRouter redirect the user's browser back to us
 // over HTTPS; this page shows a clear "you're done" screen and forwards the
 // result to the Mac app's `sentwise://` scheme. Redirecting the browser straight
 // to the custom scheme leaves the tab spinning forever (no document to render).
 //
-// The callback parameter is read CLIENT-SIDE from both the query string and the
+// The callback params are read CLIENT-SIDE from both the query string and the
 // URL fragment: Clerk returns `rotating_token_nonce` in the fragment on an HTTPS
 // redirect, and a fragment never reaches the server. So the server just renders
-// a static, self-contained page; the browser extracts the value and forwards it.
-// Nothing is stored or logged, and only the allow-listed parameter is forwarded.
+// a static, self-contained page; the browser extracts the values and forwards
+// them. Nothing is stored or logged, and ONLY the allow-listed params are
+// forwarded — every other query/fragment key is ignored, and the values are
+// URL-encoded (never interpolated into HTML/JS) so they cannot inject.
 
 import { ApiError } from "./errors";
 
@@ -18,8 +21,13 @@ const APP_SCHEME = "sentwise";
 interface CallbackRoute {
   /** Host of the `sentwise://<host>` deep link the page forwards to. */
   host: string;
-  /** The single query/fragment parameter to forward (everything else dropped). */
-  param: string;
+  /**
+   * The allow-list of query/fragment params to forward, in output order.
+   * `params[0]` is REQUIRED — if it is absent the page shows a failure state and
+   * forwards nothing. The rest (e.g. `state`) are forwarded only when present.
+   * Every param NOT in this list is dropped.
+   */
+  params: readonly [string, ...string[]];
   title: string;
   heading: string;
 }
@@ -27,13 +35,13 @@ interface CallbackRoute {
 const ROUTES: Record<string, CallbackRoute> = {
   "/auth/callback": {
     host: "oauth-callback",
-    param: "rotating_token_nonce",
+    params: ["rotating_token_nonce", "state"],
     title: "Signed in to Sentwise",
     heading: "You're all set",
   },
   "/openrouter/callback": {
     host: "openrouter-callback",
-    param: "code",
+    params: ["code", "state"],
     title: "OpenRouter connected",
     heading: "OpenRouter connected",
   },
@@ -57,9 +65,12 @@ export function renderCallbackPage(pathname: string): Response {
   });
 }
 
-// route.host / route.param are compile-time constants (never user input), so
-// embedding them in the script is safe; the runtime value from the URL is only
-// ever handled inside the browser via encodeURIComponent.
+// route.host / route.params are compile-time constants (never user input), and
+// they are embedded via JSON.stringify so they are valid JS literals. The
+// runtime values from the URL are NEVER interpolated into the page — they are
+// read in the browser and only ever placed into a URLSearchParams (which
+// percent-encodes them) or assigned via textContent, so they cannot inject into
+// the HTML or the script.
 function page(route: CallbackRoute): string {
   return `<!doctype html>
 <html lang="en">
@@ -90,13 +101,12 @@ function page(route: CallbackRoute): string {
   .btn { display:none; margin-top:1.5rem; padding:.7rem 1.4rem; border-radius:10px;
          background:var(--brand); color:#fff; text-decoration:none; font-weight:600; }
   .fail .badge { background:color-mix(in srgb,#d64545 15%,transparent); }
-  .fail h1, .ok-only { }
 </style>
 </head>
 <body>
 <main class="card" id="card">
   <div class="badge" id="badge">
-    <svg viewBox="0 0 24 24" fill="none" stroke="${escapeAttr("#1f9d57")}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+    <svg viewBox="0 0 24 24" fill="none" stroke="#1f9d57" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
   </div>
   <h1 id="heading">${route.heading}</h1>
   <p class="sub" id="sub">Returning you to Sentwise&hellip;</p>
@@ -106,14 +116,26 @@ function page(route: CallbackRoute): string {
 <script>
 (function () {
   var HOST = ${JSON.stringify(route.host)};
-  var PARAM = ${JSON.stringify(route.param)};
+  // Allow-list of params to forward, in output order; PARAMS[0] is required.
+  var PARAMS = ${JSON.stringify(route.params)};
   function read(src) { try { return new URLSearchParams(src); } catch (e) { return new URLSearchParams(); } }
   var q = read(location.search.replace(/^\\?/, ""));
   var h = read(location.hash.replace(/^#/, ""));
-  var value = q.get(PARAM) || h.get(PARAM);
-  if (value) {
-    var link = HOST + "?" + PARAM + "=" + encodeURIComponent(value);
-    var deep = "${APP_SCHEME}://" + link;
+  // Clerk returns the value in the fragment on HTTPS; prefer the query, fall back
+  // to the fragment. Only the allow-listed names are ever read.
+  function pick(name) {
+    var v = q.get(name);
+    if (v === null || v === "") v = h.get(name);
+    return (v === null || v === "") ? null : v;
+  }
+  var primary = pick(PARAMS[0]);
+  if (primary) {
+    var out = new URLSearchParams();
+    for (var i = 0; i < PARAMS.length; i++) {
+      var v = pick(PARAMS[i]);
+      if (v !== null) out.set(PARAMS[i], v);
+    }
+    var deep = "${APP_SCHEME}://" + HOST + "?" + out.toString();
     var btn = document.getElementById("btn");
     btn.href = deep; btn.style.display = "inline-block";
     location.replace(deep);
@@ -130,8 +152,4 @@ function page(route: CallbackRoute): string {
 </body>
 </html>
 `;
-}
-
-function escapeAttr(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
