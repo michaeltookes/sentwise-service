@@ -240,6 +240,78 @@ export async function fetchPaddleManagementUrl(
   }
 }
 
+/**
+ * Paddle customer-portal-session deep-link field for each management action.
+ * A portal session's `urls.subscriptions[]` entry carries authenticated links
+ * that log the customer straight in (no email sign-in step), unlike the
+ * pre-generated `management_urls` read by `fetchPaddleManagementUrl`.
+ */
+const PORTAL_SESSION_ACTION_FIELD: Record<PaddleManagementAction, string> = {
+  cancel: "cancel_subscription",
+  update_payment_method: "update_subscription_payment_method",
+};
+
+/**
+ * Mint a fresh Paddle customer portal session and return the authenticated deep
+ * link for `action` on `subscriptionId` (item 91). These session links skip the
+ * portal's email sign-in step. Returns `null` on any failure (no API key,
+ * non-2xx, network error, or no valid link in the response) so the caller can
+ * fall back to the `management_urls` path — billing management never regresses
+ * to a dead button. Session links expire, so they are minted per click and
+ * never cached.
+ */
+export async function createPaddlePortalSession(
+  env: Env,
+  customerId: string,
+  subscriptionId: string,
+  action: PaddleManagementAction,
+): Promise<string | null> {
+  if (!env.PADDLE_API_KEY) return null;
+  try {
+    const res = await fetch(
+      `${paddleApiBase(env)}/customers/${encodeURIComponent(customerId)}/portal-sessions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.PADDLE_API_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ subscription_ids: [subscriptionId] }),
+      },
+    );
+    if (!res.ok) return null;
+    const body: unknown = await res.json();
+    const data = asRecord(asRecord(body)?.data);
+    return selectPortalSessionUrl(asRecord(data?.urls), subscriptionId, action);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map a portal session's `urls` object to the authenticated deep link for
+ * `action`. Matches the per-subscription entry in `urls.subscriptions[]` by
+ * `subscriptionId` and returns that entry's action link; when no entry matches
+ * (or its link is missing/invalid), falls back to `urls.general.overview`
+ * rather than failing. Every returned URL is validated as https.
+ */
+export function selectPortalSessionUrl(
+  urls: Record<string, unknown> | null,
+  subscriptionId: string,
+  action: PaddleManagementAction,
+): string | null {
+  if (!urls) return null;
+  const field = PORTAL_SESSION_ACTION_FIELD[action];
+  const subscriptions = Array.isArray(urls.subscriptions) ? urls.subscriptions : [];
+  for (const entry of subscriptions) {
+    const record = asRecord(entry);
+    if (record?.id !== subscriptionId) continue;
+    const deepLink = validHttpsUrl(record[field]);
+    if (deepLink) return deepLink;
+  }
+  return validHttpsUrl(asRecord(urls.general)?.overview);
+}
+
 export interface PaddleSubscriptionChangeResult {
   status: string | null;
   priceId: string | null;
