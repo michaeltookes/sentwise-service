@@ -150,26 +150,40 @@ above are returned.
 ### `GET /v1/paddle/manage-billing`
 
 Requires `Authorization: Bearer <clerk-session-token>`. Reads the account's stored
-`paddleSubscriptionId`, fetches a **fresh** Paddle `management_urls` link **on demand**, and returns
+`paddleSubscriptionId`, mints a **fresh** authenticated link **on demand**, and returns
 **`200`** with `{ "managementUrl": "<fresh Paddle URL>" }` and `Cache-Control: no-store`. The app
 should navigate the browser to the returned URL.
 
 The optional **`?action=`** query param selects which management link to return:
 
-- `action=update_payment_method` (the default when omitted) → Paddle's `management_urls.update_payment_method`
-  (the payment-method / billing portal link).
-- `action=cancel` → Paddle's `management_urls.cancel` (the cancellation link).
+- `action=update_payment_method` (the default when omitted) → the payment-method / billing portal link.
+- `action=cancel` → the cancellation link.
 
 Any other `action` value returns **`400 invalid_request`**.
 
-This on-demand fetch is the **reliable** source of the management URL. The stored
-`subscription.manageBillingUrl` is intentionally always `null`: Paddle's `management_urls` are
-temporary links present on the `GET /subscriptions/{id}` read, not persisted from the webhook payload,
-so the webhook never stores them and `/v1/me` never returns one. Clients must call this endpoint each
-time they need a portal link rather than caching one.
+**Customer portal sessions first (item 91).** The endpoint prefers an **authenticated
+customer-portal-session** deep link — `POST /customers/{customer_id}/portal-sessions` — because those
+links log the customer straight into the portal, skipping the email sign-in step that the pre-generated
+`management_urls` links land on. The requested `action` maps to the matching per-subscription deep link
+in the session response's `urls.subscriptions[]` entry (matched by the stored subscription id):
+`cancel` → `cancel_subscription`, `update_payment_method` → `update_subscription_payment_method`. If no
+per-subscription entry matches, it uses `urls.general.overview`. The customer id comes from the
+webhook-stored `subscription.paddleCustomerId`; when absent it is recovered from the live
+`GET /subscriptions/{id}` payload (`data.customer_id`).
+
+**Fallback.** If the portal-session create fails for any reason (no API key, non-2xx, network error,
+missing customer id, or no valid https link), the endpoint falls back to the legacy
+`management_urls` path — `GET /subscriptions/{id}` → `data.management_urls[action]` — so billing
+management never regresses to a dead button.
+
+Session and `management_urls` links are both temporary, so this endpoint is the **reliable** on-demand
+source and its output is never cached. The stored `subscription.manageBillingUrl` is intentionally
+always `null` (the webhook never persists these temporary links and `/v1/me` never returns one), so
+clients must call this endpoint each time they need a portal link.
 
 Returns **`404 billing_subscription_not_found`** when the account has no Paddle subscription id, and
-**`502 billing_portal_unavailable`** when Paddle does not return a valid temporary management URL.
+**`502 billing_portal_unavailable`** when neither a portal session nor a `management_urls` link yields a
+valid URL.
 
 ### `DELETE /v1/me` (item 73)
 
@@ -483,9 +497,11 @@ var holds and stamps overage to the 56b Monday window); it does not encode a fin
 
 **Billing management.** Paddle portal URLs are temporary authenticated links, so the webhook never
 persists them. The app should open `GET /v1/paddle/manage-billing` for payment-method changes or
-`GET /v1/paddle/manage-billing?action=cancel` for cancellation, which fetches
-`GET /subscriptions/{id}` → `data.management_urls` on demand and returns the requested fresh URL in
-JSON for the app to navigate to.
+`GET /v1/paddle/manage-billing?action=cancel` for cancellation, which mints a fresh authenticated
+customer-portal-session deep link on demand (falling back to `GET /subscriptions/{id}` →
+`data.management_urls` if the session create fails) and returns the requested URL in JSON for the app
+to navigate to. See [`GET /v1/paddle/manage-billing`](#get-v1paddlemanage-billing) for the
+portal-session details.
 
 **Overage credit.** Extra drafts are derived from matching Paddle line-item quantity times
 `EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
