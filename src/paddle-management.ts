@@ -65,7 +65,8 @@ async function mintPortalSessionUrl(
   account: PaddleBillingAccount,
   action: PaddleManagementAction,
 ): Promise<string | null> {
-  const customerId = account.customerId ?? (await recoverPaddleCustomerId(env, account.subscriptionId));
+  const customerId =
+    account.customerId ?? (await recoverPaddleCustomerId(env, account.subscriptionId));
   if (!customerId) return null;
   return createPaddlePortalSession(env, customerId, account.subscriptionId, action);
 }
