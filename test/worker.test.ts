@@ -813,6 +813,198 @@ describe("GET /v1/paddle/manage-billing", () => {
     expect(res.status).toBe(502);
     expect(((await res.json()) as any).error.type).toBe("billing_portal_unavailable");
   });
+
+  // ---- item 91: authenticated customer-portal-session deep links ----
+
+  const portalSessionBody = (subId = "sub_123") =>
+    JSON.stringify({
+      data: {
+        urls: {
+          general: { overview: "https://portal.paddle.com/overview" },
+          subscriptions: [
+            {
+              id: subId,
+              cancel_subscription: "https://portal.paddle.com/session/cancel/sub_123",
+              update_subscription_payment_method:
+                "https://portal.paddle.com/session/update/sub_123",
+            },
+          ],
+        },
+      },
+    });
+
+  const isPortalSessionCreate = (input: RequestInfo | URL, init?: RequestInit) =>
+    requestUrl(input).endsWith("/customers/ctm_123/portal-sessions") && init?.method === "POST";
+
+  const isSubscriptionGet = (input: RequestInfo | URL, init?: RequestInit) =>
+    requestUrl(input).endsWith("/subscriptions/sub_123") && !init?.method;
+
+  it("returns a portal-session deep link for update_payment_method when a customer id is stored", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+      }),
+    );
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isPortalSessionCreate(input, init)) {
+        return Promise.resolve(new Response(portalSessionBody(), { status: 200 }));
+      }
+      throw new Error(`unexpected fetch: ${requestUrl(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing", { headers: bearer() }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      managementUrl: "https://portal.paddle.com/session/update/sub_123",
+    });
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/customers/ctm_123/portal-sessions",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ subscription_ids: ["sub_123"] }),
+      }),
+    );
+  });
+
+  it("returns the portal-session cancel deep link for action=cancel", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (isPortalSessionCreate(input, init)) {
+          return Promise.resolve(new Response(portalSessionBody(), { status: 200 }));
+        }
+        throw new Error(`unexpected fetch: ${requestUrl(input)}`);
+      }),
+    );
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing?action=cancel", { headers: bearer() }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      managementUrl: "https://portal.paddle.com/session/cancel/sub_123",
+    });
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("recovers a missing customer id from the live subscription, then mints a session", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { plan: "pro", status: "active", paddleSubscriptionId: "sub_123" },
+      }),
+    );
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isSubscriptionGet(input, init)) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "active" } }), {
+            status: 200,
+          }),
+        );
+      }
+      if (isPortalSessionCreate(input, init)) {
+        return Promise.resolve(new Response(portalSessionBody(), { status: 200 }));
+      }
+      throw new Error(`unexpected fetch: ${requestUrl(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing?action=cancel", { headers: bearer() }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      managementUrl: "https://portal.paddle.com/session/cancel/sub_123",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_123",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer pdl_apikey" }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/customers/ctm_123/portal-sessions",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("falls back to the management_urls link when the portal-session create fails", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "active",
+          paddleSubscriptionId: "sub_123",
+          paddleCustomerId: "ctm_123",
+        },
+      }),
+    );
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (isPortalSessionCreate(input, init)) {
+        return Promise.resolve(new Response(JSON.stringify({ error: {} }), { status: 500 }));
+      }
+      if (isSubscriptionGet(input, init)) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                management_urls: {
+                  update_payment_method: "https://portal.paddle.com/manage/sub_123",
+                  cancel: "https://portal.paddle.com/cancel/sub_123",
+                },
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      throw new Error(`unexpected fetch: ${requestUrl(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing?action=cancel", { headers: bearer() }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      managementUrl: "https://portal.paddle.com/cancel/sub_123",
+    });
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/customers/ctm_123/portal-sessions",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
 });
 
 describe("POST /v1/paddle/checkout", () => {
