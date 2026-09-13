@@ -76,6 +76,22 @@ describe("OAuth callback landing pages (item 89)", () => {
     expect(html).toContain('"openrouter-callback"');
   });
 
+  it("sets a strict Content-Security-Policy on both callback pages (S-L3)", async () => {
+    for (const path of ["/auth/callback", "/openrouter/callback"]) {
+      const res = await get(path);
+      const csp = res.headers.get("content-security-policy");
+      expect(csp).toBe(
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+      );
+      // The page still renders and keeps its inline script/style + deep-link (the
+      // CSP permits the inline script/style and does not block sentwise:// nav).
+      const html = await res.text();
+      expect(html).toContain("<script>");
+      expect(html).toContain("<style>");
+      expect(html).toContain('"sentwise://"');
+    }
+  });
+
   it("does not echo query params into the page (extras are ignored, not reflected)", async () => {
     const html = await (
       await get("/auth/callback?rotating_token_nonce=abc&state=xyz&evil=pwned&foo=bar")
