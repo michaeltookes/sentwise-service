@@ -79,7 +79,14 @@ export async function authenticate(request: Request, env: Env): Promise<AuthedUs
  */
 export function parseAuthorizedParties(raw: string | undefined): string[] | undefined {
   if (typeof raw !== "string") return undefined;
-  const parties = [...new Set(raw.split(",").map((p) => p.trim()).filter((p) => p !== ""))];
+  const parties = [
+    ...new Set(
+      raw
+        .split(",")
+        .map((p) => p.trim())
+        .filter((p) => p !== ""),
+    ),
+  ];
   return parties.length > 0 ? parties : undefined;
 }
 

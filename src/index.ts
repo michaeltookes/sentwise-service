@@ -9,12 +9,7 @@ import {
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
-import {
-  DEFAULT_MAX_TOKENS,
-  DEFAULT_MODEL,
-  DEFAULT_RATE_LIMIT_PER_MIN,
-  type Env,
-} from "./config";
+import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_RATE_LIMIT_PER_MIN, type Env } from "./config";
 import {
   buildQuota,
   conservativeRequestTokenBound,
@@ -129,7 +124,10 @@ export default {
         // account sees "hard" here too (it can't lag behind actual enforcement).
         const limits = {
           ...baseLimits,
-          enforcement: effectiveEnforcement(baseLimits.enforcement, hasPaidAccess(account.subscription)),
+          enforcement: effectiveEnforcement(
+            baseLimits.enforcement,
+            hasPaidAccess(account.subscription),
+          ),
         };
         // quotaOverride is internal — build the response explicitly, never spread it.
         return Response.json({
@@ -222,7 +220,10 @@ export default {
         const baseLimits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
         const limits = {
           ...baseLimits,
-          enforcement: effectiveEnforcement(baseLimits.enforcement, hasPaidAccess(account.subscription)),
+          enforcement: effectiveEnforcement(
+            baseLimits.enforcement,
+            hasPaidAccess(account.subscription),
+          ),
         };
 
         // 2) Per-request token safety cap (pre-flight conservative bound).
