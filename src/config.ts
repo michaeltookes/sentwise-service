@@ -38,6 +38,13 @@ export interface Env {
   // 56b — margin dashboard. Aggregate, hashed usage metrics. Optional so the
   // Worker still runs (and tests pass) if the binding is absent.
   USAGE_ANALYTICS?: AnalyticsEngineDataset;
+  // S-I2 (security pass 2026-09-13) — optional secret key for the analytics userId
+  // hash (wrangler secret). When set, the userId is hashed with keyed HMAC-SHA256
+  // (prevents offline re-identification of the deterministic pseudonym); when
+  // unset, the hash falls back to the original unkeyed SHA-256 so nothing breaks
+  // before the secret is provisioned. NOTE: enabling the key changes every
+  // pseudonym, discontinuing hash continuity on the margin dashboard (accepted).
+  ANALYTICS_HASH_KEY?: string;
 
   // 56b — tunable limits (wrangler `vars`; strings or numbers, coerced in metering.ts).
   WEEKLY_DRAFT_LIMIT?: string | number;
