@@ -18,6 +18,7 @@ import {
 import {
   buildQuota,
   conservativeRequestTokenBound,
+  effectiveEnforcement,
   mondayStartUtc,
   numFrom,
   resolveLimits,
@@ -123,7 +124,13 @@ export default {
         // access — it can only lag account state by at most the cache TTL.
         const account = await resolveAccount(userId, env, { initialize: false, useCache: true });
         const { window } = await quotaPeek(env, userId, { now: Date.now() });
-        const limits = resolveLimits(env, account.quotaOverride, window.windowStart);
+        const baseLimits = resolveLimits(env, account.quotaOverride, window.windowStart);
+        // S-M2: report the same effective mode a draft would enforce, so a trial
+        // account sees "hard" here too (it can't lag behind actual enforcement).
+        const limits = {
+          ...baseLimits,
+          enforcement: effectiveEnforcement(baseLimits.enforcement, hasPaidAccess(account.subscription)),
+        };
         // quotaOverride is internal — build the response explicitly, never spread it.
         return Response.json({
           userId: account.userId,
@@ -210,7 +217,13 @@ export default {
         }
         const draft = parseDraftRequest(body);
         const model = draft.model ?? DEFAULT_MODEL;
-        const limits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
+        // S-M2: trial accounts are hard-enforced regardless of ENFORCEMENT_MODE so
+        // a throwaway trial can't run unbounded spend; paid tiers keep the env mode.
+        const baseLimits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
+        const limits = {
+          ...baseLimits,
+          enforcement: effectiveEnforcement(baseLimits.enforcement, hasPaidAccess(account.subscription)),
+        };
 
         // 2) Per-request token safety cap (pre-flight conservative bound).
         const content = draftContentSize(draft.system, draft.messages);

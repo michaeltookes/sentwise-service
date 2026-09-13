@@ -3534,7 +3534,7 @@ describe("56b draft metering", () => {
       limit: 100, // WEEKLY_DRAFT_LIMIT var default
       remaining: 99,
       tokenLimit: 2_000_000,
-      enforcement: "soft",
+      enforcement: "hard", // S-M2: trial accounts are always hard-enforced
       extraPurchased: 0,
     });
     expect(q.tokensUsed).toBe(5); // 3 in + 2 out from anthropicOk
@@ -3789,9 +3789,15 @@ describe("56b draft metering", () => {
     expect(fetchMock).toHaveBeenCalledOnce(); // blocked before the 2nd forward
   });
 
-  it("soft enforcement meters past the cap but keeps drafting", async () => {
+  it("soft enforcement meters a PAID account past the cap but keeps drafting", async () => {
+    // S-M2: soft mode only applies to paid tiers now — use a paid subscription.
     mocks.verifyToken.mockResolvedValue({ sub: "u-soft" });
-    mocks.getUser.mockResolvedValue(activeTrial());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: { plan: "pro", status: "active" },
+      }),
+    );
     // Fresh Response per call — the body is single-use and this test forwards twice.
     vi.stubGlobal(
       "fetch",
@@ -3806,6 +3812,43 @@ describe("56b draft metering", () => {
     expect(q.used).toBe(2);
     expect(q.limit).toBe(1);
     expect(q.remaining).toBe(0); // clamped
+    expect(q.enforcement).toBe("soft"); // paid tier keeps the env mode
+  });
+
+  it("hard-enforces a TRIAL account over quota even when ENFORCEMENT_MODE=soft (S-M2)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-trial-hard" });
+    mocks.getUser.mockResolvedValue(activeTrial()); // trial, not paid
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    // soft mode configured, but a trial must still be blocked at the cap.
+    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+
+    const first = await worker.fetch(draftReq("u-trial-hard"), softEnv);
+    expect(first.status).toBe(200); // draftsUsed -> 1
+
+    const second = await worker.fetch(draftReq("u-trial-hard"), softEnv);
+    expect(second.status).toBe(429);
+    expect(((await second.json()) as any).error.type).toBe("quota_exceeded");
+    expect(fetchMock).toHaveBeenCalledOnce(); // blocked before the 2nd forward
+  });
+
+  it("a PAID account is NOT blocked at the cap under ENFORCEMENT_MODE=soft (S-M2)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-paid-soft" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: { plan: "starter", status: "active" },
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => anthropicOk("ok")),
+    );
+    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+
+    expect((await worker.fetch(draftReq("u-paid-soft"), softEnv)).status).toBe(200);
+    const res2 = await worker.fetch(draftReq("u-paid-soft"), softEnv);
+    expect(res2.status).toBe(200); // paid + soft keeps drafting past the cap
   });
 });
 
@@ -3822,7 +3865,7 @@ describe("56b /v1/me quota", () => {
       limit: 100,
       remaining: 100,
       tokenLimit: 2_000_000,
-      enforcement: "soft",
+      enforcement: "hard", // S-M2: a trial account reports hard on /v1/me too
       extraPurchased: 0,
     });
     // Viewing the account must not start a trial or record usage.

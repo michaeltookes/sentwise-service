@@ -4,6 +4,7 @@ import {
   CONSERVATIVE_MESSAGE_FRAMING_TOKENS,
   conservativeRequestTokenBound,
   costUsd,
+  effectiveEnforcement,
   estimateRequestTokens,
   freshWindow,
   isOverQuota,
@@ -164,6 +165,17 @@ describe("numFrom / parseEnforcement", () => {
     expect(parseEnforcement("soft")).toBe("soft");
     expect(parseEnforcement(undefined)).toBe("soft");
     expect(parseEnforcement("weird")).toBe("soft");
+  });
+});
+
+describe("effectiveEnforcement (S-M2)", () => {
+  it("forces hard for a trial (non-paid) account regardless of configured mode", () => {
+    expect(effectiveEnforcement("soft", false)).toBe("hard");
+    expect(effectiveEnforcement("hard", false)).toBe("hard");
+  });
+  it("honors the configured mode for a paid account", () => {
+    expect(effectiveEnforcement("soft", true)).toBe("soft");
+    expect(effectiveEnforcement("hard", true)).toBe("hard");
   });
 });
 
