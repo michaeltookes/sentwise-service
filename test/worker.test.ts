@@ -28,6 +28,7 @@ import worker from "../src/index";
 import { clerkUserExists } from "../src/auth";
 import {
   __resetClerkUserCache,
+  CLERK_USER_CACHE_MAX_ENTRIES,
   CLERK_USER_CACHE_TTL_MS,
   getCachedClerkUser,
   invalidateClerkUser,
@@ -729,6 +730,48 @@ describe("S-M1 Clerk user cache", () => {
     await getCachedClerkUser(env, "u-nocache", { useCache: false });
     await getCachedClerkUser(env, "u-nocache", { useCache: false });
     expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("coalesces concurrent cache misses for the same user", async () => {
+    const user = userWith({});
+    const lookup = deferred<typeof user>();
+    mocks.getUser.mockReturnValueOnce(lookup.promise);
+
+    const first = getCachedClerkUser(env, "u-flight", { useCache: true });
+    const second = getCachedClerkUser(env, "u-flight", { useCache: true });
+
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+    lookup.resolve(user);
+    await expect(Promise.all([first, second])).resolves.toEqual([user, user]);
+
+    await getCachedClerkUser(env, "u-flight", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+  });
+
+  it("removes failed in-flight lookups so cacheable calls can retry", async () => {
+    const user = userWith({});
+    mocks.getUser.mockRejectedValueOnce(new Error("clerk down")).mockResolvedValueOnce(user);
+
+    await expect(getCachedClerkUser(env, "u-retry", { useCache: true })).rejects.toThrow(
+      "clerk down",
+    );
+    await expect(getCachedClerkUser(env, "u-retry", { useCache: true })).resolves.toBe(user);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds the cache by evicting the oldest entry", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+
+    for (let i = 0; i < CLERK_USER_CACHE_MAX_ENTRIES; i += 1) {
+      await getCachedClerkUser(env, `u-bound-${i}`, { useCache: true });
+    }
+    expect(mocks.getUser).toHaveBeenCalledTimes(CLERK_USER_CACHE_MAX_ENTRIES);
+
+    await getCachedClerkUser(env, "u-bound-new", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledTimes(CLERK_USER_CACHE_MAX_ENTRIES + 1);
+
+    await getCachedClerkUser(env, "u-bound-0", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledTimes(CLERK_USER_CACHE_MAX_ENTRIES + 2);
   });
 
   it("invalidateClerkUser drops a cached entry", async () => {

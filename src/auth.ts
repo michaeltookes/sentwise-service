@@ -53,9 +53,9 @@ export async function authenticate(request: Request, env: Env): Promise<AuthedUs
   try {
     // S-L1: optionally pin the token's authorized party (`azp`). When
     // CLERK_AUTHORIZED_PARTIES is unset the option is omitted and verification is
-    // unchanged. @clerk/backend only rejects a token whose `azp` is present AND
-    // not in this list; a token with no `azp` (native-app session tokens can lack
-    // it) still verifies — so this is a safe, config opt-in cutover control.
+    // unchanged. When configured, @clerk/backend rejects tokens whose `azp` is
+    // absent or not in this list, so confirm native-app tokens carry a matching
+    // `azp` before enabling it.
     const authorizedParties = parseAuthorizedParties(env.CLERK_AUTHORIZED_PARTIES);
     const claims = await verifyToken(token, {
       secretKey: env.CLERK_SECRET_KEY,

@@ -28,9 +28,9 @@ export interface Env {
   // S-L1 (security pass 2026-09-13) — optional comma-separated allow-list of
   // Clerk `azp` (authorized party) values passed to verifyToken. When unset,
   // token verification is unchanged (no azp pinning). Config opt-in at cutover:
-  // native-app session tokens may carry no/odd `azp`, and @clerk/backend only
-  // enforces this list when a token actually presents an `azp` claim, so an
-  // absent-azp token still verifies. See src/auth.ts.
+  // @clerk/backend rejects tokens with absent or non-matching `azp` once this is
+  // set, and native-app session tokens may lack `azp`. Confirm the app's tokens
+  // carry a matching `azp` before enabling it. See src/auth.ts.
   CLERK_AUTHORIZED_PARTIES?: string;
 
   // 56b — metering. Durable Object namespace holding per-account usage counters.

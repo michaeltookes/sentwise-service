@@ -1,9 +1,10 @@
 // S-M1 (security pass 2026-09-13): a short-TTL, in-memory, per-user cache in
-// front of Clerk `users.getUser`. Workers isolates are ephemeral, so a plain Map
-// with per-entry expiry is the right shape — it blunts a scripted account
-// hammering an unauthenticated-cost route (e.g. GET /v1/me) into exhausting
-// Clerk's per-instance Backend API rate limits (which would surface as
-// account_lookup_failed for every user — a whole-service DoS).
+// front of Clerk `users.getUser`. Workers isolates are ephemeral, so a bounded
+// Map with per-entry expiry and in-flight coalescing is the right shape - it
+// blunts a scripted account hammering an unauthenticated-cost route (e.g.
+// GET /v1/me) into exhausting Clerk's per-instance Backend API rate limits
+// (which would surface as account_lookup_failed for every user - a whole-service
+// DoS).
 //
 // Scope (deliberately narrow): only the pure-READ, hammer-able request paths use
 // the cache — GET /v1/me and GET /v1/paddle/manage-billing (`useCache: true`).
@@ -25,6 +26,7 @@ import { createClerkClient } from "@clerk/backend";
 import type { Env } from "./config";
 
 export const CLERK_USER_CACHE_TTL_MS = 30_000;
+export const CLERK_USER_CACHE_MAX_ENTRIES = 512;
 
 type ClerkUsers = ReturnType<typeof createClerkClient>["users"];
 type ClerkUser = Awaited<ReturnType<ClerkUsers["getUser"]>>;
@@ -34,7 +36,13 @@ interface CacheEntry {
   user: ClerkUser;
 }
 
+interface PendingLookup {
+  cacheResult: boolean;
+  promise: Promise<ClerkUser> | null;
+}
+
 const cache = new Map<string, CacheEntry>();
+const inFlight = new Map<string, PendingLookup>();
 
 /**
  * Fetch the Clerk user, optionally served from / stored in the short-TTL cache.
@@ -54,15 +62,46 @@ export async function getCachedClerkUser(
     const hit = cache.get(userId);
     if (hit && hit.expiresAt > now) return hit.user;
     if (hit) cache.delete(userId); // expired
+
+    const pending = inFlight.get(userId);
+    if (pending?.promise) return pending.promise;
   }
 
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
-  const user = await clerk.users.getUser(userId);
-
-  if (useCache) {
-    cache.set(userId, { user, expiresAt: now + CLERK_USER_CACHE_TTL_MS });
+  if (!useCache) {
+    return clerk.users.getUser(userId);
   }
-  return user;
+
+  const pendingLookup: PendingLookup = { cacheResult: true, promise: null };
+  const lookupPromise = clerk.users
+    .getUser(userId)
+    .then((user) => {
+      if (pendingLookup.cacheResult) cacheClerkUser(userId, user);
+      return user;
+    })
+    .finally(() => {
+      if (inFlight.get(userId) === pendingLookup) inFlight.delete(userId);
+    });
+  pendingLookup.promise = lookupPromise;
+  inFlight.set(userId, pendingLookup);
+  return lookupPromise;
+}
+
+function cacheClerkUser(userId: string, user: ClerkUser): void {
+  const now = Date.now();
+  sweepExpiredCacheEntries(now);
+  while (cache.size >= CLERK_USER_CACHE_MAX_ENTRIES) {
+    const oldestUserId = cache.keys().next().value;
+    if (oldestUserId === undefined) break;
+    cache.delete(oldestUserId);
+  }
+  cache.set(userId, { user, expiresAt: now + CLERK_USER_CACHE_TTL_MS });
+}
+
+function sweepExpiredCacheEntries(now: number): void {
+  for (const [userId, entry] of cache) {
+    if (entry.expiresAt <= now) cache.delete(userId);
+  }
 }
 
 /**
@@ -72,9 +111,16 @@ export async function getCachedClerkUser(
  */
 export function invalidateClerkUser(userId: string): void {
   cache.delete(userId);
+  const pending = inFlight.get(userId);
+  if (pending) {
+    pending.cacheResult = false;
+    inFlight.delete(userId);
+  }
 }
 
 /** Test-only: clear all cached entries between tests. */
 export function __resetClerkUserCache(): void {
+  for (const pending of inFlight.values()) pending.cacheResult = false;
   cache.clear();
+  inFlight.clear();
 }
