@@ -45,8 +45,9 @@ access past the 14-day trial.
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
      weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
      reservation IDs keyed by Clerk userId. No prompts, no drafts, no emails.
-  3. **Aggregate, hashed usage metrics** in Workers Analytics Engine (56b): a SHA-256 hash of the
-     userId (never the raw id), the model, token counts, estimated cost, latency, and outcome.
+  3. **Aggregate, hashed usage metrics** in Workers Analytics Engine (56b): a hash of the userId
+     (never the raw id) — SHA-256, or keyed **HMAC-SHA256** when `ANALYTICS_HASH_KEY` is set (S-I2) —
+     the model, token counts, estimated cost, latency, and outcome.
   4. **Interest flags** in the user's Clerk `privateMetadata.interest` (75): a topic key mapped to
      the ISO timestamp of the user's first click asking to be notified when a parked capability
      ships (e.g. `google-oauth`). Just a topic name + timestamp on the user's own account — no mail,
@@ -60,10 +61,11 @@ access past the 14-day trial.
   Durable Object usage data (all usage counters, reservations, and the settlement alarm). A minimal
   DO tombstone remains so stale already-issued tokens cannot recreate fresh usage state after
   deletion. Workers Analytics Engine usage rows are retained separately as content-free,
-  pseudonymous metrics keyed by a deterministic SHA-256 hash of the Clerk userId. The hash is not
-  reversible by itself, but anyone who already knows the former Clerk userId can recompute it and
-  find those rows. They are retained for aggregate margin/usage reporting and are not deleted by
-  this endpoint.
+  pseudonymous metrics keyed by a deterministic hash of the Clerk userId (SHA-256, or keyed
+  HMAC-SHA256 when `ANALYTICS_HASH_KEY` is set — S-I2). The hash is not reversible by itself; with the
+  unkeyed SHA-256, anyone who already knows the former Clerk userId can recompute it and find those
+  rows, whereas the keyed HMAC blocks that offline recomputation. They are retained for aggregate
+  margin/usage reporting and are not deleted by this endpoint.
 
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
@@ -117,6 +119,11 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
 ```
 
 Viewing your account never starts the trial — the trial begins on your first real draft.
+
+This read is served from a short-TTL (30s) in-memory per-user cache in front of the Clerk lookup
+(S-M1) so it can't be used to hammer Clerk's Backend API. Drafting access is always re-checked fresh
+on `/v1/draft`, so a cached view can only lag account state by at most the TTL — it can never grant
+access. `DELETE /v1/me` always bypasses the cache, and starting the trial invalidates it.
 
 #### `subscription` (item 73)
 
@@ -282,9 +289,11 @@ lazy reset (the next request at/after `resetsAt` starts a fresh, zeroed window).
 `resetsAt` timestamp, the `enforcement` mode, and `extraPurchased` (overage credits added to the
 limit for the current window).
 
-**Per-request pipeline** (`POST /v1/draft`): authenticate → trial → parse → **rate-limit** →
+**Per-request pipeline** (`POST /v1/draft`): authenticate → **rate-limit** → trial → parse →
 **token safety cap** → **atomic weekly quota reservation** → forward to Anthropic → settle usage →
-respond. If Anthropic fails after reservation, the reserved draft is released; if immediate settlement
+respond. The rate limiter runs **before** the Clerk trial lookup (S-M1) so a scripted account is
+stopped by our per-account limiter rather than exhausting Clerk's per-instance Backend API limits;
+the rate limit is env-derived, so it needs no Clerk call to evaluate. If Anthropic fails after reservation, the reserved draft is released; if immediate settlement
 fails after Anthropic succeeds, the completed draft is still returned and the settlement is queued in
 the account Durable Object for alarm retry. Abandoned reservations expire after 15 minutes so leaked
 capacity is reclaimed before the weekly reset.
@@ -296,13 +305,18 @@ capacity is reclaimed before the weekly reset.
 - `hard`: also block over-quota drafts with `429 quota_exceeded`; token capacity is reserved with a
   conservative `UTF-8 input bytes + per-message framing + max_tokens` bound before forwarding.
 
+> **Trial accounts are always hard-enforced (S-M2)**, regardless of `ENFORCEMENT_MODE`, so a free
+> throwaway trial can't run unbounded Anthropic spend past its weekly caps. `ENFORCEMENT_MODE` only
+> governs **paid** tiers (the measure-first decision stands for billed accounts). A trial therefore
+> reports `enforcement: "hard"` on both `/v1/draft` and `/v1/me`.
+
 **Error codes:**
 
-| HTTP | `error.type`        | When                                                                |
-| ---- | ------------------- | ------------------------------------------------------------------- |
-| 429  | `rate_limited`      | Over `RATE_LIMIT_PER_MIN` (sliding 60s). Includes `Retry-After`.    |
-| 413  | `request_too_large` | Estimated request tokens exceed `MAX_TOKENS_PER_REQUEST`.           |
-| 429  | `quota_exceeded`    | Weekly cap reached **and** `ENFORCEMENT_MODE=hard`. Has `resetsAt`. |
+| HTTP | `error.type`        | When                                                                                                           |
+| ---- | ------------------- | -------------------------------------------------------------------------------------------------------------- |
+| 429  | `rate_limited`      | Over `RATE_LIMIT_PER_MIN` (sliding 60s). Includes `Retry-After`.                                               |
+| 413  | `request_too_large` | Estimated request tokens exceed `MAX_TOKENS_PER_REQUEST`.                                                      |
+| 429  | `quota_exceeded`    | Weekly cap reached under hard enforcement (`ENFORCEMENT_MODE=hard`, **or any trial account**). Has `resetsAt`. |
 
 **Config vars** (in `wrangler.jsonc` `vars`; placeholder defaults, final numbers land with 56c):
 
@@ -567,6 +581,15 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
 - `CLERK_SECRET_KEY` — Clerk backend key (JWT verification + trial metadata).
 - `ANTHROPIC_API_KEY` — the server-held drafting key.
 - `CLERK_PUBLISHABLE_KEY` — public; committed in `wrangler.jsonc` as a plain var.
+- `CLERK_AUTHORIZED_PARTIES` — **security-pass S-L1, optional.** Comma-separated allow-list of Clerk
+  `azp` (authorized-party) values pinned on `verifyToken`. **Unset = unchanged behavior** (no
+  pinning). ⚠️ **Cutover caveat:** `@clerk/backend` **rejects a token that carries no `azp` claim**
+  once this is set, and native-app session tokens may lack `azp` — so only set it after confirming
+  the app's tokens carry a matching `azp`. Not secret, but managed like the other config.
+- `ANALYTICS_HASH_KEY` — **security-pass S-I2, optional.** Secret key that switches the analytics
+  userId pseudonym from unkeyed SHA-256 to keyed **HMAC-SHA256** (prevents offline re-identification).
+  **Unset = unchanged (SHA-256).** ⚠️ Enabling it changes every pseudonym, so hash continuity on the
+  margin dashboard is discontinued from that point (accepted).
 - `ADMIN_TOKEN` — **56b, optional.** Bearer token that guards `GET /admin/margin`; when unset the
   endpoint 404s.
 - `CF_ANALYTICS_API_TOKEN` — **56b, optional.** A Cloudflare API token with **Account Analytics
