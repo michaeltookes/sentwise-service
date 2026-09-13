@@ -263,12 +263,43 @@ export function planFromEvent(event: PaddleEvent): { plan: PaidPlan; priceId: st
   return null;
 }
 
+const SUBSCRIPTION_STATUSES: readonly SubscriptionStatus[] = [
+  "trialing",
+  "active",
+  "past_due",
+  "canceled",
+  "lapsed",
+];
+
+/**
+ * Validate a stored `privateMetadata.subscription.status` into a known
+ * SubscriptionStatus, or null when absent/unrecognized. Used as the safe fallback
+ * for statusFromEvent (S-L4).
+ */
+export function storedSubscriptionStatus(
+  stored: Record<string, unknown> | null | undefined,
+): SubscriptionStatus | null {
+  const status = stored?.status;
+  return typeof status === "string" && (SUBSCRIPTION_STATUSES as readonly string[]).includes(status)
+    ? (status as SubscriptionStatus)
+    : null;
+}
+
 /**
  * Map an event to a wire `status`. Prefers the entity's own `data.status` (the
  * source of truth), then falls back to the event type. A Paddle "paused"
  * subscription is treated as `canceled` for access purposes.
+ *
+ * S-L4 (security pass 2026-09-13): an UNKNOWN/absent status on an event type we
+ * don't infer (e.g. subscription.updated / .created carrying a future status
+ * string) must NOT fail open to `active`. It defaults to the last known stored
+ * status when one exists, else to the non-entitling `canceled` — so an unexpected
+ * status can never silently grant access.
  */
-export function statusFromEvent(event: PaddleEvent): SubscriptionStatus {
+export function statusFromEvent(
+  event: PaddleEvent,
+  storedStatus?: SubscriptionStatus | null,
+): SubscriptionStatus {
   const dataStatus = typeof event.data.status === "string" ? event.data.status : undefined;
   switch (dataStatus) {
     case "active":
@@ -291,7 +322,9 @@ export function statusFromEvent(event: PaddleEvent): SubscriptionStatus {
     case "subscription.resumed":
       return "active";
     default:
-      return "active";
+      // No known entity status and no event-type inference: never fail open to
+      // "active". Keep the current entitlement if we have one, else deny.
+      return storedStatus ?? "canceled";
   }
 }
 
@@ -574,10 +607,11 @@ export function buildSubscriptionRecord(
   plan: SubscriptionPlan,
   priceId: string | null,
   now: number,
+  storedStatus?: SubscriptionStatus | null,
 ): StoredSubscriptionRecord {
   return {
     plan,
-    status: statusFromEvent(event),
+    status: statusFromEvent(event, storedStatus),
     renewsAt: normalizeIso(event.data.next_billed_at),
     manageBillingUrl: null,
     paddleSubscriptionId: subscriptionIdFromEvent(event),
