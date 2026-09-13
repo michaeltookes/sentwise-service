@@ -25,6 +25,13 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   // Public — safe to commit / expose. Present for parity / future use.
   CLERK_PUBLISHABLE_KEY: string;
+  // S-L1 (security pass 2026-09-13) — optional comma-separated allow-list of
+  // Clerk `azp` (authorized party) values passed to verifyToken. When unset,
+  // token verification is unchanged (no azp pinning). Config opt-in at cutover:
+  // native-app session tokens may carry no/odd `azp`, and @clerk/backend only
+  // enforces this list when a token actually presents an `azp` claim, so an
+  // absent-azp token still verifies. See src/auth.ts.
+  CLERK_AUTHORIZED_PARTIES?: string;
 
   // 56b — metering. Durable Object namespace holding per-account usage counters.
   ACCOUNT_QUOTA: DurableObjectNamespace;

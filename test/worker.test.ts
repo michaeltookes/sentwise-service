@@ -429,6 +429,29 @@ describe("auth", () => {
       vi.useRealTimers();
     }
   });
+
+  it("forwards CLERK_AUTHORIZED_PARTIES to verifyToken when set (S-L1)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const res = await worker.fetch(req("/v1/me", { headers: bearer("good-token") }), {
+      ...env,
+      CLERK_AUTHORIZED_PARTIES: "sentwise-app, other-client",
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.verifyToken).toHaveBeenCalledWith(
+      "good-token",
+      expect.objectContaining({ authorizedParties: ["sentwise-app", "other-client"] }),
+    );
+  });
+
+  it("omits authorizedParties from verifyToken when the env var is unset (S-L1)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const res = await worker.fetch(req("/v1/me", { headers: bearer("good-token") }), env);
+    expect(res.status).toBe(200);
+    expect(mocks.verifyToken).toHaveBeenCalledOnce();
+    expect(mocks.verifyToken.mock.calls[0][1]).not.toHaveProperty("authorizedParties");
+  });
 });
 
 describe("POST /v1/draft trial handling", () => {

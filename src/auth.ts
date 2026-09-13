@@ -50,7 +50,16 @@ export async function authenticate(request: Request, env: Env): Promise<AuthedUs
   }
 
   try {
-    const claims = await verifyToken(token, { secretKey: env.CLERK_SECRET_KEY });
+    // S-L1: optionally pin the token's authorized party (`azp`). When
+    // CLERK_AUTHORIZED_PARTIES is unset the option is omitted and verification is
+    // unchanged. @clerk/backend only rejects a token whose `azp` is present AND
+    // not in this list; a token with no `azp` (native-app session tokens can lack
+    // it) still verifies — so this is a safe, config opt-in cutover control.
+    const authorizedParties = parseAuthorizedParties(env.CLERK_AUTHORIZED_PARTIES);
+    const claims = await verifyToken(token, {
+      secretKey: env.CLERK_SECRET_KEY,
+      ...(authorizedParties ? { authorizedParties } : {}),
+    });
     if (!claims.sub) {
       throw new ApiError(401, "unauthenticated", "Your session is invalid. Sign in again.");
     }
@@ -60,6 +69,17 @@ export async function authenticate(request: Request, env: Env): Promise<AuthedUs
     // Expired or malformed token — do not leak verifier internals.
     throw new ApiError(401, "session_invalid", "Your session has expired. Sign in again.");
   }
+}
+
+/**
+ * Parse the comma-separated CLERK_AUTHORIZED_PARTIES env var into a trimmed,
+ * de-duplicated allow-list, or `undefined` when unset/empty (verification then
+ * pins no authorized party — the pre-S-L1 behavior). Exported for testing.
+ */
+export function parseAuthorizedParties(raw: string | undefined): string[] | undefined {
+  if (typeof raw !== "string") return undefined;
+  const parties = [...new Set(raw.split(",").map((p) => p.trim()).filter((p) => p !== ""))];
+  return parties.length > 0 ? parties : undefined;
 }
 
 const TRIAL_METADATA_KEY = "trialStartedAt";
