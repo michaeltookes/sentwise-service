@@ -1,5 +1,6 @@
 import { verifyToken, createClerkClient } from "@clerk/backend";
 import { CLERK_DELETE_TIMEOUT_MS, type Env } from "./config";
+import { getCachedClerkUser, invalidateClerkUser } from "./clerk-user-cache";
 import { ApiError } from "./errors";
 import { computeTrial, type TrialState } from "./trial";
 import { parseQuotaOverride, type QuotaOverride } from "./metering";
@@ -84,10 +85,16 @@ export function parseAuthorizedParties(raw: string | undefined): string[] | unde
 
 const TRIAL_METADATA_KEY = "trialStartedAt";
 
-// TODO(56b): trial state is read from Clerk on every draft, costing two Clerk
-// Backend API calls per request (getUser + updateUserMetadata on first draft).
-// Cache it (KV/D1, short TTL keyed by userId) so steady-state drafts skip the
-// lookup; metering (56b) will introduce that store anyway.
+// Account lookup options.
+//   initialize — start the trial (`trialStartedAt`) on this call if absent.
+//   useCache   — serve/store the Clerk getUser via the short-TTL cache (S-M1).
+//                Only pure-read, hammer-able routes (GET /v1/me) opt in; the draft
+//                path (rate-limit reorder) and DELETE /v1/me read fresh.
+export interface ResolveAccountOptions {
+  initialize: boolean;
+  useCache?: boolean;
+}
+
 /**
  * Read the user's trial state, initializing `trialStartedAt` in Clerk
  * privateMetadata on the first authenticated call. Returns account info.
@@ -98,7 +105,7 @@ const TRIAL_METADATA_KEY = "trialStartedAt";
 export async function resolveAccount(
   userId: string,
   env: Env,
-  options: { initialize: boolean },
+  options: ResolveAccountOptions,
 ): Promise<AccountInfo> {
   const account = await resolveAccountIfExists(userId, env, options);
   if (account) return account;
@@ -112,13 +119,11 @@ export async function resolveAccount(
 export async function resolveAccountIfExists(
   userId: string,
   env: Env,
-  options: { initialize: boolean },
+  options: ResolveAccountOptions,
 ): Promise<AccountInfo | null> {
-  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
-
   let user;
   try {
-    user = await clerk.users.getUser(userId);
+    user = await getCachedClerkUser(env, userId, { useCache: options.useCache });
   } catch (err) {
     if (isClerkNotFoundError(err)) return null;
     throw new ApiError(
@@ -128,14 +133,14 @@ export async function resolveAccountIfExists(
     );
   }
 
-  return accountInfoFromUser(userId, clerk, user, options);
+  return accountInfoFromUser(userId, env, user, options);
 }
 
 async function accountInfoFromUser(
   userId: string,
-  clerk: ClerkClientLike,
+  env: Env,
   user: ClerkUserLike,
-  options: { initialize: boolean },
+  options: ResolveAccountOptions,
 ): Promise<AccountInfo> {
   const meta = user.privateMetadata ?? {};
   let startedAt = typeof meta[TRIAL_METADATA_KEY] === "string" ? meta[TRIAL_METADATA_KEY] : null;
@@ -147,6 +152,7 @@ async function accountInfoFromUser(
 
   if (!startedAt && options.initialize) {
     startedAt = new Date().toISOString();
+    const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
     try {
       await clerk.users.updateUserMetadata(userId, {
         privateMetadata: { [TRIAL_METADATA_KEY]: startedAt },
@@ -154,6 +160,9 @@ async function accountInfoFromUser(
     } catch {
       throw new ApiError(502, "trial_init_failed", "Could not start your trial. Please try again.");
     }
+    // The just-started trial must not be masked by an earlier cached (pre-init)
+    // record served to a later GET /v1/me in this isolate.
+    invalidateClerkUser(userId);
   }
 
   const email = primaryEmail(user);
@@ -289,15 +298,6 @@ interface ClerkUserLike {
   privateMetadata?: Record<string, unknown> | null;
   primaryEmailAddressId?: string | null;
   emailAddresses?: Array<{ id: string; emailAddress: string }>;
-}
-
-interface ClerkClientLike {
-  users: {
-    updateUserMetadata(
-      userId: string,
-      params: { privateMetadata: Record<string, unknown> },
-    ): Promise<unknown>;
-  };
 }
 
 function primaryEmail(user: ClerkUserLike): string | null {

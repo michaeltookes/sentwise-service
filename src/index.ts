@@ -36,6 +36,7 @@ import {
   quotaSettle,
 } from "./quota-client";
 import { recordUsage } from "./analytics";
+import { invalidateClerkUser } from "./clerk-user-cache";
 import { handleMargin } from "./admin";
 import { recordInterest } from "./interest";
 import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
@@ -117,7 +118,10 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
-        const account = await resolveAccount(userId, env, { initialize: false });
+        // S-M1: this pure read is cache-eligible (short TTL). Drafting access is
+        // still re-checked fresh on /v1/draft, so a stale display can never grant
+        // access — it can only lag account state by at most the cache TTL.
+        const account = await resolveAccount(userId, env, { initialize: false, useCache: true });
         const { window } = await quotaPeek(env, userId, { now: Date.now() });
         const limits = resolveLimits(env, account.quotaOverride, window.windowStart);
         // quotaOverride is internal — build the response explicitly, never spread it.
@@ -132,6 +136,10 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "DELETE") {
         const { userId } = await authenticate(request, env);
+        // S-M1: account deletion must never read a cached record (the paid-account
+        // guard below and the post-delete tombstone must see fresh state), and it
+        // drops any entry a concurrent GET /v1/me cached in this isolate.
+        invalidateClerkUser(userId);
         const account = await resolveAccountIfExists(userId, env, { initialize: false });
         if (account && hasPaidAccess(account.subscription)) {
           throw activeSubscriptionDeletionError();
@@ -164,6 +172,8 @@ export default {
           throw err;
         }
         await finishAccountDeletion(env, userId, deletionAttemptId, ctx);
+        // Drop any record cached between the guard read and now (deleted user).
+        invalidateClerkUser(userId);
         return new Response(null, { status: 204 });
       }
 

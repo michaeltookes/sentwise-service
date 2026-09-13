@@ -26,6 +26,12 @@ vi.mock("@clerk/backend", () => ({
 // Import AFTER the mock is registered.
 import worker from "../src/index";
 import { clerkUserExists } from "../src/auth";
+import {
+  __resetClerkUserCache,
+  CLERK_USER_CACHE_TTL_MS,
+  getCachedClerkUser,
+  invalidateClerkUser,
+} from "../src/clerk-user-cache";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 import {
   PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
@@ -354,6 +360,7 @@ beforeEach(async () => {
   mocks.getUser.mockReset();
   mocks.updateUserMetadata.mockReset();
   mocks.deleteUser.mockReset();
+  __resetClerkUserCache();
   await clearPaddleCheckoutReservations("user_123");
 });
 
@@ -698,6 +705,91 @@ describe("GET /v1/me", () => {
     const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
     const body = (await res.json()) as any;
     expect(body.subscription).toEqual({ ...override, manageBillingUrl: null });
+  });
+});
+
+describe("S-M1 Clerk user cache", () => {
+  it("caches within the TTL and refetches after it expires", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.getUser.mockResolvedValue(userWith({}));
+      await getCachedClerkUser(env, "u-ttl", { useCache: true });
+      await getCachedClerkUser(env, "u-ttl", { useCache: true });
+      expect(mocks.getUser).toHaveBeenCalledTimes(1); // second served from cache
+      vi.advanceTimersByTime(CLERK_USER_CACHE_TTL_MS + 1);
+      await getCachedClerkUser(env, "u-ttl", { useCache: true });
+      expect(mocks.getUser).toHaveBeenCalledTimes(2); // refetched after expiry
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never caches when useCache is not set", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    await getCachedClerkUser(env, "u-nocache", { useCache: false });
+    await getCachedClerkUser(env, "u-nocache", { useCache: false });
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidateClerkUser drops a cached entry", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    await getCachedClerkUser(env, "u-inv", { useCache: true });
+    invalidateClerkUser("u-inv");
+    await getCachedClerkUser(env, "u-inv", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("serves a repeated GET /v1/me from cache (one Clerk lookup)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_me_cache" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const r1 = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const r2 = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+  });
+
+  it("does not serve POST /v1/draft from the /v1/me cache (fresh trial read)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_draft_fresh" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    await worker.fetch(req("/v1/me", { headers: bearer() }), env); // getUser #1 (cached)
+    const draft = await worker.fetch(draftReq("user_draft_fresh"), env); // getUser #2 (fresh)
+    expect(draft.status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates the cache when the first draft initializes the trial", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_init_inval" });
+    mocks.getUser.mockResolvedValue(userWith({})); // no trial yet
+    mocks.updateUserMetadata.mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    await worker.fetch(req("/v1/me", { headers: bearer() }), env); // getUser #1 (cached, pre-init)
+    await worker.fetch(draftReq("user_init_inval"), env); // getUser #2 (fresh) + trial init -> invalidate
+    await worker.fetch(req("/v1/me", { headers: bearer() }), env); // getUser #3 (cache was dropped)
+    expect(mocks.getUser).toHaveBeenCalledTimes(3);
+  });
+
+  it("never serves DELETE /v1/me from cache — it reads fresh state", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_del_bypass" });
+    // First a plain view caches a non-paid account.
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(200);
+
+    // The account then gains a paid subscription. A cache-served DELETE would miss
+    // it and wrongly proceed; a fresh read blocks with 409.
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: { plan: "pro", status: "active" },
+      }),
+    );
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(409);
+    expect(((await del.json()) as any).error.type).toBe("billing_subscription_active");
   });
 });
 
