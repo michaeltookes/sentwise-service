@@ -25,12 +25,26 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   // Public — safe to commit / expose. Present for parity / future use.
   CLERK_PUBLISHABLE_KEY: string;
+  // S-L1 (security pass 2026-09-13) — optional comma-separated allow-list of
+  // Clerk `azp` (authorized party) values passed to verifyToken. When unset,
+  // token verification is unchanged (no azp pinning). Config opt-in at cutover:
+  // @clerk/backend rejects tokens with absent or non-matching `azp` once this is
+  // set, and native-app session tokens may lack `azp`. Confirm the app's tokens
+  // carry a matching `azp` before enabling it. See src/auth.ts.
+  CLERK_AUTHORIZED_PARTIES?: string;
 
   // 56b — metering. Durable Object namespace holding per-account usage counters.
   ACCOUNT_QUOTA: DurableObjectNamespace;
   // 56b — margin dashboard. Aggregate, hashed usage metrics. Optional so the
   // Worker still runs (and tests pass) if the binding is absent.
   USAGE_ANALYTICS?: AnalyticsEngineDataset;
+  // S-I2 (security pass 2026-09-13) — optional secret key for the analytics userId
+  // hash (wrangler secret). When set, the userId is hashed with keyed HMAC-SHA256
+  // (prevents offline re-identification of the deterministic pseudonym); when
+  // unset, the hash falls back to the original unkeyed SHA-256 so nothing breaks
+  // before the secret is provisioned. NOTE: enabling the key changes every
+  // pseudonym, discontinuing hash continuity on the margin dashboard (accepted).
+  ANALYTICS_HASH_KEY?: string;
 
   // 56b — tunable limits (wrangler `vars`; strings or numbers, coerced in metering.ts).
   WEEKLY_DRAFT_LIMIT?: string | number;

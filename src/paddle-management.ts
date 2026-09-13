@@ -1,5 +1,5 @@
-import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
+import { getCachedClerkUser } from "./clerk-user-cache";
 import { storedPaddleCustomerId, storedPaddleSubscriptionId } from "./paddle-account";
 import {
   createPaddlePortalSession,
@@ -96,9 +96,10 @@ async function loadPaddleBillingAccount(
   userId: string,
   env: Env,
 ): Promise<PaddleBillingAccount | null> {
-  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
   try {
-    const user = await clerk.users.getUser(userId);
+    // S-M1: pure read of billing metadata — cache-eligible (short TTL). A stale
+    // subscription id only affects which portal URL we mint, never entitlement.
+    const user = await getCachedClerkUser(env, userId, { useCache: true });
     const meta = user.privateMetadata ?? {};
     const subscriptionId = storedPaddleSubscriptionId(meta.subscription);
     if (!subscriptionId) return null;

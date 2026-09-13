@@ -61,6 +61,16 @@ export function renderCallbackPage(pathname: string): Response {
       "cache-control": "no-store",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
+      // S-L3 (security pass 2026-09-13): defense-in-depth CSP. The page has one
+      // inline <script> and inline <style> (both required), and loads NO external
+      // resources — so 'unsafe-inline' for script/style with default-src 'none'
+      // locks everything else out. `frame-ancestors 'none'` blocks framing/
+      // clickjacking; `base-uri`/`form-action 'none'` remove those vectors. None
+      // of these restrict the top-level `sentwise://` navigation the script
+      // performs (no CSP directive governs top-level custom-scheme navigation), so
+      // the deep-link redirect and the "Open Sentwise" anchor still work.
+      "content-security-policy":
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
     },
   });
 }

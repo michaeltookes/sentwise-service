@@ -15,10 +15,30 @@ export interface UsageEvent {
   outcome: string; // "ok" or an error type
 }
 
-/** SHA-256 of the userId, hex-encoded. The raw userId never leaves this call. */
-export async function hashUserId(userId: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(userId));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+function toHex(buffer: ArrayBuffer): string {
+  return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Pseudonymize the userId for aggregate metrics. The raw userId never leaves this
+ * call. When `key` is provided (S-I2), it is a keyed HMAC-SHA256 — an attacker who
+ * later obtains the dataset cannot re-identify a userId by hashing candidates
+ * offline. Without a key it falls back to the original unkeyed SHA-256 so metrics
+ * keep working before the secret is provisioned.
+ */
+export async function hashUserId(userId: string, key?: string): Promise<string> {
+  const data = new TextEncoder().encode(userId);
+  if (key) {
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(key),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    return toHex(await crypto.subtle.sign("HMAC", cryptoKey, data));
+  }
+  return toHex(await crypto.subtle.digest("SHA-256", data));
 }
 
 /**
@@ -30,7 +50,7 @@ export async function recordUsage(env: Env, ev: UsageEvent): Promise<void> {
   const dataset = env.USAGE_ANALYTICS;
   if (!dataset) return;
   try {
-    const hashed = await hashUserId(ev.userId);
+    const hashed = await hashUserId(ev.userId, env.ANALYTICS_HASH_KEY);
     dataset.writeDataPoint({
       indexes: [hashed],
       blobs: [hashed, ev.model, ev.outcome],

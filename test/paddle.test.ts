@@ -22,6 +22,7 @@ import {
   priceIdsFromEvent,
   resolvePlanDraftLimit,
   statusFromEvent,
+  storedSubscriptionStatus,
   subscriptionIdFromEvent,
   transactionIdFromEvent,
   timingSafeEqualHex,
@@ -342,6 +343,58 @@ describe("statusFromEvent", () => {
       data: { id: "s", items: [{ price: { id: PRO_PRICE } }] },
     });
     expect(statusFromEvent(parsePaddleEvent(activated)!)).toBe("active");
+  });
+
+  it("does NOT fail open to active on an unrecognized status (S-L4)", () => {
+    // A future/unknown status string on subscription.created|updated (no event-type
+    // inference) previously defaulted to "active". It must not grant access.
+    const unknown = subscriptionEventBody({ status: "some_future_status" });
+    expect(statusFromEvent(parsePaddleEvent(unknown)!)).toBe("canceled");
+    const updated = JSON.stringify({
+      event_id: "e",
+      event_type: "subscription.updated",
+      data: { id: "s", status: "some_future_status", items: [{ price: { id: PRO_PRICE } }] },
+    });
+    expect(statusFromEvent(parsePaddleEvent(updated)!)).toBe("canceled");
+  });
+
+  it("defaults to the stored status on an unrecognized status when one exists (S-L4)", () => {
+    const updated = JSON.stringify({
+      event_id: "e",
+      event_type: "subscription.updated",
+      data: { id: "s", status: "some_future_status", items: [{ price: { id: PRO_PRICE } }] },
+    });
+    // Holds current entitlement rather than flipping to active-by-default or wrongly canceling.
+    expect(statusFromEvent(parsePaddleEvent(updated)!, "active")).toBe("active");
+    expect(statusFromEvent(parsePaddleEvent(updated)!, "past_due")).toBe("past_due");
+  });
+});
+
+describe("storedSubscriptionStatus (S-L4)", () => {
+  it("returns a valid stored status, else null", () => {
+    expect(storedSubscriptionStatus({ status: "active" })).toBe("active");
+    expect(storedSubscriptionStatus({ status: "canceled" })).toBe("canceled");
+    expect(storedSubscriptionStatus({ status: "bogus" })).toBeNull();
+    expect(storedSubscriptionStatus({})).toBeNull();
+    expect(storedSubscriptionStatus(null)).toBeNull();
+    expect(storedSubscriptionStatus(undefined)).toBeNull();
+  });
+
+  it("buildSubscriptionRecord uses the stored status for an unrecognized incoming status", () => {
+    const updated = parsePaddleEvent(
+      JSON.stringify({
+        event_id: "e",
+        event_type: "subscription.updated",
+        data: { id: "s", status: "some_future_status", items: [{ price: { id: PRO_PRICE } }] },
+      }),
+    )!;
+    expect(buildSubscriptionRecord(updated, "pro", PRO_PRICE, Date.now(), "active").status).toBe(
+      "active",
+    );
+    // No stored status -> non-entitling, never active-by-default.
+    expect(buildSubscriptionRecord(updated, "pro", PRO_PRICE, Date.now(), null).status).toBe(
+      "canceled",
+    );
   });
 });
 

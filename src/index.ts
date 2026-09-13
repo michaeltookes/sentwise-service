@@ -9,11 +9,13 @@ import {
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
-import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, type Env } from "./config";
+import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_RATE_LIMIT_PER_MIN, type Env } from "./config";
 import {
   buildQuota,
   conservativeRequestTokenBound,
+  effectiveEnforcement,
   mondayStartUtc,
+  numFrom,
   resolveLimits,
   type WindowState,
 } from "./metering";
@@ -30,6 +32,7 @@ import {
   quotaSettle,
 } from "./quota-client";
 import { recordUsage } from "./analytics";
+import { invalidateClerkUser } from "./clerk-user-cache";
 import { handleMargin } from "./admin";
 import { recordInterest } from "./interest";
 import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
@@ -111,9 +114,21 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
-        const account = await resolveAccount(userId, env, { initialize: false });
+        // S-M1: this pure read is cache-eligible (short TTL). Drafting access is
+        // still re-checked fresh on /v1/draft, so a stale display can never grant
+        // access — it can only lag account state by at most the cache TTL.
+        const account = await resolveAccount(userId, env, { initialize: false, useCache: true });
         const { window } = await quotaPeek(env, userId, { now: Date.now() });
-        const limits = resolveLimits(env, account.quotaOverride, window.windowStart);
+        const baseLimits = resolveLimits(env, account.quotaOverride, window.windowStart);
+        // S-M2: report the same effective mode a draft would enforce, so a trial
+        // account sees "hard" here too (it can't lag behind actual enforcement).
+        const limits = {
+          ...baseLimits,
+          enforcement: effectiveEnforcement(
+            baseLimits.enforcement,
+            hasPaidAccess(account.subscription),
+          ),
+        };
         // quotaOverride is internal — build the response explicitly, never spread it.
         return Response.json({
           userId: account.userId,
@@ -126,6 +141,10 @@ export default {
 
       if (pathname === "/v1/me" && request.method === "DELETE") {
         const { userId } = await authenticate(request, env);
+        // S-M1: account deletion must never read a cached record (the paid-account
+        // guard below and the post-delete tombstone must see fresh state), and it
+        // drops any entry a concurrent GET /v1/me cached in this isolate.
+        invalidateClerkUser(userId);
         const account = await resolveAccountIfExists(userId, env, { initialize: false });
         if (account && hasPaidAccess(account.subscription)) {
           throw activeSubscriptionDeletionError();
@@ -158,11 +177,34 @@ export default {
           throw err;
         }
         await finishAccountDeletion(env, userId, deletionAttemptId, ctx);
+        // Drop any record cached between the guard read and now (deleted user).
+        invalidateClerkUser(userId);
         return new Response(null, { status: 204 });
       }
 
       if (pathname === "/v1/draft" && request.method === "POST") {
         const { userId } = await authenticate(request, env);
+
+        // 1) Rate limit FIRST — before the Clerk trial lookup (S-M1). This runs
+        // the Durable Object limiter ahead of requireActiveTrial's Clerk Backend
+        // API call, so a scripted account is stopped by our per-account limiter
+        // rather than exhausting Clerk's per-instance backend rate limits (which
+        // would surface as account_lookup_failed for every user — a whole-service
+        // DoS). The rate limit is env-derived only (never per-account overridden),
+        // so it needs no Clerk lookup to evaluate.
+        const now = Date.now();
+        const check = await quotaCheck(env, userId, {
+          now,
+          rateLimitPerMin: numFrom(env.RATE_LIMIT_PER_MIN, DEFAULT_RATE_LIMIT_PER_MIN),
+        });
+        if (!check.allowed) {
+          const res = jsonError(429, "rate_limited", "Too many requests. Slow down and retry.", {
+            retryAfterSeconds: check.retryAfterSeconds,
+          });
+          res.headers.set("Retry-After", String(check.retryAfterSeconds));
+          return res;
+        }
+
         const account = await requireActiveTrial(userId, env);
 
         let body: unknown;
@@ -173,21 +215,16 @@ export default {
         }
         const draft = parseDraftRequest(body);
         const model = draft.model ?? DEFAULT_MODEL;
-        const now = Date.now();
-        const limits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
-
-        // 1) Rate limit + read the current window (records this request's timestamp).
-        const check = await quotaCheck(env, userId, {
-          now,
-          rateLimitPerMin: limits.rateLimitPerMin,
-        });
-        if (!check.allowed) {
-          const res = jsonError(429, "rate_limited", "Too many requests. Slow down and retry.", {
-            retryAfterSeconds: check.retryAfterSeconds,
-          });
-          res.headers.set("Retry-After", String(check.retryAfterSeconds));
-          return res;
-        }
+        // S-M2: trial accounts are hard-enforced regardless of ENFORCEMENT_MODE so
+        // a throwaway trial can't run unbounded spend; paid tiers keep the env mode.
+        const baseLimits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
+        const limits = {
+          ...baseLimits,
+          enforcement: effectiveEnforcement(
+            baseLimits.enforcement,
+            hasPaidAccess(account.subscription),
+          ),
+        };
 
         // 2) Per-request token safety cap (pre-flight conservative bound).
         const content = draftContentSize(draft.system, draft.messages);

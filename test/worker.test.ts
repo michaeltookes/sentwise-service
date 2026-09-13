@@ -26,6 +26,13 @@ vi.mock("@clerk/backend", () => ({
 // Import AFTER the mock is registered.
 import worker from "../src/index";
 import { clerkUserExists } from "../src/auth";
+import {
+  __resetClerkUserCache,
+  CLERK_USER_CACHE_MAX_ENTRIES,
+  CLERK_USER_CACHE_TTL_MS,
+  getCachedClerkUser,
+  invalidateClerkUser,
+} from "../src/clerk-user-cache";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 import {
   PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
@@ -354,6 +361,7 @@ beforeEach(async () => {
   mocks.getUser.mockReset();
   mocks.updateUserMetadata.mockReset();
   mocks.deleteUser.mockReset();
+  __resetClerkUserCache();
   await clearPaddleCheckoutReservations("user_123");
 });
 
@@ -428,6 +436,29 @@ describe("auth", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("forwards CLERK_AUTHORIZED_PARTIES to verifyToken when set (S-L1)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const res = await worker.fetch(req("/v1/me", { headers: bearer("good-token") }), {
+      ...env,
+      CLERK_AUTHORIZED_PARTIES: "sentwise-app, other-client",
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.verifyToken).toHaveBeenCalledWith(
+      "good-token",
+      expect.objectContaining({ authorizedParties: ["sentwise-app", "other-client"] }),
+    );
+  });
+
+  it("omits authorizedParties from verifyToken when the env var is unset (S-L1)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const res = await worker.fetch(req("/v1/me", { headers: bearer("good-token") }), env);
+    expect(res.status).toBe(200);
+    expect(mocks.verifyToken).toHaveBeenCalledOnce();
+    expect(mocks.verifyToken.mock.calls[0][1]).not.toHaveProperty("authorizedParties");
   });
 });
 
@@ -675,6 +706,133 @@ describe("GET /v1/me", () => {
     const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
     const body = (await res.json()) as any;
     expect(body.subscription).toEqual({ ...override, manageBillingUrl: null });
+  });
+});
+
+describe("S-M1 Clerk user cache", () => {
+  it("caches within the TTL and refetches after it expires", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.getUser.mockResolvedValue(userWith({}));
+      await getCachedClerkUser(env, "u-ttl", { useCache: true });
+      await getCachedClerkUser(env, "u-ttl", { useCache: true });
+      expect(mocks.getUser).toHaveBeenCalledTimes(1); // second served from cache
+      vi.advanceTimersByTime(CLERK_USER_CACHE_TTL_MS + 1);
+      await getCachedClerkUser(env, "u-ttl", { useCache: true });
+      expect(mocks.getUser).toHaveBeenCalledTimes(2); // refetched after expiry
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never caches when useCache is not set", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    await getCachedClerkUser(env, "u-nocache", { useCache: false });
+    await getCachedClerkUser(env, "u-nocache", { useCache: false });
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("coalesces concurrent cache misses for the same user", async () => {
+    const user = userWith({});
+    const lookup = deferred<typeof user>();
+    mocks.getUser.mockReturnValueOnce(lookup.promise);
+
+    const first = getCachedClerkUser(env, "u-flight", { useCache: true });
+    const second = getCachedClerkUser(env, "u-flight", { useCache: true });
+
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+    lookup.resolve(user);
+    await expect(Promise.all([first, second])).resolves.toEqual([user, user]);
+
+    await getCachedClerkUser(env, "u-flight", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+  });
+
+  it("removes failed in-flight lookups so cacheable calls can retry", async () => {
+    const user = userWith({});
+    mocks.getUser.mockRejectedValueOnce(new Error("clerk down")).mockResolvedValueOnce(user);
+
+    await expect(getCachedClerkUser(env, "u-retry", { useCache: true })).rejects.toThrow(
+      "clerk down",
+    );
+    await expect(getCachedClerkUser(env, "u-retry", { useCache: true })).resolves.toBe(user);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds the cache by evicting the oldest entry", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+
+    for (let i = 0; i < CLERK_USER_CACHE_MAX_ENTRIES; i += 1) {
+      await getCachedClerkUser(env, `u-bound-${i}`, { useCache: true });
+    }
+    expect(mocks.getUser).toHaveBeenCalledTimes(CLERK_USER_CACHE_MAX_ENTRIES);
+
+    await getCachedClerkUser(env, "u-bound-new", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledTimes(CLERK_USER_CACHE_MAX_ENTRIES + 1);
+
+    await getCachedClerkUser(env, "u-bound-0", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledTimes(CLERK_USER_CACHE_MAX_ENTRIES + 2);
+  });
+
+  it("invalidateClerkUser drops a cached entry", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    await getCachedClerkUser(env, "u-inv", { useCache: true });
+    invalidateClerkUser("u-inv");
+    await getCachedClerkUser(env, "u-inv", { useCache: true });
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("serves a repeated GET /v1/me from cache (one Clerk lookup)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_me_cache" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const r1 = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    const r2 = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+  });
+
+  it("does not serve POST /v1/draft from the /v1/me cache (fresh trial read)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_draft_fresh" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    await worker.fetch(req("/v1/me", { headers: bearer() }), env); // getUser #1 (cached)
+    const draft = await worker.fetch(draftReq("user_draft_fresh"), env); // getUser #2 (fresh)
+    expect(draft.status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates the cache when the first draft initializes the trial", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_init_inval" });
+    mocks.getUser.mockResolvedValue(userWith({})); // no trial yet
+    mocks.updateUserMetadata.mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+
+    await worker.fetch(req("/v1/me", { headers: bearer() }), env); // getUser #1 (cached, pre-init)
+    await worker.fetch(draftReq("user_init_inval"), env); // getUser #2 (fresh) + trial init -> invalidate
+    await worker.fetch(req("/v1/me", { headers: bearer() }), env); // getUser #3 (cache was dropped)
+    expect(mocks.getUser).toHaveBeenCalledTimes(3);
+  });
+
+  it("never serves DELETE /v1/me from cache — it reads fresh state", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_del_bypass" });
+    // First a plain view caches a non-paid account.
+    mocks.getUser.mockResolvedValue(activeTrial());
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(200);
+
+    // The account then gains a paid subscription. A cache-served DELETE would miss
+    // it and wrongly proceed; a fresh read blocks with 409.
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: { plan: "pro", status: "active" },
+      }),
+    );
+    const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+    expect(del.status).toBe(409);
+    expect(((await del.json()) as any).error.type).toBe("billing_subscription_active");
   });
 });
 
@@ -3419,7 +3577,7 @@ describe("56b draft metering", () => {
       limit: 100, // WEEKLY_DRAFT_LIMIT var default
       remaining: 99,
       tokenLimit: 2_000_000,
-      enforcement: "soft",
+      enforcement: "hard", // S-M2: trial accounts are always hard-enforced
       extraPurchased: 0,
     });
     expect(q.tokensUsed).toBe(5); // 3 in + 2 out from anthropicOk
@@ -3478,6 +3636,26 @@ describe("56b draft metering", () => {
     expect(second.headers.get("Retry-After")).toBeTruthy();
     // The rate-limited request never reached Anthropic.
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("runs the rate limiter BEFORE the Clerk trial lookup (S-M1)", async () => {
+    // The DoS fix: a rate-limited request must not reach requireActiveTrial's
+    // Clerk Backend API getUser, so a scripted account can't exhaust Clerk's
+    // per-instance limits. verifyToken (JWKS, cheap) still runs to resolve the
+    // user id; getUser (the backend call) must not.
+    mocks.verifyToken.mockResolvedValue({ sub: "u-reorder" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const rlEnv: Env = { ...env, RATE_LIMIT_PER_MIN: "1" };
+
+    const first = await worker.fetch(draftReq("u-reorder"), rlEnv);
+    expect(first.status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+
+    const second = await worker.fetch(draftReq("u-reorder"), rlEnv);
+    expect(second.status).toBe(429);
+    // Clerk was NOT consulted for the rate-limited request.
+    expect(mocks.getUser).toHaveBeenCalledOnce();
   });
 
   it("rejects an over-cap request with 413 request_too_large before forwarding", async () => {
@@ -3654,9 +3832,15 @@ describe("56b draft metering", () => {
     expect(fetchMock).toHaveBeenCalledOnce(); // blocked before the 2nd forward
   });
 
-  it("soft enforcement meters past the cap but keeps drafting", async () => {
+  it("soft enforcement meters a PAID account past the cap but keeps drafting", async () => {
+    // S-M2: soft mode only applies to paid tiers now — use a paid subscription.
     mocks.verifyToken.mockResolvedValue({ sub: "u-soft" });
-    mocks.getUser.mockResolvedValue(activeTrial());
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: { plan: "pro", status: "active" },
+      }),
+    );
     // Fresh Response per call — the body is single-use and this test forwards twice.
     vi.stubGlobal(
       "fetch",
@@ -3671,6 +3855,43 @@ describe("56b draft metering", () => {
     expect(q.used).toBe(2);
     expect(q.limit).toBe(1);
     expect(q.remaining).toBe(0); // clamped
+    expect(q.enforcement).toBe("soft"); // paid tier keeps the env mode
+  });
+
+  it("hard-enforces a TRIAL account over quota even when ENFORCEMENT_MODE=soft (S-M2)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-trial-hard" });
+    mocks.getUser.mockResolvedValue(activeTrial()); // trial, not paid
+    const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    // soft mode configured, but a trial must still be blocked at the cap.
+    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+
+    const first = await worker.fetch(draftReq("u-trial-hard"), softEnv);
+    expect(first.status).toBe(200); // draftsUsed -> 1
+
+    const second = await worker.fetch(draftReq("u-trial-hard"), softEnv);
+    expect(second.status).toBe(429);
+    expect(((await second.json()) as any).error.type).toBe("quota_exceeded");
+    expect(fetchMock).toHaveBeenCalledOnce(); // blocked before the 2nd forward
+  });
+
+  it("a PAID account is NOT blocked at the cap under ENFORCEMENT_MODE=soft (S-M2)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-paid-soft" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: { plan: "starter", status: "active" },
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => anthropicOk("ok")),
+    );
+    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+
+    expect((await worker.fetch(draftReq("u-paid-soft"), softEnv)).status).toBe(200);
+    const res2 = await worker.fetch(draftReq("u-paid-soft"), softEnv);
+    expect(res2.status).toBe(200); // paid + soft keeps drafting past the cap
   });
 });
 
@@ -3687,7 +3908,7 @@ describe("56b /v1/me quota", () => {
       limit: 100,
       remaining: 100,
       tokenLimit: 2_000_000,
-      enforcement: "soft",
+      enforcement: "hard", // S-M2: a trial account reports hard on /v1/me too
       extraPurchased: 0,
     });
     // Viewing the account must not start a trial or record usage.

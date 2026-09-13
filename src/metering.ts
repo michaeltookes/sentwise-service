@@ -95,6 +95,23 @@ export function parseEnforcement(v: string | undefined): EnforcementMode {
   return DEFAULT_ENFORCEMENT_MODE;
 }
 
+/**
+ * Effective enforcement mode for a request (S-M2, security pass 2026-09-13).
+ *
+ * Trial accounts are ALWAYS hard-enforced regardless of ENFORCEMENT_MODE: a free,
+ * throwaway trial account must not be able to run unbounded Anthropic spend past
+ * its weekly caps. Paid tiers keep honoring the configured env-var mode — the 56b
+ * measure-first ("soft") decision stands for accounts that are actually billed.
+ *
+ * `hasPaidAccess` is the paid-vs-trial signal (see hasPaidAccess in src/auth.ts).
+ */
+export function effectiveEnforcement(
+  configured: EnforcementMode,
+  hasPaidAccess: boolean,
+): EnforcementMode {
+  return hasPaidAccess ? configured : "hard";
+}
+
 /** Safely parse `privateMetadata.quota` (untrusted-ish) into a QuotaOverride. */
 export function parseQuotaOverride(raw: unknown): QuotaOverride {
   if (typeof raw !== "object" || raw === null) return {};

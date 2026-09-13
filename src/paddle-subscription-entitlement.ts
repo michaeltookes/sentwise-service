@@ -15,6 +15,7 @@ import {
   isSubscriptionEvent,
   planFromEvent,
   resolvePlanDraftLimit,
+  storedSubscriptionStatus,
   subscriptionIdFromEvent,
   type PaddleEvent,
 } from "./paddle";
@@ -132,7 +133,15 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const record = {
-    ...buildSubscriptionRecord(body.event, mapped.plan, mapped.priceId, body.now),
+    // S-L4: pass the last known stored status so an unrecognized incoming status
+    // can't fail open to "active" — it holds the current status or denies.
+    ...buildSubscriptionRecord(
+      body.event,
+      mapped.plan,
+      mapped.priceId,
+      body.now,
+      storedSubscriptionStatus(existingSub),
+    ),
     ...supersededSubscriptionHistory(
       supersededSubscriptionIds,
       isDifferentSubscription ? existingSubscriptionId : null,
