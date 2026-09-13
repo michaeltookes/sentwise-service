@@ -77,7 +77,9 @@ beforeAll(async () => {
     ["sign", "verify"],
   )) as CryptoKeyPair;
   privateKey = pair.privateKey;
-  const spki = new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey));
+  const spki = new Uint8Array(
+    (await crypto.subtle.exportKey("spki", pair.publicKey)) as ArrayBuffer,
+  );
   const b64 = btoa(String.fromCharCode(...spki));
   pem = `-----BEGIN PUBLIC KEY-----\n${b64.replace(/(.{64})/g, "$1\n")}\n-----END PUBLIC KEY-----`;
 });

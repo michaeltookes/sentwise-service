@@ -9,11 +9,17 @@ import {
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
-import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, type Env } from "./config";
+import {
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_MODEL,
+  DEFAULT_RATE_LIMIT_PER_MIN,
+  type Env,
+} from "./config";
 import {
   buildQuota,
   conservativeRequestTokenBound,
   mondayStartUtc,
+  numFrom,
   resolveLimits,
   type WindowState,
 } from "./metering";
@@ -163,6 +169,27 @@ export default {
 
       if (pathname === "/v1/draft" && request.method === "POST") {
         const { userId } = await authenticate(request, env);
+
+        // 1) Rate limit FIRST — before the Clerk trial lookup (S-M1). This runs
+        // the Durable Object limiter ahead of requireActiveTrial's Clerk Backend
+        // API call, so a scripted account is stopped by our per-account limiter
+        // rather than exhausting Clerk's per-instance backend rate limits (which
+        // would surface as account_lookup_failed for every user — a whole-service
+        // DoS). The rate limit is env-derived only (never per-account overridden),
+        // so it needs no Clerk lookup to evaluate.
+        const now = Date.now();
+        const check = await quotaCheck(env, userId, {
+          now,
+          rateLimitPerMin: numFrom(env.RATE_LIMIT_PER_MIN, DEFAULT_RATE_LIMIT_PER_MIN),
+        });
+        if (!check.allowed) {
+          const res = jsonError(429, "rate_limited", "Too many requests. Slow down and retry.", {
+            retryAfterSeconds: check.retryAfterSeconds,
+          });
+          res.headers.set("Retry-After", String(check.retryAfterSeconds));
+          return res;
+        }
+
         const account = await requireActiveTrial(userId, env);
 
         let body: unknown;
@@ -173,21 +200,7 @@ export default {
         }
         const draft = parseDraftRequest(body);
         const model = draft.model ?? DEFAULT_MODEL;
-        const now = Date.now();
         const limits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
-
-        // 1) Rate limit + read the current window (records this request's timestamp).
-        const check = await quotaCheck(env, userId, {
-          now,
-          rateLimitPerMin: limits.rateLimitPerMin,
-        });
-        if (!check.allowed) {
-          const res = jsonError(429, "rate_limited", "Too many requests. Slow down and retry.", {
-            retryAfterSeconds: check.retryAfterSeconds,
-          });
-          res.headers.set("Retry-After", String(check.retryAfterSeconds));
-          return res;
-        }
 
         // 2) Per-request token safety cap (pre-flight conservative bound).
         const content = draftContentSize(draft.system, draft.messages);

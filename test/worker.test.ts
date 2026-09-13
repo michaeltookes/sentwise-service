@@ -3503,6 +3503,26 @@ describe("56b draft metering", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("runs the rate limiter BEFORE the Clerk trial lookup (S-M1)", async () => {
+    // The DoS fix: a rate-limited request must not reach requireActiveTrial's
+    // Clerk Backend API getUser, so a scripted account can't exhaust Clerk's
+    // per-instance limits. verifyToken (JWKS, cheap) still runs to resolve the
+    // user id; getUser (the backend call) must not.
+    mocks.verifyToken.mockResolvedValue({ sub: "u-reorder" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
+    const rlEnv: Env = { ...env, RATE_LIMIT_PER_MIN: "1" };
+
+    const first = await worker.fetch(draftReq("u-reorder"), rlEnv);
+    expect(first.status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+
+    const second = await worker.fetch(draftReq("u-reorder"), rlEnv);
+    expect(second.status).toBe(429);
+    // Clerk was NOT consulted for the rate-limited request.
+    expect(mocks.getUser).toHaveBeenCalledOnce();
+  });
+
   it("rejects an over-cap request with 413 request_too_large before forwarding", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-big" });
     mocks.getUser.mockResolvedValue(activeTrial());
