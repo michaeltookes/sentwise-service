@@ -6,7 +6,7 @@
 // is counters, timestamps, and random reservation IDs, never content:
 //   1. `trialStartedAt` in the user's Clerk `privateMetadata` (56a).
 //   2. Per-account usage counters + timestamps in a Durable Object (`AccountQuota`,
-//      56b) — weekly drafts/tokens used, in-flight token reservations, a sliding
+//      56b) — monthly drafts/tokens used, in-flight token reservations, a sliding
 //      rate-limit window, and random reservation IDs keyed by Clerk userId. No
 //      prompts, no drafts, no emails.
 //   3. Aggregate, hashed usage metrics in Workers Analytics Engine (56b) — a SHA-256
@@ -47,8 +47,8 @@ export interface Env {
   ANALYTICS_HASH_KEY?: string;
 
   // 56b — tunable limits (wrangler `vars`; strings or numbers, coerced in metering.ts).
-  WEEKLY_DRAFT_LIMIT?: string | number;
-  WEEKLY_TOKEN_LIMIT?: string | number;
+  MONTHLY_DRAFT_LIMIT?: string | number;
+  MONTHLY_TOKEN_LIMIT?: string | number;
   RATE_LIMIT_PER_MIN?: string | number;
   MAX_TOKENS_PER_REQUEST?: string | number;
   ENFORCEMENT_MODE?: string; // "soft" (default) | "hard"
@@ -69,9 +69,9 @@ export interface Env {
   PADDLE_CHECKOUT_BINDING_SECRET?: string; // stable HMAC secret for server-minted checkout binding; defaults to PADDLE_WEBHOOK_SECRET
   PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // previous checkout-binding secret accepted during rotations
 
-  // 56c — per-tier weekly draft limits. Server-side placeholders (measure-first,
-  // like the 56b limits): tunable per-deploy without shipping a new binary, and
-  // written per-account into Clerk `privateMetadata.quota.weeklyDraftLimit` by the
+  // 56c — per-tier monthly draft limits (the marketed caps; owner decision
+  // 2026-09-16). Tunable per-deploy without shipping a new binary, and written
+  // per-account into Clerk `privateMetadata.quota.monthlyDraftLimit` by the
   // webhook so 56b enforcement uses them.
   STARTER_DRAFT_LIMIT?: string | number;
   PRO_DRAFT_LIMIT?: string | number;
@@ -110,12 +110,17 @@ export const MAX_TOTAL_CONTENT_CHARS = 200_000;
 // 56b — metering + limits.
 // ---------------------------------------------------------------------------
 
-// Weekly allotment (owner decision 2026-08-29: weekly reset + pay-per-use
-// overage). These are PLACEHOLDER defaults — final numbers land with 56c
-// pricing. Overridable per-deploy via wrangler `vars`, and per-account via
-// Clerk `privateMetadata.quota` (56c writes purchased extras there).
-export const DEFAULT_WEEKLY_DRAFT_LIMIT = 100;
-export const DEFAULT_WEEKLY_TOKEN_LIMIT = 2_000_000;
+// Base monthly allotment for accounts without a per-tier override — trial
+// accounts and any fallback. The window is a calendar month in UTC (owner
+// decision 2026-09-16; see the window computation in metering.ts). These
+// preserve the intent of the earlier weekly base (100 drafts / 2M tokens per
+// week) at a monthly cadence — ~4.3x the weekly figure, rounded to clean
+// numbers. Overridable per-deploy via wrangler `vars`, and per-account via
+// Clerk `privateMetadata.quota` (56c writes purchased extras there). The trial
+// is also time-bounded to TRIAL_DAYS and hard-enforced (see effectiveEnforcement),
+// so a single trial rarely spans a full monthly allotment.
+export const DEFAULT_MONTHLY_DRAFT_LIMIT = 400;
+export const DEFAULT_MONTHLY_TOKEN_LIMIT = 8_000_000;
 
 // Abuse-prevention rate limit (sliding 60s window), per account.
 export const DEFAULT_RATE_LIMIT_PER_MIN = 10;
@@ -180,7 +185,7 @@ export type PaidPlan = "starter" | "pro" | "unlimited";
 
 // Paddle price id -> paid tier. SANDBOX price ids (owner swaps for live ids when
 // flipping PADDLE_API_BASE to the live base). The *plan* is stable; the tier's
-// weekly draft limit is resolved from a var at runtime (see PLAN_DRAFT_LIMIT_VAR
+// monthly draft limit is resolved from a var at runtime (see PLAN_DRAFT_LIMIT_VAR
 // / resolvePlanDraftLimit in src/paddle.ts) so it stays tunable without a release.
 export const PRICE_TO_PLAN: Record<string, PaidPlan> = {
   pri_01m1syd7nfarp8pggpcnvjbgyy: "starter",
@@ -188,10 +193,11 @@ export const PRICE_TO_PLAN: Record<string, PaidPlan> = {
   pri_01m1syrdg05f49kz705gbzn6tz: "unlimited",
 };
 
-// Per-tier weekly draft limit PLACEHOLDER defaults. These are deliberately not
-// "final" numbers — the window unit (weekly vs. monthly) and real per-tier caps
-// are an open owner decision (see the 56c note in docs/backlog.md). Overridable
-// per-deploy via the STARTER/PRO/UNLIMITED_DRAFT_LIMIT vars.
+// Per-tier MONTHLY draft-limit defaults (owner decision 2026-09-16): the caps
+// the marketing site sells — "30 follow-ups a month" (starter), "120 a month"
+// (pro), fair-use unlimited. Enforced over a calendar-month UTC window (see
+// metering.ts). Overridable per-deploy via the STARTER/PRO/UNLIMITED_DRAFT_LIMIT
+// vars.
 export const DEFAULT_STARTER_DRAFT_LIMIT = 30;
 export const DEFAULT_PRO_DRAFT_LIMIT = 120;
 export const DEFAULT_UNLIMITED_DRAFT_LIMIT = 100_000; // fair-use ceiling, not "infinite"

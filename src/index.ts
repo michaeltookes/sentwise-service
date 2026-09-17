@@ -14,7 +14,7 @@ import {
   buildQuota,
   conservativeRequestTokenBound,
   effectiveEnforcement,
-  mondayStartUtc,
+  windowStartUtc,
   numFrom,
   resolveLimits,
   type WindowState,
@@ -217,7 +217,7 @@ export default {
         const model = draft.model ?? DEFAULT_MODEL;
         // S-M2: trial accounts are hard-enforced regardless of ENFORCEMENT_MODE so
         // a throwaway trial can't run unbounded spend; paid tiers keep the env mode.
-        const baseLimits = resolveLimits(env, account.quotaOverride, mondayStartUtc(now));
+        const baseLimits = resolveLimits(env, account.quotaOverride, windowStartUtc(now));
         const limits = {
           ...baseLimits,
           enforcement: effectiveEnforcement(
@@ -238,7 +238,7 @@ export default {
           throw new ApiError(413, "request_too_large", "The request is too large to draft.");
         }
 
-        // 3) Weekly quota admission + draft reservation. Hard mode blocks atomically;
+        // 3) Monthly quota admission + draft reservation. Hard mode blocks atomically;
         // soft mode reserves and continues so successful drafts are metered once.
         const reservationId = crypto.randomUUID();
         const reservation = await quotaReserve(env, userId, {
@@ -249,7 +249,7 @@ export default {
         });
         if (!reservation.reserved && reservation.blockedByQuota) {
           const resetsAt = buildQuota(reservation.window, limits).resetsAt;
-          throw new ApiError(429, "quota_exceeded", "You've used your weekly allowance.", {
+          throw new ApiError(429, "quota_exceeded", "You've used your monthly allowance.", {
             resetsAt,
           });
         }
@@ -462,7 +462,7 @@ async function releaseReservedUsage(
       }
       if (isAccountDeletionError(retryErr)) return;
       // The reservation also has a DO-side TTL, so a repeated release outage
-      // cannot hold quota capacity until the weekly reset.
+      // cannot hold quota capacity until the monthly reset.
     }
   }
 }

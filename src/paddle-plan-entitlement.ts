@@ -43,7 +43,7 @@ export function parsePaddlePlanChangeEntitlementBody(
 
 /**
  * Optimistically bump the stored subscription record's plan/priceId and the
- * account's weekly draft limit to the new tier. This function is called from the
+ * account's monthly draft limit to the new tier. This function is called from the
  * account Durable Object write queue and reads Clerk metadata inside that queue,
  * so webhook updates that finish during the Paddle network call are preserved.
  */
@@ -117,9 +117,9 @@ function quotaForLatestSubscriptionStatus(
 ): Record<string, unknown> {
   const quota = { ...existingQuota };
   if (status === "active" || status === "trialing" || status === "past_due") {
-    quota.weeklyDraftLimit = resolvePlanDraftLimit(env, plan);
+    quota.monthlyDraftLimit = resolvePlanDraftLimit(env, plan);
   } else {
-    quota.weeklyDraftLimit = null;
+    quota.monthlyDraftLimit = null;
   }
   return quota;
 }

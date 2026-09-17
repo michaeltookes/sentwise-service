@@ -309,9 +309,9 @@ function quotaForSubscriptionStatus(
 ): Record<string, unknown> {
   const quota = { ...existingQuota };
   if (plan && (status === "active" || status === "trialing" || status === "past_due")) {
-    quota.weeklyDraftLimit = resolvePlanDraftLimit(env, plan);
+    quota.monthlyDraftLimit = resolvePlanDraftLimit(env, plan);
   } else {
-    quota.weeklyDraftLimit = null;
+    quota.monthlyDraftLimit = null;
   }
   return quota;
 }

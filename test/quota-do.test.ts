@@ -1,12 +1,7 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
-import {
-  RESERVATION_TTL_MS,
-  WEEK_MS,
-  type ResolvedLimits,
-  type WindowState,
-} from "../src/metering";
+import { RESERVATION_TTL_MS, type ResolvedLimits, type WindowState } from "../src/metering";
 import { AccountQuota } from "../src/quota-do";
 
 const clerkMocks = vi.hoisted(() => ({
@@ -34,7 +29,8 @@ vi.mock("../src/auth", () => ({
   deleteClerkUser: clerkMocks.deleteClerkUser,
 }));
 
-const MON = Date.parse("2024-01-01T00:00:00.000Z"); // a Monday
+const MON = Date.parse("2024-01-01T00:00:00.000Z"); // the 1st of the month (also a Monday)
+const FEB = Date.parse("2024-02-01T00:00:00.000Z"); // the next monthly reset boundary
 const OLD_BOUNDED_ARRAY_SIZE = 128;
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
 const OVERAGE_PRICE = "pri_overage";
@@ -107,8 +103,8 @@ beforeEach(() => {
 });
 
 const hardLimits: ResolvedLimits = {
-  weeklyDraftLimit: 1,
-  weeklyTokenLimit: 2_000_000,
+  monthlyDraftLimit: 1,
+  monthlyTokenLimit: 2_000_000,
   rateLimitPerMin: 10,
   maxTokensPerRequest: 55_000,
   enforcement: "hard",
@@ -200,11 +196,11 @@ function delayedJsonRequest(op: string, body: unknown, release: Promise<void>): 
 }
 
 describe("AccountQuota Durable Object", () => {
-  it("check returns the current weekly window (Mon 00:00 UTC start)", async () => {
+  it("check returns the current monthly window (1st 00:00 UTC start)", async () => {
     const r = await callDO<CheckResult>("do-window", "/check", { now: MON, rateLimitPerMin: 10 });
     expect(r.allowed).toBe(true);
     expect(r.window.windowStart).toBe(MON);
-    expect(r.window.resetsAt).toBe(MON + WEEK_MS);
+    expect(r.window.resetsAt).toBe(FEB);
     expect(r.window.draftsUsed).toBe(0);
   });
 
@@ -257,8 +253,8 @@ describe("AccountQuota Durable Object", () => {
   it("reserve counts estimated tokens in hard quota admission", async () => {
     const limits: ResolvedLimits = {
       ...hardLimits,
-      weeklyDraftLimit: 10,
-      weeklyTokenLimit: 100,
+      monthlyDraftLimit: 10,
+      monthlyTokenLimit: 100,
     };
     const first = await callDO<ReserveResult>("do-reserve-tokens", "/reserve", {
       now: MON,
@@ -485,12 +481,12 @@ describe("AccountQuota Durable Object", () => {
     expect(await storedKeys(stub)).toEqual([ACCOUNT_DELETION_KEY]);
     expect(await pendingSettlements(stub)).toEqual([]);
 
-    const peek = await callDOResponse(uid, "/peek", { now: MON + WEEK_MS });
+    const peek = await callDOResponse(uid, "/peek", { now: FEB });
     expect(peek.status).toBe(410);
     expect(((await peek.json()) as any).error.type).toBe("account_deleted");
 
     const check = await callDOResponse(uid, "/check", {
-      now: MON + WEEK_MS,
+      now: FEB,
       rateLimitPerMin: 10,
     });
     expect(check.status).toBe(410);
@@ -1216,7 +1212,7 @@ describe("AccountQuota Durable Object", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       await state.storage.put("window", {
         windowStart: MON,
-        resetsAt: MON + WEEK_MS,
+        resetsAt: FEB,
         draftsUsed: 1,
         tokensUsed: 5,
       });
@@ -1526,7 +1522,7 @@ describe("AccountQuota Durable Object", () => {
         "window",
         {
           windowStart: MON,
-          resetsAt: MON + WEEK_MS,
+          resetsAt: FEB,
           draftsUsed: 1,
           tokensUsed: 0,
         },
@@ -1865,8 +1861,8 @@ describe("AccountQuota Durable Object", () => {
     const baseNow = Date.now() + 60_000;
     const limits: ResolvedLimits = {
       ...hardLimits,
-      weeklyDraftLimit: count + 1,
-      weeklyTokenLimit: count + 1,
+      monthlyDraftLimit: count + 1,
+      monthlyTokenLimit: count + 1,
     };
 
     for (let i = 0; i < count; i++) {
@@ -1899,7 +1895,7 @@ describe("AccountQuota Durable Object", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       await state.storage.put("window", {
         windowStart: MON,
-        resetsAt: MON + WEEK_MS,
+        resetsAt: FEB,
         draftsUsed: count,
         tokensUsed: count,
         tokensReserved: 0,
@@ -1942,7 +1938,7 @@ describe("AccountQuota Durable Object", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       await state.storage.put("window", {
         windowStart: MON,
-        resetsAt: MON + WEEK_MS,
+        resetsAt: FEB,
         draftsUsed: 1,
         tokensUsed: 500,
         tokensReserved: 0,
@@ -1965,8 +1961,8 @@ describe("AccountQuota Durable Object", () => {
   it("expires abandoned reservations before admitting more hard quota capacity", async () => {
     const limits: ResolvedLimits = {
       ...hardLimits,
-      weeklyDraftLimit: 1,
-      weeklyTokenLimit: 500,
+      monthlyDraftLimit: 1,
+      monthlyTokenLimit: 500,
     };
     const first = await callDO<ReserveResult>("do-expire-reservation", "/reserve", {
       now: MON,
@@ -1994,11 +1990,11 @@ describe("AccountQuota Durable Object", () => {
     ]);
   });
 
-  it("rolls the window to a fresh, zeroed one at the next Monday", async () => {
+  it("rolls the window to a fresh, zeroed one at the next month", async () => {
     await callDO("do-roll", "/settle", { now: MON + 1000, draftsDelta: 5, tokensDelta: 9999 });
     // Peek exactly at the reset instant -> new window, counters reset.
-    const r = await callDO<WindowResult>("do-roll", "/peek", { now: MON + WEEK_MS });
-    expect(r.window.windowStart).toBe(MON + WEEK_MS);
+    const r = await callDO<WindowResult>("do-roll", "/peek", { now: FEB });
+    expect(r.window.windowStart).toBe(FEB);
     expect(r.window.draftsUsed).toBe(0);
     expect(r.window.tokensUsed).toBe(0);
   });

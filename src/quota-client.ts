@@ -143,7 +143,7 @@ export function quotaCheck(
   return call<CheckResult>(env, userId, "/check", body);
 }
 
-/** Atomically admit a draft against the weekly quota and reserve one draft slot. */
+/** Atomically admit a draft against the monthly quota and reserve one draft slot. */
 export function quotaReserve(
   env: Env,
   userId: string,

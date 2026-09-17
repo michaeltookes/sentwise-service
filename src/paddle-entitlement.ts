@@ -2,7 +2,7 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { mondayStartUtc } from "./metering";
+import { windowStartUtc } from "./metering";
 import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
 import type { OverageAdjustmentAction } from "./paddle";
 
@@ -292,7 +292,7 @@ export async function recordPaddleOverageInClerk(
     return { mapped: false };
   }
 
-  const windowStart = mondayStartUtc(body.now);
+  const windowStart = windowStartUtc(body.now);
   const sameWindow = existingQuota.extraDraftsWindowStart === windowStart;
   const prevExtras =
     sameWindow && typeof existingQuota.extraDrafts === "number"
@@ -595,7 +595,7 @@ function overageCreditRepairWindowStart(
       transaction.eventId === body.eventId && transaction.transactionId === body.transactionId,
   );
   if (matchingTransaction) return matchingTransaction.windowStart;
-  return body.eventWindowStart ?? mondayStartUtc(body.now);
+  return body.eventWindowStart ?? windowStartUtc(body.now);
 }
 
 function storedOverageCreditTransactionFromCredits(

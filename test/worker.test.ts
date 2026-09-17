@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { CLERK_DELETE_TIMEOUT_MS, TRIAL_MS } from "../src/config";
-import { mondayStartUtc, RESERVATION_TTL_MS, WEEK_MS, type WindowState } from "../src/metering";
+import {
+  windowStartUtc,
+  windowResetsAt,
+  RESERVATION_TTL_MS,
+  type WindowState,
+} from "../src/metering";
 
 // Mock @clerk/backend so JWT verification and user lookups are controllable.
 const mocks = vi.hoisted(() => ({
@@ -164,10 +169,10 @@ function quotaNamespaceWithSettleFailure(now: number): {
   deferCalls: () => number;
   deferredSettlements: () => Array<ReturnType<typeof internalBody>>;
 } {
-  const windowStart = mondayStartUtc(now);
+  const windowStart = windowStartUtc(now);
   let window: WindowState = {
     windowStart,
-    resetsAt: windowStart + WEEK_MS,
+    resetsAt: windowResetsAt(now),
     draftsUsed: 0,
     tokensUsed: 0,
   };
@@ -264,10 +269,10 @@ function quotaNamespaceWithDeletionFailures(options: {
   const attemptIds = new Set<string>();
   let cancelCalls = 0;
   let finishCalls = 0;
-  const windowStart = mondayStartUtc(Date.now());
+  const windowStart = windowStartUtc(Date.now());
   const window: WindowState = {
     windowStart,
-    resetsAt: windowStart + WEEK_MS,
+    resetsAt: windowResetsAt(Date.now()),
     draftsUsed: 1,
     tokensUsed: 5,
   };
@@ -2204,7 +2209,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
           updatedAt: "2024-01-01T00:00:00.000Z",
           paddleOccurredAt: "2024-01-01T00:00:00.000000Z",
         },
-        quota: { weeklyDraftLimit: 30 },
+        quota: { monthlyDraftLimit: 30 },
       }),
     );
     mocks.updateUserMetadata.mockResolvedValue({});
@@ -2227,7 +2232,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
       items: [{ price_id: PRO_PRICE, quantity: 1 }],
     });
 
-    // Optimistic entitlement write: new plan/price + PRO weekly limit, preserving
+    // Optimistic entitlement write: new plan/price + PRO monthly limit, preserving
     // reconciliation/idempotency fields for the subscription.updated webhook.
     const write = lastMetadataWrite();
     expect(write.privateMetadata.subscription.plan).toBe("pro");
@@ -2236,7 +2241,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
     expect(write.privateMetadata.subscription.paddleSubscriptionId).toBe("sub_123");
     expect(write.privateMetadata.subscription.updatedAt).toBe("2024-01-01T00:00:00.000Z");
     expect(write.privateMetadata.subscription.paddleOccurredAt).toBe("2024-01-01T00:00:00.000000Z");
-    expect(write.privateMetadata.quota.weeklyDraftLimit).toBe(120);
+    expect(write.privateMetadata.quota.monthlyDraftLimit).toBe(120);
   });
 
   it("re-reads metadata inside the serialized entitlement write", async () => {
@@ -2257,7 +2262,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
                   updatedAt: "2026-09-08T17:00:00.000Z",
                   paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
                 },
-                quota: { weeklyDraftLimit: 30, extraDrafts: 1 },
+                quota: { monthlyDraftLimit: 30, extraDrafts: 1 },
               }
             : {
                 subscription: {
@@ -2270,7 +2275,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
                   paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
                 },
                 quota: {
-                  weeklyDraftLimit: 30,
+                  monthlyDraftLimit: 30,
                   extraDrafts: 5,
                   extraDraftsWindowStart: MON,
                   lastOverageEventId: "evt_overage",
@@ -2296,7 +2301,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
       paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
     });
     expect(write.privateMetadata.quota).toMatchObject({
-      weeklyDraftLimit: 120,
+      monthlyDraftLimit: 120,
       extraDrafts: 5,
       extraDraftsWindowStart: MON,
       lastOverageEventId: "evt_overage",
@@ -2314,7 +2319,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             paddleSubscriptionId: "sub_123",
             priceId: STARTER_PRICE,
           },
-          quota: { weeklyDraftLimit: 30 },
+          quota: { monthlyDraftLimit: 30 },
         }),
       )
       .mockResolvedValueOnce(
@@ -2325,7 +2330,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             paddleSubscriptionId: "sub_123",
             priceId: STARTER_PRICE,
           },
-          quota: { weeklyDraftLimit: null, extraDrafts: 0 },
+          quota: { monthlyDraftLimit: null, extraDrafts: 0 },
         }),
       );
     mocks.updateUserMetadata.mockResolvedValue({});
@@ -2343,7 +2348,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
       status: "canceled",
     });
     expect(write.privateMetadata.quota).toMatchObject({
-      weeklyDraftLimit: null,
+      monthlyDraftLimit: null,
       extraDrafts: 0,
     });
   });
@@ -2359,7 +2364,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             paddleSubscriptionId: "sub_old",
             priceId: STARTER_PRICE,
           },
-          quota: { weeklyDraftLimit: 30 },
+          quota: { monthlyDraftLimit: 30 },
         }),
       )
       .mockResolvedValueOnce(
@@ -2370,7 +2375,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             paddleSubscriptionId: "sub_new",
             priceId: STARTER_PRICE,
           },
-          quota: { weeklyDraftLimit: 30 },
+          quota: { monthlyDraftLimit: 30 },
         }),
       );
     const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
@@ -2401,7 +2406,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             updatedAt: "2026-09-08T17:00:00.000Z",
             paddleOccurredAt: "2026-09-08T17:00:00.000000Z",
           },
-          quota: { weeklyDraftLimit: 30 },
+          quota: { monthlyDraftLimit: 30 },
         }),
       )
       .mockResolvedValueOnce(
@@ -2415,7 +2420,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             updatedAt: "2026-09-08T17:30:00.000Z",
             paddleOccurredAt: "2026-09-08T17:30:00.000000Z",
           },
-          quota: { weeklyDraftLimit: 30 },
+          quota: { monthlyDraftLimit: 30 },
         }),
       );
     const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
@@ -2443,7 +2448,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             paddleSubscriptionId: "sub_123",
             priceId: STARTER_PRICE,
           },
-          quota: { weeklyDraftLimit: 30 },
+          quota: { monthlyDraftLimit: 30 },
         }),
       )
       .mockResolvedValueOnce(
@@ -2456,7 +2461,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
             lastEventId: "evt_newer",
             paddleOccurredAt: "2026-09-08T17:30:00.000000Z",
           },
-          quota: { weeklyDraftLimit: 100000 },
+          quota: { monthlyDraftLimit: 100000 },
         }),
       );
     const fetchMock = vi.fn(() => Promise.resolve(paddleSubscriptionOk(PRO_PRICE)));
@@ -2483,7 +2488,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
           paddleSubscriptionId: "sub_123",
           priceId: PRO_PRICE,
         },
-        quota: { weeklyDraftLimit: 120 },
+        quota: { monthlyDraftLimit: 120 },
       }),
     );
     mocks.updateUserMetadata.mockResolvedValue({});
@@ -2503,7 +2508,7 @@ describe("POST /v1/paddle/change-plan (90 — in-app plan change)", () => {
 
     const write = lastMetadataWrite();
     expect(write.privateMetadata.subscription.plan).toBe("starter");
-    expect(write.privateMetadata.quota.weeklyDraftLimit).toBe(30);
+    expect(write.privateMetadata.quota.monthlyDraftLimit).toBe(30);
   });
 
   it("rejects an unknown price without touching Clerk or Paddle", async () => {
@@ -3574,9 +3579,9 @@ describe("56b draft metering", () => {
     expect(q).toMatchObject({
       unit: "drafts",
       used: 1,
-      limit: 100, // WEEKLY_DRAFT_LIMIT var default
-      remaining: 99,
-      tokenLimit: 2_000_000,
+      limit: 400, // MONTHLY_DRAFT_LIMIT var default
+      remaining: 399,
+      tokenLimit: 8_000_000,
       enforcement: "hard", // S-M2: trial accounts are always hard-enforced
       extraPurchased: 0,
     });
@@ -3590,31 +3595,35 @@ describe("56b draft metering", () => {
     mocks.getUser.mockResolvedValue(
       userWith({
         trialStartedAt: new Date(Date.now() - 1000).toISOString(),
-        quota: { extraDrafts: 5, extraDraftsWindowStart: mondayStartUtc(Date.now()) },
+        quota: { extraDrafts: 5, extraDraftsWindowStart: windowStartUtc(Date.now()) },
       }),
     );
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
 
     const res = await worker.fetch(draftReq("u-extra"), env);
     const q = ((await res.json()) as any).quota;
-    expect(q.limit).toBe(105);
+    expect(q.limit).toBe(405); // base 400 + 5 purchased extras
     expect(q.extraPurchased).toBe(5);
-    expect(q.remaining).toBe(104);
+    expect(q.remaining).toBe(404); // 405 - 1 used
   });
 
-  it("ignores stale purchased extras from a previous weekly window", async () => {
+  it("ignores stale purchased extras from a previous month window", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "u-extra-stale" });
     mocks.getUser.mockResolvedValue(
       userWith({
         trialStartedAt: new Date(Date.now() - 1000).toISOString(),
-        quota: { extraDrafts: 5, extraDraftsWindowStart: mondayStartUtc(Date.now()) - WEEK_MS },
+        // Stamp the extras to the 1st of the previous month.
+        quota: {
+          extraDrafts: 5,
+          extraDraftsWindowStart: windowStartUtc(windowStartUtc(Date.now()) - 1),
+        },
       }),
     );
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk("ok")));
 
     const res = await worker.fetch(draftReq("u-extra-stale"), env);
     const q = ((await res.json()) as any).quota;
-    expect(q.limit).toBe(100);
+    expect(q.limit).toBe(400);
     expect(q.extraPurchased).toBe(0);
   });
 
@@ -3746,7 +3755,7 @@ describe("56b draft metering", () => {
     mocks.getUser.mockResolvedValue(activeTrial());
     const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
     vi.stubGlobal("fetch", fetchMock);
-    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "20", ENFORCEMENT_MODE: "hard" };
+    const hardEnv: Env = { ...env, MONTHLY_TOKEN_LIMIT: "20", ENFORCEMENT_MODE: "hard" };
 
     const res = await worker.fetch(
       req("/v1/draft", {
@@ -3769,7 +3778,7 @@ describe("56b draft metering", () => {
     mocks.getUser.mockResolvedValue(activeTrial());
     const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
     vi.stubGlobal("fetch", fetchMock);
-    const hardEnv: Env = { ...env, WEEKLY_TOKEN_LIMIT: "100", ENFORCEMENT_MODE: "hard" };
+    const hardEnv: Env = { ...env, MONTHLY_TOKEN_LIMIT: "100", ENFORCEMENT_MODE: "hard" };
 
     const res = await worker.fetch(
       req("/v1/draft", {
@@ -3803,7 +3812,7 @@ describe("56b draft metering", () => {
     expect(body.text).toBe("ok");
     expect(body.quota.used).toBe(1);
     expect(body.quota.tokensUsed).toBe(5);
-    expect(body.quota.remaining).toBe(99);
+    expect(body.quota.remaining).toBe(399);
     expect(quota.settleCalls()).toBe(2);
     expect(quota.deferCalls()).toBe(1);
     expect(quota.deferredSettlements()[0]).toMatchObject({
@@ -3819,7 +3828,7 @@ describe("56b draft metering", () => {
     mocks.getUser.mockResolvedValue(activeTrial());
     const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
     vi.stubGlobal("fetch", fetchMock);
-    const hardEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "hard" };
+    const hardEnv: Env = { ...env, MONTHLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "hard" };
 
     const first = await worker.fetch(draftReq("u-hard"), hardEnv);
     expect(first.status).toBe(200); // draftsUsed -> 1
@@ -3846,7 +3855,7 @@ describe("56b draft metering", () => {
       "fetch",
       vi.fn().mockImplementation(() => anthropicOk("ok")),
     );
-    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+    const softEnv: Env = { ...env, MONTHLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
 
     expect((await worker.fetch(draftReq("u-soft"), softEnv)).status).toBe(200);
     const res2 = await worker.fetch(draftReq("u-soft"), softEnv);
@@ -3864,7 +3873,7 @@ describe("56b draft metering", () => {
     const fetchMock = vi.fn().mockResolvedValue(anthropicOk("ok"));
     vi.stubGlobal("fetch", fetchMock);
     // soft mode configured, but a trial must still be blocked at the cap.
-    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+    const softEnv: Env = { ...env, MONTHLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
 
     const first = await worker.fetch(draftReq("u-trial-hard"), softEnv);
     expect(first.status).toBe(200); // draftsUsed -> 1
@@ -3887,7 +3896,7 @@ describe("56b draft metering", () => {
       "fetch",
       vi.fn().mockImplementation(() => anthropicOk("ok")),
     );
-    const softEnv: Env = { ...env, WEEKLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
+    const softEnv: Env = { ...env, MONTHLY_DRAFT_LIMIT: "1", ENFORCEMENT_MODE: "soft" };
 
     expect((await worker.fetch(draftReq("u-paid-soft"), softEnv)).status).toBe(200);
     const res2 = await worker.fetch(draftReq("u-paid-soft"), softEnv);
@@ -3905,9 +3914,9 @@ describe("56b /v1/me quota", () => {
     expect(body.quota).toMatchObject({
       unit: "drafts",
       used: 0,
-      limit: 100,
-      remaining: 100,
-      tokenLimit: 2_000_000,
+      limit: 400,
+      remaining: 400,
+      tokenLimit: 8_000_000,
       enforcement: "hard", // S-M2: a trial account reports hard on /v1/me too
       extraPurchased: 0,
     });
