@@ -1259,6 +1259,34 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     ]);
   });
 
+  it("accumulates with legacy weekly extra-credit stamps that overlap the month", async () => {
+    const monthStart = windowStartUtc(Date.now());
+    const legacyWeekStart = Date.parse("2026-08-31T00:00:00.000Z");
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: {
+          extraDrafts: 10,
+          extraDraftsWindowStart: legacyWeekStart,
+          lastOverageEventId: "evt_old",
+        },
+      }),
+    );
+    await signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+        },
+        "evt_legacy_week",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(15);
+    expect(quota.extraDraftsWindowStart).toBe(monthStart);
+    expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_legacy_week"]);
+  });
+
   it("resets extras when the stored purchase belongs to a prior window", async () => {
     mocks.getUser.mockResolvedValue(
       userWith({ quota: { extraDrafts: 99, extraDraftsWindowStart: 123 /* ancient */ } }),

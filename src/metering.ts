@@ -118,11 +118,17 @@ export function parseQuotaOverride(raw: unknown): QuotaOverride {
   const out: QuotaOverride = {};
   // Prefer the current monthly keys; fall back to the legacy weekly keys so any
   // Clerk metadata written before the weekly->monthly switch still resolves.
-  const draftLimit = r.monthlyDraftLimit ?? r.weeklyDraftLimit;
+  // If a monthly key is explicitly present, it is authoritative: null/invalid
+  // values intentionally mean "no per-account paid-tier override".
+  const draftLimit = Object.hasOwn(r, "monthlyDraftLimit")
+    ? r.monthlyDraftLimit
+    : r.weeklyDraftLimit;
   if (typeof draftLimit === "number" && draftLimit >= 0) {
     out.monthlyDraftLimit = Math.floor(draftLimit);
   }
-  const tokenLimit = r.monthlyTokenLimit ?? r.weeklyTokenLimit;
+  const tokenLimit = Object.hasOwn(r, "monthlyTokenLimit")
+    ? r.monthlyTokenLimit
+    : r.weeklyTokenLimit;
   if (typeof tokenLimit === "number" && tokenLimit >= 0) {
     out.monthlyTokenLimit = Math.floor(tokenLimit);
   }
@@ -141,8 +147,9 @@ export function resolveLimits(
   override: QuotaOverride,
   windowStart?: number,
 ): ResolvedLimits {
-  const extraPurchased =
-    override.extraDraftsWindowStart === windowStart ? (override.extraDrafts ?? 0) : 0;
+  const extraPurchased = extraDraftsWindowMatches(override.extraDraftsWindowStart, windowStart)
+    ? (override.extraDrafts ?? 0)
+    : 0;
   const baseDraftLimit =
     override.monthlyDraftLimit ?? numFrom(env.MONTHLY_DRAFT_LIMIT, DEFAULT_MONTHLY_DRAFT_LIMIT);
   return {
@@ -178,6 +185,37 @@ export function windowResetsAt(now: number): number {
   const d = new Date(now);
   // Date.UTC normalizes a month index of 12 to January of the next year.
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+}
+
+/** True when `value` is exactly Monday 00:00:00.000 UTC. */
+function isLegacyWeekStartUtc(value: number): boolean {
+  const d = new Date(value);
+  return (
+    d.getUTCDay() === 1 &&
+    d.getUTCHours() === 0 &&
+    d.getUTCMinutes() === 0 &&
+    d.getUTCSeconds() === 0 &&
+    d.getUTCMilliseconds() === 0
+  );
+}
+
+/**
+ * True when purchased extras belong to the current monthly quota window.
+ *
+ * New writes store the month start exactly. During the weekly->monthly migration,
+ * old writes may still be stamped with the Monday UTC start of the purchase week;
+ * honor those paid credits when that legacy week overlaps the current month.
+ */
+export function extraDraftsWindowMatches(
+  extraDraftsWindowStart: number | undefined,
+  windowStart: number | undefined,
+): boolean {
+  if (extraDraftsWindowStart === undefined || windowStart === undefined) return false;
+  if (extraDraftsWindowStart === windowStart) return true;
+  if (!isLegacyWeekStartUtc(extraDraftsWindowStart)) return false;
+
+  const legacyWindowEnd = extraDraftsWindowStart + 7 * DAY_MS;
+  return extraDraftsWindowStart < windowResetsAt(windowStart) && legacyWindowEnd > windowStart;
 }
 
 /** True when `state` is exactly the calendar-month window that contains `now`. */

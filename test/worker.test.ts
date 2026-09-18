@@ -3925,4 +3925,20 @@ describe("56b /v1/me quota", () => {
     // quotaOverride is internal and must not leak into the response.
     expect("quotaOverride" in body).toBe(false);
   });
+
+  it("does not revive a legacy paid limit when monthlyDraftLimit is explicitly null", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "u-me-canceled" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        quota: { monthlyDraftLimit: null, weeklyDraftLimit: 120 },
+      }),
+    );
+
+    const res = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.quota.limit).toBe(400);
+    expect(body.quota.remaining).toBe(400);
+  });
 });

@@ -6,6 +6,7 @@ import {
   costUsd,
   effectiveEnforcement,
   estimateRequestTokens,
+  extraDraftsWindowMatches,
   freshWindow,
   isCurrentWindow,
   isOverQuota,
@@ -38,6 +39,8 @@ const FEB = Date.parse("2024-02-01T00:00:00.000Z");
 const MAR = Date.parse("2024-03-01T00:00:00.000Z");
 const DEC = Date.parse("2024-12-01T00:00:00.000Z");
 const JAN_NEXT = Date.parse("2025-01-01T00:00:00.000Z");
+const JAN_LEGACY_WEEK = Date.parse("2024-01-15T00:00:00.000Z");
+const FEB_OVERLAP_LEGACY_WEEK = Date.parse("2024-01-29T00:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 describe("windowStartUtc", () => {
@@ -80,6 +83,20 @@ describe("windowResetsAt", () => {
   it("rolls the year over from December to January", () => {
     expect(windowResetsAt(DEC)).toBe(JAN_NEXT);
     expect(new Date(windowResetsAt(DEC)).getUTCFullYear()).toBe(2025);
+  });
+});
+
+describe("extraDraftsWindowMatches", () => {
+  it("matches canonical monthly stamps exactly", () => {
+    expect(extraDraftsWindowMatches(JAN, JAN)).toBe(true);
+  });
+  it("matches legacy weekly stamps that overlap the current month", () => {
+    expect(extraDraftsWindowMatches(JAN_LEGACY_WEEK, JAN)).toBe(true);
+    expect(extraDraftsWindowMatches(FEB_OVERLAP_LEGACY_WEEK, FEB)).toBe(true);
+  });
+  it("does not match ancient weekly stamps or non-window-aligned values", () => {
+    expect(extraDraftsWindowMatches(JAN_LEGACY_WEEK, FEB)).toBe(false);
+    expect(extraDraftsWindowMatches(JAN + DAY_MS, JAN)).toBe(false);
   });
 });
 
@@ -264,6 +281,16 @@ describe("parseQuotaOverride", () => {
       monthlyDraftLimit: 30,
     });
   });
+  it("treats explicit monthly nulls as authoritative over legacy weekly keys", () => {
+    expect(
+      parseQuotaOverride({
+        monthlyDraftLimit: null,
+        weeklyDraftLimit: 250,
+        monthlyTokenLimit: null,
+        weeklyTokenLimit: 5_000_000,
+      }),
+    ).toEqual({});
+  });
   it("returns {} for non-objects and negative/invalid values", () => {
     expect(parseQuotaOverride(null)).toEqual({});
     expect(parseQuotaOverride("nope")).toEqual({});
@@ -309,6 +336,18 @@ describe("resolveLimits", () => {
     );
     expect(l.monthlyDraftLimit).toBe(55);
     expect(l.extraPurchased).toBe(25);
+  });
+  it("adds purchased extras from legacy weekly stamps that overlap the current month", () => {
+    expect(
+      resolveLimits(
+        { MONTHLY_DRAFT_LIMIT: "30" },
+        { extraDrafts: 25, extraDraftsWindowStart: JAN_LEGACY_WEEK },
+        JAN,
+      ),
+    ).toMatchObject({
+      monthlyDraftLimit: 55,
+      extraPurchased: 25,
+    });
   });
   it("ignores purchased extras without a matching monthly window", () => {
     expect(resolveLimits({ MONTHLY_DRAFT_LIMIT: "30" }, { extraDrafts: 25 }, JAN)).toMatchObject({
