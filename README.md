@@ -342,8 +342,10 @@ and any account without a written tier override.
 `{ monthlyDraftLimit?, monthlyTokenLimit?, extraDrafts?, extraDraftsWindowStart?, processedOverageEventIds? }`
 — overrides the vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart`
 equals the current month window's 1st-of-month 00:00 UTC epoch-ms `windowStart`; stale or unscoped
-credits are ignored. `monthlyDraftLimit: null` is treated as absent and is used by the Paddle webhook
-to clear Clerk's deep-merged paid override. (The parser still reads the legacy `weeklyDraftLimit` /
+credits are ignored. The one weekly-stamped overage window active at the September 2026 cutover is
+canonicalized into that month; older expired weekly credits and month-boundary weeks are not revived.
+`monthlyDraftLimit: null` is treated as absent and is used by the Paddle webhook to clear Clerk's
+deep-merged paid override. (The parser still reads the legacy `weeklyDraftLimit` /
 `weeklyTokenLimit` keys as a fallback so any metadata written before the weekly→monthly switch still
 resolves.) These are read on the same `getUser` as the trial, so metering adds no extra Clerk
 round-trip.

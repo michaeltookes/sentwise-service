@@ -2,7 +2,11 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { extraDraftsWindowMatches, windowStartUtc } from "./metering";
+import {
+  canonicalExtraDraftsWindowStart,
+  extraDraftsWindowMatches,
+  windowStartUtc,
+} from "./metering";
 import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
 import type { OverageAdjustmentAction } from "./paddle";
 
@@ -301,7 +305,10 @@ export async function recordPaddleOverageInClerk(
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
       : 0;
   const pending = await loadPendingOverageReversals(existingQuota, ledgerStore);
-  const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
+  const existingCredits = canonicalizeCurrentWindowCredits(
+    await loadOverageCredits(existingQuota, ledgerStore),
+    windowStart,
+  );
   const expectedCredits = body.credits.map((credit) =>
     storedCreditFromInput(body.eventId, body.transactionId, credit, windowStart),
   );
@@ -580,6 +587,22 @@ function storedCreditFromInput(
     extraDrafts: input.extraDrafts,
     ...(input.amount !== null ? { amount: input.amount } : {}),
     windowStart,
+  });
+}
+
+function canonicalizeCurrentWindowCredits(
+  credits: StoredOverageCredit[],
+  currentWindowStart: number,
+): StoredOverageCredit[] {
+  return credits.map((credit) => {
+    const canonicalWindowStart = canonicalExtraDraftsWindowStart(credit.windowStart);
+    if (
+      canonicalWindowStart !== currentWindowStart ||
+      canonicalWindowStart === credit.windowStart
+    ) {
+      return credit;
+    }
+    return cleanCredit({ ...credit, windowStart: canonicalWindowStart });
   });
 }
 

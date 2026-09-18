@@ -40,7 +40,11 @@ const MAR = Date.parse("2024-03-01T00:00:00.000Z");
 const DEC = Date.parse("2024-12-01T00:00:00.000Z");
 const JAN_NEXT = Date.parse("2025-01-01T00:00:00.000Z");
 const JAN_LEGACY_WEEK = Date.parse("2024-01-15T00:00:00.000Z");
-const FEB_OVERLAP_LEGACY_WEEK = Date.parse("2024-01-29T00:00:00.000Z");
+const SEP_2026 = Date.parse("2026-09-01T00:00:00.000Z");
+const OCT_2026 = Date.parse("2026-10-01T00:00:00.000Z");
+const CUTOVER_ACTIVE_LEGACY_WEEK = Date.parse("2026-09-14T00:00:00.000Z");
+const EXPIRED_CUTOVER_MONTH_LEGACY_WEEK = Date.parse("2026-09-07T00:00:00.000Z");
+const MONTH_BOUNDARY_LEGACY_WEEK = Date.parse("2026-09-28T00:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 describe("windowStartUtc", () => {
@@ -90,9 +94,11 @@ describe("extraDraftsWindowMatches", () => {
   it("matches canonical monthly stamps exactly", () => {
     expect(extraDraftsWindowMatches(JAN, JAN)).toBe(true);
   });
-  it("matches legacy weekly stamps that overlap the current month", () => {
-    expect(extraDraftsWindowMatches(JAN_LEGACY_WEEK, JAN)).toBe(true);
-    expect(extraDraftsWindowMatches(FEB_OVERLAP_LEGACY_WEEK, FEB)).toBe(true);
+  it("matches only the cutover-active legacy weekly stamp for migration", () => {
+    expect(extraDraftsWindowMatches(CUTOVER_ACTIVE_LEGACY_WEEK, SEP_2026)).toBe(true);
+    expect(extraDraftsWindowMatches(EXPIRED_CUTOVER_MONTH_LEGACY_WEEK, SEP_2026)).toBe(false);
+    expect(extraDraftsWindowMatches(MONTH_BOUNDARY_LEGACY_WEEK, SEP_2026)).toBe(false);
+    expect(extraDraftsWindowMatches(MONTH_BOUNDARY_LEGACY_WEEK, OCT_2026)).toBe(false);
   });
   it("does not match ancient weekly stamps or non-window-aligned values", () => {
     expect(extraDraftsWindowMatches(JAN_LEGACY_WEEK, FEB)).toBe(false);
@@ -337,16 +343,38 @@ describe("resolveLimits", () => {
     expect(l.monthlyDraftLimit).toBe(55);
     expect(l.extraPurchased).toBe(25);
   });
-  it("adds purchased extras from legacy weekly stamps that overlap the current month", () => {
+  it("adds purchased extras from the legacy weekly stamp active at cutover", () => {
     expect(
       resolveLimits(
         { MONTHLY_DRAFT_LIMIT: "30" },
-        { extraDrafts: 25, extraDraftsWindowStart: JAN_LEGACY_WEEK },
-        JAN,
+        { extraDrafts: 25, extraDraftsWindowStart: CUTOVER_ACTIVE_LEGACY_WEEK },
+        SEP_2026,
       ),
     ).toMatchObject({
       monthlyDraftLimit: 55,
       extraPurchased: 25,
+    });
+  });
+  it("does not revive expired or boundary legacy weekly stamps", () => {
+    expect(
+      resolveLimits(
+        { MONTHLY_DRAFT_LIMIT: "30" },
+        { extraDrafts: 25, extraDraftsWindowStart: EXPIRED_CUTOVER_MONTH_LEGACY_WEEK },
+        SEP_2026,
+      ),
+    ).toMatchObject({
+      monthlyDraftLimit: 30,
+      extraPurchased: 0,
+    });
+    expect(
+      resolveLimits(
+        { MONTHLY_DRAFT_LIMIT: "30" },
+        { extraDrafts: 25, extraDraftsWindowStart: MONTH_BOUNDARY_LEGACY_WEEK },
+        OCT_2026,
+      ),
+    ).toMatchObject({
+      monthlyDraftLimit: 30,
+      extraPurchased: 0,
     });
   });
   it("ignores purchased extras without a matching monthly window", () => {

@@ -64,7 +64,7 @@ const env: Env = {
 // so Durable Object alarm timers keep running on the real clock.
 beforeAll(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
-  vi.setSystemTime(new Date("2026-09-05T12:00:00.000Z"));
+  vi.setSystemTime(new Date("2026-09-17T12:00:00.000Z"));
 });
 
 afterAll(() => {
@@ -1259,15 +1259,23 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     ]);
   });
 
-  it("accumulates with legacy weekly extra-credit stamps that overlap the month", async () => {
+  it("accumulates and canonicalizes the legacy weekly extra-credit stamp active at cutover", async () => {
     const monthStart = windowStartUtc(Date.now());
-    const legacyWeekStart = Date.parse("2026-08-31T00:00:00.000Z");
+    const legacyWeekStart = Date.parse("2026-09-14T00:00:00.000Z");
     mocks.getUser.mockResolvedValue(
       userWith({
         quota: {
           extraDrafts: 10,
           extraDraftsWindowStart: legacyWeekStart,
           lastOverageEventId: "evt_old",
+          overageCredits: [
+            {
+              eventId: "evt_old",
+              transactionId: "txn_evt_old",
+              extraDrafts: 10,
+              windowStart: legacyWeekStart,
+            },
+          ],
         },
       }),
     );
@@ -1285,6 +1293,52 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect(quota.extraDrafts).toBe(15);
     expect(quota.extraDraftsWindowStart).toBe(monthStart);
     expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_legacy_week"]);
+    const credits = await storedPaddleOverageCredits();
+    expect(credits).toHaveLength(2);
+    expect(credits).toEqual(
+      expect.arrayContaining([
+        {
+          eventId: "evt_old",
+          transactionId: "txn_evt_old",
+          extraDrafts: 10,
+          windowStart: monthStart,
+        },
+        {
+          eventId: "evt_legacy_week",
+          transactionId: "txn_evt_legacy_week",
+          extraDrafts: 5,
+          windowStart: monthStart,
+        },
+      ]),
+    );
+  });
+
+  it("does not revive an expired legacy weekly extra-credit stamp from the cutover month", async () => {
+    const monthStart = windowStartUtc(Date.now());
+    const expiredLegacyWeekStart = Date.parse("2026-09-07T00:00:00.000Z");
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: {
+          extraDrafts: 10,
+          extraDraftsWindowStart: expiredLegacyWeekStart,
+          lastOverageEventId: "evt_old",
+        },
+      }),
+    );
+    await signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+        },
+        "evt_expired_legacy_week",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(5);
+    expect(quota.extraDraftsWindowStart).toBe(monthStart);
+    expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_expired_legacy_week"]);
   });
 
   it("resets extras when the stored purchase belongs to a prior window", async () => {
@@ -1806,7 +1860,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
 
   it("revokes migrated legacy weekly-stamped credits from the monthly aggregate", async () => {
     const monthStart = windowStartUtc(Date.now());
-    const legacyWeekStart = Date.parse("2026-08-31T00:00:00.000Z");
+    const legacyWeekStart = Date.parse("2026-09-14T00:00:00.000Z");
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },

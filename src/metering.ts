@@ -20,6 +20,8 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
 export const RATE_WINDOW_MS = 60_000;
 export const RESERVATION_TTL_MS = 15 * 60_000;
 export const CONSERVATIVE_MESSAGE_FRAMING_TOKENS = 16;
+const MONTHLY_METERING_CUTOVER_MONTH_START = Date.UTC(2026, 8, 1);
+const MONTHLY_METERING_CUTOVER_LEGACY_WEEK_START = Date.UTC(2026, 8, 14);
 
 export interface ReservationRecord {
   id: string;
@@ -187,35 +189,32 @@ export function windowResetsAt(now: number): number {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
 }
 
-/** True when `value` is exactly Monday 00:00:00.000 UTC. */
-function isLegacyWeekStartUtc(value: number): boolean {
-  const d = new Date(value);
-  return (
-    d.getUTCDay() === 1 &&
-    d.getUTCHours() === 0 &&
-    d.getUTCMinutes() === 0 &&
-    d.getUTCSeconds() === 0 &&
-    d.getUTCMilliseconds() === 0
-  );
+/**
+ * Canonical storage stamp for purchased-extra credits.
+ *
+ * New writes store the month start exactly. For the one-time weekly->monthly
+ * migration, only the legacy weekly stamp that was active at cutover (owner
+ * decision 2026-09-16) is carried into the September 2026 monthly window.
+ */
+export function canonicalExtraDraftsWindowStart(extraDraftsWindowStart: number): number {
+  if (extraDraftsWindowStart === MONTHLY_METERING_CUTOVER_LEGACY_WEEK_START) {
+    return MONTHLY_METERING_CUTOVER_MONTH_START;
+  }
+  return extraDraftsWindowStart;
 }
 
 /**
  * True when purchased extras belong to the current monthly quota window.
  *
- * New writes store the month start exactly. During the weekly->monthly migration,
- * old writes may still be stamped with the Monday UTC start of the purchase week;
- * honor those paid credits when that legacy week overlaps the current month.
+ * Legacy weekly stamps are migration-compatible only for the cutover-active
+ * week; older expired weekly purchases and month-boundary weeks are not revived.
  */
 export function extraDraftsWindowMatches(
   extraDraftsWindowStart: number | undefined,
   windowStart: number | undefined,
 ): boolean {
   if (extraDraftsWindowStart === undefined || windowStart === undefined) return false;
-  if (extraDraftsWindowStart === windowStart) return true;
-  if (!isLegacyWeekStartUtc(extraDraftsWindowStart)) return false;
-
-  const legacyWindowEnd = extraDraftsWindowStart + 7 * DAY_MS;
-  return extraDraftsWindowStart < windowResetsAt(windowStart) && legacyWindowEnd > windowStart;
+  return canonicalExtraDraftsWindowStart(extraDraftsWindowStart) === windowStart;
 }
 
 /** True when `state` is exactly the calendar-month window that contains `now`. */
