@@ -1858,7 +1858,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
-  it("revokes migrated legacy weekly-stamped credits from the monthly aggregate", async () => {
+  it("revokes migrated legacy weekly-stamped credits from a legacy-stamped aggregate", async () => {
     const monthStart = windowStartUtc(Date.now());
     const legacyWeekStart = Date.parse("2026-09-14T00:00:00.000Z");
     mocks.getUser.mockResolvedValue(
@@ -1866,7 +1866,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
         subscription: { paddleCustomerId: "ctm_123" },
         quota: {
           extraDrafts: 30,
-          extraDraftsWindowStart: monthStart,
+          extraDraftsWindowStart: legacyWeekStart,
           overageCredits: [
             {
               eventId: "evt_txn",
