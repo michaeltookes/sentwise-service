@@ -25,8 +25,8 @@
     "CLERK_PUBLISHABLE_KEY": "pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA",
 
     // --- 56b metering limits (placeholder defaults; final numbers land with 56c) ---
-    "WEEKLY_DRAFT_LIMIT": "100", // drafts per account per week (Mon 00:00 UTC reset)
-    "WEEKLY_TOKEN_LIMIT": "2000000", // input+output tokens per account per week
+    "MONTHLY_DRAFT_LIMIT": "400", // base drafts per account per calendar month (1st 00:00 UTC reset); governs trials + fallback
+    "MONTHLY_TOKEN_LIMIT": "8000000", // input+output tokens per account per calendar month
     "RATE_LIMIT_PER_MIN": "10", // abuse guard: requests per 60s per account
     "MAX_TOKENS_PER_REQUEST": "55000", // per-request safety cap (see config.ts derivation)
     "ENFORCEMENT_MODE": "soft", // "soft" meters only; "hard" also blocks over-quota drafts
@@ -40,9 +40,10 @@
     // SANDBOX base until the owner flips to https://api.paddle.com with live creds.
     "PADDLE_API_BASE": "https://sandbox-api.paddle.com",
     "PADDLE_WEBHOOK_TOLERANCE_SEC": "300", // signature freshness window (seconds)
-    // Per-tier weekly draft limits — PLACEHOLDERS. The window unit (weekly vs.
-    // monthly, which the landing page implies) and the real per-tier numbers are
-    // an open owner decision; the webhook writes whichever value lives here.
+    // Per-tier MONTHLY draft limits (owner decision 2026-09-16): the caps the
+    // marketing site sells — "30 follow-ups a month" / "120 a month" — enforced over
+    // a calendar-month UTC window. The webhook writes the resolved value per-account
+    // into Clerk privateMetadata.quota.monthlyDraftLimit.
     "STARTER_DRAFT_LIMIT": "30",
     "PRO_DRAFT_LIMIT": "120",
     "UNLIMITED_DRAFT_LIMIT": "100000", // fair-use ceiling, not "infinite"
@@ -51,7 +52,7 @@
     // exists; until then transaction.completed overage crediting stays disabled.
   },
 
-  // 56b — per-account usage counters (weekly drafts/tokens + sliding rate-limit
+  // 56b — per-account usage counters (monthly drafts/tokens + sliding rate-limit
   // window). SQLite-backed Durable Object; stores integers and timestamps only,
   // never content. Keyed by Clerk userId via idFromName.
   "durable_objects": {

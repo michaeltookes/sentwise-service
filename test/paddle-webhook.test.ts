@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from "vites
 import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
 import { computeHmacSha256Hex } from "../src/paddle";
-import { mondayStartUtc, WEEK_MS } from "../src/metering";
+import { windowStartUtc } from "../src/metering";
 
 // Mock @clerk/backend — the webhook resolves + writes the user's privateMetadata.
 const mocks = vi.hoisted(() => ({
@@ -56,15 +56,15 @@ const env: Env = {
   UNLIMITED_DRAFT_LIMIT: "100000",
 };
 
-// Freeze the clock to the fixtures' week. The overage-credit fixtures pin
-// occurred_at to 2026-09-05, while assertions derive the expected Monday window
-// from the current clock; without a fixed "now" those agree only during that week
-// (the credit-repair path stamps a historical credit to the event's own week, not
-// the current one), so the suite would drift red every later week. Fake ONLY Date
+// Freeze the clock to the fixtures' month. The overage-credit fixtures pin
+// occurred_at to 2026-09-05, while assertions derive the expected month window
+// from the current clock; without a fixed "now" those agree only during that month
+// (the credit-repair path stamps a historical credit to the event's own month, not
+// the current one), so the suite would drift red in a later month. Fake ONLY Date
 // so Durable Object alarm timers keep running on the real clock.
 beforeAll(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
-  vi.setSystemTime(new Date("2026-09-05T12:00:00.000Z"));
+  vi.setSystemTime(new Date("2026-09-17T12:00:00.000Z"));
 });
 
 afterAll(() => {
@@ -337,7 +337,7 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
       priceId: PRO_PRICE,
       lastEventId: "evt_1",
     });
-    expect(write?.quota).toEqual({ weeklyDraftLimit: 120 });
+    expect(write?.quota).toEqual({ monthlyDraftLimit: 120 });
   });
 
   it("maps each tier's price id to its configured draft limit", async () => {
@@ -349,22 +349,22 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
       mocks.getUser.mockResolvedValue(userWith({}));
       const res = await signedReq(subBody({ priceId, eventId: `evt_${priceId}` }));
       expect(res.status).toBe(200);
-      expect(lastWrite()?.quota).toEqual({ weeklyDraftLimit: limit });
+      expect(lastWrite()?.quota).toEqual({ monthlyDraftLimit: limit });
     }
   });
 
   it("preserves other quota fields when setting the tier limit", async () => {
     mocks.getUser.mockResolvedValue(
       userWith({
-        quota: { weeklyTokenLimit: 500000, extraDrafts: 7, extraDraftsWindowStart: 123 },
+        quota: { monthlyTokenLimit: 500000, extraDrafts: 7, extraDraftsWindowStart: 123 },
       }),
     );
     await signedReq(subBody({ priceId: STARTER_PRICE }));
     expect(lastWrite()?.quota).toEqual({
-      weeklyTokenLimit: 500000,
+      monthlyTokenLimit: 500000,
       extraDrafts: 7,
       extraDraftsWindowStart: 123,
-      weeklyDraftLimit: 30,
+      monthlyDraftLimit: 30,
     });
   });
 
@@ -386,7 +386,7 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     const res = await signedReq(subBody({ eventType: "subscription.paused", status: "paused" }));
     expect(res.status).toBe(200);
     expect(lastWrite()?.subscription).toMatchObject({ status: "canceled", plan: "pro" });
-    expect(lastWrite()?.quota.weeklyDraftLimit).toBeNull();
+    expect(lastWrite()?.quota.monthlyDraftLimit).toBeNull();
   });
 
   it("records resumed subscriptions as active", async () => {
@@ -399,15 +399,15 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
   it("records canceled status and removes the paid tier quota limit", async () => {
     mocks.getUser.mockResolvedValue(
       userWith({
-        quota: { weeklyDraftLimit: 120, weeklyTokenLimit: 500000, extraDrafts: 7 },
+        quota: { monthlyDraftLimit: 120, monthlyTokenLimit: 500000, extraDrafts: 7 },
       }),
     );
     await signedReq(subBody({ eventType: "subscription.canceled", status: "canceled" }));
     const write = lastWrite();
     expect(write?.subscription).toMatchObject({ status: "canceled", plan: "pro" });
     expect(write?.quota).toEqual({
-      weeklyDraftLimit: null,
-      weeklyTokenLimit: 500000,
+      monthlyDraftLimit: null,
+      monthlyTokenLimit: 500000,
       extraDrafts: 7,
     });
   });
@@ -430,7 +430,7 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
           paddleSubscriptionId: "sub_123",
           paddleCustomerId: "ctm_123",
         },
-        quota: { weeklyDraftLimit: 120 },
+        quota: { monthlyDraftLimit: 120 },
       }),
     );
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -477,7 +477,7 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
           lastEventId: "evt_old",
           updatedAt: "2026-09-05T00:00:00.000Z",
         },
-        quota: { weeklyDraftLimit: 120, weeklyTokenLimit: 500000 },
+        quota: { monthlyDraftLimit: 120, monthlyTokenLimit: 500000 },
       }),
     );
 
@@ -500,8 +500,8 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
       lastEventId: "evt_removed_price_cancel",
     });
     expect(lastWrite()?.quota).toEqual({
-      weeklyDraftLimit: null,
-      weeklyTokenLimit: 500000,
+      monthlyDraftLimit: null,
+      monthlyTokenLimit: 500000,
     });
   });
 
@@ -517,7 +517,7 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
           lastEventId: "evt_cancel",
           updatedAt: "2026-09-05T00:00:00.000Z",
         },
-        quota: { weeklyDraftLimit: null, weeklyTokenLimit: 500000 },
+        quota: { monthlyDraftLimit: null, monthlyTokenLimit: 500000 },
       }),
     );
 
@@ -540,8 +540,8 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
       lastEventId: "evt_removed_price_resume",
     });
     expect(lastWrite()?.quota).toEqual({
-      weeklyDraftLimit: 120,
-      weeklyTokenLimit: 500000,
+      monthlyDraftLimit: 120,
+      monthlyTokenLimit: 500000,
     });
   });
 
@@ -578,7 +578,7 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
       priceId: PRO_PRICE,
       lastEventId: "evt_catalog_change",
     });
-    expect(lastWrite()?.quota).toEqual({ weeklyDraftLimit: 120 });
+    expect(lastWrite()?.quota).toEqual({ monthlyDraftLimit: 120 });
     const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName("user_abc"));
     await runInDurableObject(stub, async (_instance, state) => {
       expect(await state.storage.get(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY)).toBe(
@@ -924,7 +924,7 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
           lastEventId: "evt_old",
           updatedAt: "2026-09-05T00:00:00.000Z",
         },
-        quota: { weeklyDraftLimit: 30, weeklyTokenLimit: 500000 },
+        quota: { monthlyDraftLimit: 30, monthlyTokenLimit: 500000 },
       }),
     );
 
@@ -947,8 +947,8 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
       supersededPaddleSubscriptionIds: ["sub_old"],
     });
     expect(lastWrite()?.quota).toEqual({
-      weeklyDraftLimit: null,
-      weeklyTokenLimit: 500000,
+      monthlyDraftLimit: null,
+      monthlyTokenLimit: 500000,
     });
   });
 
@@ -960,7 +960,7 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
         lastEventId: "evt_initial",
         updatedAt: "2026-09-01T00:00:00.000Z",
       },
-      quota: { weeklyTokenLimit: 500000 },
+      quota: { monthlyTokenLimit: 500000 },
     };
     const newWrite = deferred<void>();
     const newWriteStarted = deferred<void>();
@@ -1001,7 +1001,7 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
 
     expect((await olderRes.json()) as any).toEqual({ ok: true, stale: true });
     expect(storedMeta.subscription).toMatchObject({ plan: "pro", lastEventId: "evt_new" });
-    expect(storedMeta.quota).toMatchObject({ weeklyTokenLimit: 500000, weeklyDraftLimit: 120 });
+    expect(storedMeta.quota).toMatchObject({ monthlyTokenLimit: 500000, monthlyDraftLimit: 120 });
   });
 });
 
@@ -1026,8 +1026,8 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
 
   const overageEnv: Env = { ...env, EXTRA_DRAFTS_PRICE_ID: OVERAGE_PRICE };
 
-  it("credits extra drafts stamped to the CURRENT Monday window", async () => {
-    mocks.getUser.mockResolvedValue(userWith({ quota: { weeklyDraftLimit: 120 } }));
+  it("credits extra drafts stamped to the CURRENT month window", async () => {
+    mocks.getUser.mockResolvedValue(userWith({ quota: { monthlyDraftLimit: 120 } }));
     const res = await signedReq(
       txnBody({
         custom_data: { clerkUserId: "user_abc", kind: "overage", extraDrafts: 1_000_000 },
@@ -1040,8 +1040,8 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
 
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(25);
-    expect(quota.extraDraftsWindowStart).toBe(mondayStartUtc(Date.now()));
-    expect(quota.weeklyDraftLimit).toBe(120); // preserved
+    expect(quota.extraDraftsWindowStart).toBe(windowStartUtc(Date.now()));
+    expect(quota.monthlyDraftLimit).toBe(120); // preserved
     expect(quota.lastOverageEventId).toBe("evt_txn");
     expect(quota.processedOverageEventIds).toEqual(["evt_txn"]);
     expect(quota.overageCredits).toBeUndefined();
@@ -1050,7 +1050,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
         eventId: "evt_txn",
         transactionId: "txn_evt_txn",
         extraDrafts: 25,
-        windowStart: mondayStartUtc(Date.now()),
+        windowStart: windowStartUtc(Date.now()),
       },
     ]);
     expect(await storedPaddleOverageCreditKeys()).toEqual([
@@ -1067,7 +1067,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
           paddleSubscriptionId: "sub_123",
           paddleCustomerId: "ctm_123",
         },
-        quota: { weeklyDraftLimit: null },
+        quota: { monthlyDraftLimit: null },
       }),
     );
 
@@ -1103,7 +1103,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
           paddleSubscriptionId: "sub_123",
           paddleCustomerId: "ctm_123",
         },
-        quota: { weeklyDraftLimit: 120 },
+        quota: { monthlyDraftLimit: 120 },
       }),
     );
 
@@ -1128,7 +1128,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("credits a tracked overage transaction completed after subscription cancellation", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     await seedPaddleOverageCheckoutReservation({
       reservationId: "overage-open",
       createdAt: Date.now(),
@@ -1146,7 +1146,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
           paddleSubscriptionId: "sub_123",
           paddleCustomerId: "ctm_123",
         },
-        quota: { weeklyDraftLimit: null },
+        quota: { monthlyDraftLimit: null },
       }),
     );
 
@@ -1174,7 +1174,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("credits a tracked overage checkout after the configured price rotates", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     const oldOveragePrice = "pri_old_overage";
     const customData = await buildPaddleCheckoutCustomData("user_abc", env, "overage-open");
     await seedPaddleOverageCheckoutReservation({
@@ -1195,7 +1195,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
           paddleSubscriptionId: "sub_123",
           paddleCustomerId: "ctm_123",
         },
-        quota: { weeklyDraftLimit: 120 },
+        quota: { monthlyDraftLimit: 120 },
       }),
     );
 
@@ -1228,7 +1228,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("accumulates a second purchase within the same window", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         quota: { extraDrafts: 10, extraDraftsWindowStart: monday, lastOverageEventId: "evt_old" },
@@ -1259,6 +1259,88 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     ]);
   });
 
+  it("accumulates and canonicalizes the legacy weekly extra-credit stamp active at cutover", async () => {
+    const monthStart = windowStartUtc(Date.now());
+    const legacyWeekStart = Date.parse("2026-09-14T00:00:00.000Z");
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: {
+          extraDrafts: 10,
+          extraDraftsWindowStart: legacyWeekStart,
+          lastOverageEventId: "evt_old",
+          overageCredits: [
+            {
+              eventId: "evt_old",
+              transactionId: "txn_evt_old",
+              extraDrafts: 10,
+              windowStart: legacyWeekStart,
+            },
+          ],
+        },
+      }),
+    );
+    await signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+        },
+        "evt_legacy_week",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(15);
+    expect(quota.extraDraftsWindowStart).toBe(monthStart);
+    expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_legacy_week"]);
+    const credits = await storedPaddleOverageCredits();
+    expect(credits).toHaveLength(2);
+    expect(credits).toEqual(
+      expect.arrayContaining([
+        {
+          eventId: "evt_old",
+          transactionId: "txn_evt_old",
+          extraDrafts: 10,
+          windowStart: monthStart,
+        },
+        {
+          eventId: "evt_legacy_week",
+          transactionId: "txn_evt_legacy_week",
+          extraDrafts: 5,
+          windowStart: monthStart,
+        },
+      ]),
+    );
+  });
+
+  it("does not revive an expired legacy weekly extra-credit stamp from the cutover month", async () => {
+    const monthStart = windowStartUtc(Date.now());
+    const expiredLegacyWeekStart = Date.parse("2026-09-07T00:00:00.000Z");
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        quota: {
+          extraDrafts: 10,
+          extraDraftsWindowStart: expiredLegacyWeekStart,
+          lastOverageEventId: "evt_old",
+        },
+      }),
+    );
+    await signedReq(
+      txnBody(
+        {
+          custom_data: { clerkUserId: "user_abc", kind: "overage" },
+          items: [{ price: { id: OVERAGE_PRICE }, quantity: 5 }],
+        },
+        "evt_expired_legacy_week",
+      ),
+      { overrideEnv: overageEnv },
+    );
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(5);
+    expect(quota.extraDraftsWindowStart).toBe(monthStart);
+    expect(quota.processedOverageEventIds).toEqual(["evt_old", "evt_expired_legacy_week"]);
+  });
+
   it("resets extras when the stored purchase belongs to a prior window", async () => {
     mocks.getUser.mockResolvedValue(
       userWith({ quota: { extraDrafts: 99, extraDraftsWindowStart: 123 /* ancient */ } }),
@@ -1272,11 +1354,11 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     );
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(5);
-    expect(quota.extraDraftsWindowStart).toBe(mondayStartUtc(Date.now()));
+    expect(quota.extraDraftsWindowStart).toBe(windowStartUtc(Date.now()));
   });
 
   it("is idempotent on the overage event id", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         quota: {
@@ -1323,7 +1405,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("is idempotent when replaying any retained processed overage event id", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         quota: {
@@ -1359,7 +1441,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("is idempotent when replaying an overage event retained only in the durable ledger", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     await putPaddleOverageCredits([
       {
         eventId: "evt_txn",
@@ -1405,14 +1487,16 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("repairs processed overage credits with the original event window", async () => {
-    const currentMonday = mondayStartUtc(Date.now());
-    const oldMonday = currentMonday - WEEK_MS;
-    const oldOccurredAt = new Date(oldMonday + 12 * 60 * 60 * 1000).toISOString();
+    const currentWindowStart = windowStartUtc(Date.now());
+    // The 1st of the previous month: step back 1 ms from this window's start, then
+    // floor to that month's 1st.
+    const oldWindowStart = windowStartUtc(currentWindowStart - 1);
+    const oldOccurredAt = new Date(oldWindowStart + 12 * 60 * 60 * 1000).toISOString();
     mocks.getUser.mockResolvedValue(
       userWith({
         quota: {
           extraDrafts: 5,
-          extraDraftsWindowStart: currentMonday,
+          extraDraftsWindowStart: currentWindowStart,
           processedOverageEventIds: ["evt_old"],
         },
       }),
@@ -1434,12 +1518,12 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     expect((await res.json()) as any).toEqual({ ok: true, idempotent: true });
     const quota = lastWrite()?.quota;
     expect(quota.extraDrafts).toBe(5);
-    expect(quota.extraDraftsWindowStart).toBe(currentMonday);
+    expect(quota.extraDraftsWindowStart).toBe(currentWindowStart);
     expect(quota.overageCreditTransactions).toEqual([
       {
         eventId: "evt_old",
         transactionId: "txn_evt_old",
-        windowStart: oldMonday,
+        windowStart: oldWindowStart,
         creditKeys: ["evt_old:txn_evt_old:txnitm_old"],
       },
     ]);
@@ -1449,13 +1533,13 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
         transactionId: "txn_evt_old",
         transactionItemId: "txnitm_old",
         extraDrafts: 10,
-        windowStart: oldMonday,
+        windowStart: oldWindowStart,
       },
     ]);
   });
 
   it("serializes overlapping overage writes through the account Durable Object", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       quota: { extraDrafts: 0, extraDraftsWindowStart: monday },
     };
@@ -1513,7 +1597,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("retains overage credit records beyond the newest 100 entries", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     const existingCredits = Array.from({ length: 100 }, (_, i) => ({
       eventId: `evt_old_${i}`,
       transactionId: `txn_old_${i}`,
@@ -1561,7 +1645,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("writes only changed overage ledger shards", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     const existingCredits = [
       { eventId: "evt_a", transactionId: "txn_a", extraDrafts: 1, windowStart: monday },
       { eventId: "evt_b", transactionId: "txn_b", extraDrafts: 1, windowStart: monday },
@@ -1619,7 +1703,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
   });
 
   it("serializes overlapping subscription and overage writes through the account Durable Object", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       quota: { extraDrafts: 0, extraDraftsWindowStart: monday },
     };
@@ -1662,7 +1746,7 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
       extraDrafts: 5,
       extraDraftsWindowStart: monday,
       lastOverageEventId: "evt_overage",
-      weeklyDraftLimit: 120,
+      monthlyDraftLimit: 120,
     });
     expect((storedMeta.quota as Record<string, unknown>).processedOverageEventIds).toEqual([
       "evt_overage",
@@ -1733,7 +1817,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   }
 
   it("revokes current-window overage credit when an adjustment is approved", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -1774,8 +1858,65 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
+  it("revokes migrated legacy weekly-stamped credits from a legacy-stamped aggregate", async () => {
+    const monthStart = windowStartUtc(Date.now());
+    const legacyWeekStart = Date.parse("2026-09-14T00:00:00.000Z");
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 30,
+          extraDraftsWindowStart: legacyWeekStart,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 25,
+              windowStart: legacyWeekStart,
+            },
+            {
+              eventId: "evt_new",
+              transactionId: "txn_evt_new",
+              extraDrafts: 5,
+              windowStart: monthStart,
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(adjustmentBody());
+
+    expect((await res.json()) as any).toEqual({ ok: true, revoked: true, extraDrafts: 25 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(5);
+    expect(quota.extraDraftsWindowStart).toBe(monthStart);
+    const credits = await storedPaddleOverageCredits();
+    expect(credits).toHaveLength(2);
+    expect(credits).toEqual(
+      expect.arrayContaining([
+        {
+          eventId: "evt_txn",
+          transactionId: "txn_evt_txn",
+          extraDrafts: 25,
+          windowStart: legacyWeekStart,
+          reversedDrafts: 25,
+          reversedByAdjustmentId: "adj_123",
+          reversalAdjustmentIds: ["adj_123"],
+          reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
+        },
+        {
+          eventId: "evt_new",
+          transactionId: "txn_evt_new",
+          extraDrafts: 5,
+          windowStart: monthStart,
+        },
+      ]),
+    );
+  });
+
   it("resolves adjustment owners from the original transaction checkout binding", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     const customData = await buildPaddleCheckoutCustomData("user_abc", env);
     const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -1847,7 +1988,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("is idempotent on the adjustment id", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -1875,7 +2016,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("is idempotent when replaying an adjustment retained on the credit ledger", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -1927,7 +2068,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("retains an approved reversal that arrives before the overage transaction", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },
       quota: {},
@@ -1990,7 +2131,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("keeps pending reversals when purchase replay metadata writes fail", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let failPurchaseWrite = true;
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },
@@ -2064,7 +2205,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("does not apply retained pending reversals twice while repairing a processed purchase", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     const creditKey = "evt_txn:txn_evt_txn:";
     const pending = {
       eventId: "evt_adj",
@@ -2171,7 +2312,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("replays pending adjustments when repairing a processed overage purchase credit", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },
       quota: {
@@ -2229,7 +2370,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("preserves full refunds across partial processed purchase ledger repairs", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     await putPaddleOverageCredits([
       {
         eventId: "evt_txn",
@@ -2328,7 +2469,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("preserves itemized adjustments across partial processed purchase ledger repairs", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     await putPaddleOverageCredits([
       {
         eventId: "evt_txn",
@@ -2485,7 +2626,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("prorates a partial adjustment for one transaction item", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -2534,7 +2675,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("prorates cumulative partial adjustments before rounding", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },
       quota: {
@@ -2615,7 +2756,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("keeps partial adjustments pending when purchase amounts are unavailable", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -2670,7 +2811,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("ignores tax-only adjustment items without revoking overage credit", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -2703,7 +2844,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("restores credits after an approved chargeback reversal", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -2750,7 +2891,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("removes restored partial adjustment amounts before later cumulative proration", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },
       quota: {
@@ -2844,7 +2985,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("prorates cumulative partial restoration adjustments before rounding", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },
       quota: {
@@ -2942,7 +3083,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("restores only drafts revoked by the matching adjustment action", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     mocks.getUser.mockResolvedValue(
       userWith({
         subscription: { paddleCustomerId: "ctm_123" },
@@ -3004,7 +3145,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("retains a restore adjustment that arrives before its reversal", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },
       quota: {
@@ -3070,7 +3211,7 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
   });
 
   it("keeps replayed pending restores when reversal metadata writes fail", async () => {
-    const monday = mondayStartUtc(Date.now());
+    const monday = windowStartUtc(Date.now());
     let failChargebackWrite = true;
     let storedMeta: Record<string, unknown> = {
       subscription: { paddleCustomerId: "ctm_123" },

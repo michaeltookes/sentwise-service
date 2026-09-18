@@ -4,7 +4,7 @@
 // never emails.
 //
 // Storage keys:
-//   "window" -> WindowState  (weekly usage, in-flight token reservations, reset timestamps)
+//   "window" -> WindowState  (monthly usage, in-flight token reservations, reset timestamps)
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)

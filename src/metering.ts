@@ -9,18 +9,19 @@ import {
   DEFAULT_ENFORCEMENT_MODE,
   DEFAULT_MAX_TOKENS_PER_REQUEST,
   DEFAULT_RATE_LIMIT_PER_MIN,
-  DEFAULT_WEEKLY_DRAFT_LIMIT,
-  DEFAULT_WEEKLY_TOKEN_LIMIT,
+  DEFAULT_MONTHLY_DRAFT_LIMIT,
+  DEFAULT_MONTHLY_TOKEN_LIMIT,
   DEFAULT_MODEL_COST,
   MODEL_COSTS,
   type EnforcementMode,
 } from "./config";
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
-export const WEEK_MS = 7 * DAY_MS;
 export const RATE_WINDOW_MS = 60_000;
 export const RESERVATION_TTL_MS = 15 * 60_000;
 export const CONSERVATIVE_MESSAGE_FRAMING_TOKENS = 16;
+const MONTHLY_METERING_CUTOVER_MONTH_START = Date.UTC(2026, 8, 1);
+const MONTHLY_METERING_CUTOVER_LEGACY_WEEK_START = Date.UTC(2026, 8, 14);
 
 export interface ReservationRecord {
   id: string;
@@ -28,10 +29,10 @@ export interface ReservationRecord {
   expiresAt: number;
 }
 
-/** Per-account weekly window state. Stored in the Durable Object. No content. */
+/** Per-account monthly window state. Stored in the Durable Object. No content. */
 export interface WindowState {
-  windowStart: number; // ms epoch of Monday 00:00 UTC for the current window
-  resetsAt: number; // ms epoch when the window rolls (windowStart + WEEK_MS)
+  windowStart: number; // ms epoch of the 1st of the month 00:00 UTC for the current window
+  resetsAt: number; // ms epoch when the window rolls (the 1st of the next month 00:00 UTC)
   draftsUsed: number;
   tokensUsed: number;
   tokensReserved?: number; // in-flight estimated tokens reserved until settlement/release
@@ -41,16 +42,16 @@ export interface WindowState {
 
 /** Per-account overrides read from Clerk `privateMetadata.quota` (56c writes these). */
 export interface QuotaOverride {
-  weeklyDraftLimit?: number;
-  weeklyTokenLimit?: number;
+  monthlyDraftLimit?: number;
+  monthlyTokenLimit?: number;
   extraDrafts?: number; // purchased overage added only when extraDraftsWindowStart matches
-  extraDraftsWindowStart?: number; // ms epoch of the Monday window this purchase belongs to
+  extraDraftsWindowStart?: number; // ms epoch of the month window this purchase belongs to
 }
 
 /** Resolved effective limits for one request (env defaults + per-account overrides). */
 export interface ResolvedLimits {
-  weeklyDraftLimit: number; // already includes extraPurchased
-  weeklyTokenLimit: number;
+  monthlyDraftLimit: number; // already includes extraPurchased
+  monthlyTokenLimit: number;
   rateLimitPerMin: number;
   maxTokensPerRequest: number;
   enforcement: EnforcementMode;
@@ -72,8 +73,8 @@ export interface Quota {
 
 /** Structural subset of Env needed to resolve limits (keeps this module I/O-free & testable). */
 export interface LimitEnv {
-  WEEKLY_DRAFT_LIMIT?: string | number;
-  WEEKLY_TOKEN_LIMIT?: string | number;
+  MONTHLY_DRAFT_LIMIT?: string | number;
+  MONTHLY_TOKEN_LIMIT?: string | number;
   RATE_LIMIT_PER_MIN?: string | number;
   MAX_TOKENS_PER_REQUEST?: string | number;
   ENFORCEMENT_MODE?: string;
@@ -100,7 +101,7 @@ export function parseEnforcement(v: string | undefined): EnforcementMode {
  *
  * Trial accounts are ALWAYS hard-enforced regardless of ENFORCEMENT_MODE: a free,
  * throwaway trial account must not be able to run unbounded Anthropic spend past
- * its weekly caps. Paid tiers keep honoring the configured env-var mode — the 56b
+ * its monthly caps. Paid tiers keep honoring the configured env-var mode — the 56b
  * measure-first ("soft") decision stands for accounts that are actually billed.
  *
  * `hasPaidAccess` is the paid-vs-trial signal (see hasPaidAccess in src/auth.ts).
@@ -117,11 +118,21 @@ export function parseQuotaOverride(raw: unknown): QuotaOverride {
   if (typeof raw !== "object" || raw === null) return {};
   const r = raw as Record<string, unknown>;
   const out: QuotaOverride = {};
-  if (typeof r.weeklyDraftLimit === "number" && r.weeklyDraftLimit >= 0) {
-    out.weeklyDraftLimit = Math.floor(r.weeklyDraftLimit);
+  // Prefer the current monthly keys; fall back to the legacy weekly keys so any
+  // Clerk metadata written before the weekly->monthly switch still resolves.
+  // If a monthly key is explicitly present, it is authoritative: null/invalid
+  // values intentionally mean "no per-account paid-tier override".
+  const draftLimit = Object.hasOwn(r, "monthlyDraftLimit")
+    ? r.monthlyDraftLimit
+    : r.weeklyDraftLimit;
+  if (typeof draftLimit === "number" && draftLimit >= 0) {
+    out.monthlyDraftLimit = Math.floor(draftLimit);
   }
-  if (typeof r.weeklyTokenLimit === "number" && r.weeklyTokenLimit >= 0) {
-    out.weeklyTokenLimit = Math.floor(r.weeklyTokenLimit);
+  const tokenLimit = Object.hasOwn(r, "monthlyTokenLimit")
+    ? r.monthlyTokenLimit
+    : r.weeklyTokenLimit;
+  if (typeof tokenLimit === "number" && tokenLimit >= 0) {
+    out.monthlyTokenLimit = Math.floor(tokenLimit);
   }
   if (typeof r.extraDrafts === "number" && r.extraDrafts >= 0) {
     out.extraDrafts = Math.floor(r.extraDrafts);
@@ -138,14 +149,15 @@ export function resolveLimits(
   override: QuotaOverride,
   windowStart?: number,
 ): ResolvedLimits {
-  const extraPurchased =
-    override.extraDraftsWindowStart === windowStart ? (override.extraDrafts ?? 0) : 0;
+  const extraPurchased = extraDraftsWindowMatches(override.extraDraftsWindowStart, windowStart)
+    ? (override.extraDrafts ?? 0)
+    : 0;
   const baseDraftLimit =
-    override.weeklyDraftLimit ?? numFrom(env.WEEKLY_DRAFT_LIMIT, DEFAULT_WEEKLY_DRAFT_LIMIT);
+    override.monthlyDraftLimit ?? numFrom(env.MONTHLY_DRAFT_LIMIT, DEFAULT_MONTHLY_DRAFT_LIMIT);
   return {
-    weeklyDraftLimit: baseDraftLimit + extraPurchased,
-    weeklyTokenLimit:
-      override.weeklyTokenLimit ?? numFrom(env.WEEKLY_TOKEN_LIMIT, DEFAULT_WEEKLY_TOKEN_LIMIT),
+    monthlyDraftLimit: baseDraftLimit + extraPurchased,
+    monthlyTokenLimit:
+      override.monthlyTokenLimit ?? numFrom(env.MONTHLY_TOKEN_LIMIT, DEFAULT_MONTHLY_TOKEN_LIMIT),
     rateLimitPerMin: numFrom(env.RATE_LIMIT_PER_MIN, DEFAULT_RATE_LIMIT_PER_MIN),
     maxTokensPerRequest: numFrom(env.MAX_TOKENS_PER_REQUEST, DEFAULT_MAX_TOKENS_PER_REQUEST),
     enforcement: parseEnforcement(env.ENFORCEMENT_MODE),
@@ -153,21 +165,68 @@ export function resolveLimits(
   };
 }
 
-/** Monday 00:00:00.000 UTC of the week containing `now`. */
-export function mondayStartUtc(now: number): number {
+// ---------------------------------------------------------------------------
+// Window computation — a single, explicit definition of the metering window.
+//
+// The quota window is a CALENDAR MONTH in UTC: it starts at 00:00:00.000 UTC on
+// the 1st and resets at 00:00:00.000 UTC on the 1st of the following month
+// (owner decision 2026-09-16; the marketed per-tier caps are monthly — see
+// docs/tier-matrix.md in the app repo). Months are not a fixed number of ms, so
+// resets are computed from the calendar rather than by adding a constant. All
+// UTC, so it is DST-irrelevant.
+// ---------------------------------------------------------------------------
+
+/** 00:00:00.000 UTC on the 1st of the month containing `now`. */
+export function windowStartUtc(now: number): number {
   const d = new Date(now);
-  const day = d.getUTCDay(); // 0 = Sunday .. 6 = Saturday
-  const daysSinceMonday = (day + 6) % 7; // Monday -> 0, Sunday -> 6
-  const midnightToday = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
-  return midnightToday - daysSinceMonday * DAY_MS;
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
 }
 
-/** A brand-new zeroed window for the week containing `now`. */
+/** 00:00:00.000 UTC on the 1st of the month AFTER the one containing `now`. */
+export function windowResetsAt(now: number): number {
+  const d = new Date(now);
+  // Date.UTC normalizes a month index of 12 to January of the next year.
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+}
+
+/**
+ * Canonical storage stamp for purchased-extra credits.
+ *
+ * New writes store the month start exactly. For the one-time weekly->monthly
+ * migration, only the legacy weekly stamp that was active at cutover (owner
+ * decision 2026-09-16) is carried into the September 2026 monthly window.
+ */
+export function canonicalExtraDraftsWindowStart(extraDraftsWindowStart: number): number {
+  if (extraDraftsWindowStart === MONTHLY_METERING_CUTOVER_LEGACY_WEEK_START) {
+    return MONTHLY_METERING_CUTOVER_MONTH_START;
+  }
+  return extraDraftsWindowStart;
+}
+
+/**
+ * True when purchased extras belong to the current monthly quota window.
+ *
+ * Legacy weekly stamps are migration-compatible only for the cutover-active
+ * week; older expired weekly purchases and month-boundary weeks are not revived.
+ */
+export function extraDraftsWindowMatches(
+  extraDraftsWindowStart: number | undefined,
+  windowStart: number | undefined,
+): boolean {
+  if (extraDraftsWindowStart === undefined || windowStart === undefined) return false;
+  return canonicalExtraDraftsWindowStart(extraDraftsWindowStart) === windowStart;
+}
+
+/** True when `state` is exactly the calendar-month window that contains `now`. */
+export function isCurrentWindow(state: WindowState, now: number): boolean {
+  return state.windowStart === windowStartUtc(now) && state.resetsAt === windowResetsAt(now);
+}
+
+/** A brand-new zeroed window for the calendar month containing `now`. */
 export function freshWindow(now: number): WindowState {
-  const windowStart = mondayStartUtc(now);
   return {
-    windowStart,
-    resetsAt: windowStart + WEEK_MS,
+    windowStart: windowStartUtc(now),
+    resetsAt: windowResetsAt(now),
     draftsUsed: 0,
     tokensUsed: 0,
     tokensReserved: 0,
@@ -176,9 +235,18 @@ export function freshWindow(now: number): WindowState {
   };
 }
 
-/** Return the current window, rolling to a fresh one if `now` is at/after reset. */
+/**
+ * Return the current window, rolling to a fresh one when needed.
+ *
+ * Rolls when there is no stored state, when `now` is at/after the stored reset,
+ * OR when the stored window is not the calendar-month window for `now`. The last
+ * condition makes the weekly->monthly migration clean: a record whose boundaries
+ * were computed under the old weekly scheme is never aligned to a month, so the
+ * first request after deploy rolls it into a fresh monthly window (usage resets —
+ * acceptable pre-launch) with no crash or stuck state.
+ */
 export function rollWindow(state: WindowState | undefined | null, now: number): WindowState {
-  if (!state || now >= state.resetsAt) return freshWindow(now);
+  if (!state || now >= state.resetsAt || !isCurrentWindow(state, now)) return freshWindow(now);
   return pruneExpiredReservations(normalizeWindow(state), now);
 }
 
@@ -216,19 +284,21 @@ export function buildQuota(state: WindowState, limits: ResolvedLimits): Quota {
   return {
     unit: "drafts",
     used: state.draftsUsed,
-    limit: limits.weeklyDraftLimit,
-    remaining: Math.max(0, limits.weeklyDraftLimit - state.draftsUsed),
+    limit: limits.monthlyDraftLimit,
+    remaining: Math.max(0, limits.monthlyDraftLimit - state.draftsUsed),
     resetsAt: new Date(state.resetsAt).toISOString(),
     tokensUsed: state.tokensUsed,
-    tokenLimit: limits.weeklyTokenLimit,
+    tokenLimit: limits.monthlyTokenLimit,
     enforcement: limits.enforcement,
     extraPurchased: limits.extraPurchased,
   };
 }
 
-/** True when the account is at/over either weekly cap (drafts or tokens). */
+/** True when the account is at/over either monthly cap (drafts or tokens). */
 export function isOverQuota(state: WindowState, limits: ResolvedLimits): boolean {
-  return state.draftsUsed >= limits.weeklyDraftLimit || state.tokensUsed >= limits.weeklyTokenLimit;
+  return (
+    state.draftsUsed >= limits.monthlyDraftLimit || state.tokensUsed >= limits.monthlyTokenLimit
+  );
 }
 
 export function reservedTokens(state: WindowState): number {
@@ -258,8 +328,8 @@ export function wouldExceedQuota(
   tokensReservedDelta: number,
 ): boolean {
   return (
-    state.draftsUsed + draftDelta > limits.weeklyDraftLimit ||
-    state.tokensUsed + reservedTokens(state) + tokensReservedDelta > limits.weeklyTokenLimit
+    state.draftsUsed + draftDelta > limits.monthlyDraftLimit ||
+    state.tokensUsed + reservedTokens(state) + tokensReservedDelta > limits.monthlyTokenLimit
   );
 }
 

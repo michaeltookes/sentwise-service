@@ -18,7 +18,7 @@ import {
   type Env,
 } from "./config";
 import { ApiError } from "./errors";
-import { mondayStartUtc, numFrom } from "./metering";
+import { windowStartUtc, numFrom } from "./metering";
 import {
   paddleCheckoutBindingMatchesCustomData,
   paddleCheckoutBindingMatchesEvent,
@@ -140,7 +140,7 @@ async function applySubscriptionEvent(
 }
 
 // ---------------------------------------------------------------------------
-// transaction.completed → extra drafts stamped to the current weekly window.
+// transaction.completed → extra drafts stamped to the current monthly window.
 // ---------------------------------------------------------------------------
 
 async function applyOverageEvent(event: PaddleEvent, env: Env, userId: string): Promise<Response> {
@@ -386,5 +386,5 @@ function positiveIntFrom(v: string | number | undefined, fallback: number): numb
 function overageEventWindowStart(event: PaddleEvent): number | undefined {
   if (!event.occurredAt) return undefined;
   const occurredAt = Date.parse(event.occurredAt);
-  return Number.isFinite(occurredAt) ? mondayStartUtc(occurredAt) : undefined;
+  return Number.isFinite(occurredAt) ? windowStartUtc(occurredAt) : undefined;
 }

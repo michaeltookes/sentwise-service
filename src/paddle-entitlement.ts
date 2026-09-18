@@ -2,7 +2,11 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { mondayStartUtc } from "./metering";
+import {
+  canonicalExtraDraftsWindowStart,
+  extraDraftsWindowMatches,
+  windowStartUtc,
+} from "./metering";
 import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
 import type { OverageAdjustmentAction } from "./paddle";
 
@@ -229,10 +233,7 @@ export async function recordPaddleOverageInClerk(
       existingCredits,
       creditTransactions,
     );
-    const currentWindowStart =
-      typeof existingQuota.extraDraftsWindowStart === "number"
-        ? existingQuota.extraDraftsWindowStart
-        : null;
+    const currentWindowStart = currentExtraDraftsWindowStart(existingQuota);
     const currentExtras =
       typeof existingQuota.extraDrafts === "number"
         ? Math.max(0, Math.floor(existingQuota.extraDrafts))
@@ -270,6 +271,7 @@ export async function recordPaddleOverageInClerk(
       const quota = {
         ...quotaWithoutOverageCredits(existingQuota),
         ...(replayed.currentExtras !== null ? { extraDrafts: replayed.currentExtras } : {}),
+        ...(currentWindowStart !== null ? { extraDraftsWindowStart: currentWindowStart } : {}),
         overageCreditTransactions: nextCreditTransactions,
         ...fallbackPendingOverageReversals(ledgerStore, replayed.remainingPending),
         ...fallbackOverageCredits(ledgerStore, replayed.credits),
@@ -292,14 +294,19 @@ export async function recordPaddleOverageInClerk(
     return { mapped: false };
   }
 
-  const windowStart = mondayStartUtc(body.now);
-  const sameWindow = existingQuota.extraDraftsWindowStart === windowStart;
+  const windowStart = windowStartUtc(body.now);
+  const sameWindow =
+    typeof existingQuota.extraDraftsWindowStart === "number" &&
+    extraDraftsWindowMatches(existingQuota.extraDraftsWindowStart, windowStart);
   const prevExtras =
     sameWindow && typeof existingQuota.extraDrafts === "number"
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
       : 0;
   const pending = await loadPendingOverageReversals(existingQuota, ledgerStore);
-  const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
+  const existingCredits = canonicalizeCurrentWindowCredits(
+    await loadOverageCredits(existingQuota, ledgerStore),
+    windowStart,
+  );
   const expectedCredits = body.credits.map((credit) =>
     storedCreditFromInput(body.eventId, body.transactionId, credit, windowStart),
   );
@@ -380,10 +387,7 @@ export async function revokePaddleOverageInClerk(
   const existingQuota = asRecord(meta.quota) ?? {};
   const processedAdjustmentIds = processedOverageAdjustmentIds(existingQuota);
   if (processedAdjustmentIds.includes(body.adjustmentId)) {
-    const currentWindowStart =
-      typeof existingQuota.extraDraftsWindowStart === "number"
-        ? existingQuota.extraDraftsWindowStart
-        : null;
+    const currentWindowStart = currentExtraDraftsWindowStart(existingQuota);
     const credits = await loadOverageCredits(existingQuota, ledgerStore);
     const applied = applyAdjustmentToCredits(credits, body, currentWindowStart);
     if (applied.processed) {
@@ -393,10 +397,7 @@ export async function revokePaddleOverageInClerk(
   }
 
   const credits = await loadOverageCredits(existingQuota, ledgerStore);
-  const currentWindowStart =
-    typeof existingQuota.extraDraftsWindowStart === "number"
-      ? existingQuota.extraDraftsWindowStart
-      : null;
+  const currentWindowStart = currentExtraDraftsWindowStart(existingQuota);
   const previousExtras =
     typeof existingQuota.extraDrafts === "number"
       ? Math.max(0, Math.floor(existingQuota.extraDrafts))
@@ -478,6 +479,7 @@ export async function revokePaddleOverageInClerk(
   const quota = {
     ...quotaWithoutOverageCredits(existingQuota),
     extraDrafts: nextExtras,
+    ...(currentWindowStart !== null ? { extraDraftsWindowStart: currentWindowStart } : {}),
     processedOverageAdjustmentIds: boundedProcessedOverageAdjustmentIds([
       ...processedAdjustmentIds,
       body.adjustmentId,
@@ -581,6 +583,28 @@ function storedCreditFromInput(
   });
 }
 
+function canonicalizeCurrentWindowCredits(
+  credits: StoredOverageCredit[],
+  currentWindowStart: number,
+): StoredOverageCredit[] {
+  return credits.map((credit) => {
+    const canonicalWindowStart = canonicalExtraDraftsWindowStart(credit.windowStart);
+    if (
+      canonicalWindowStart !== currentWindowStart ||
+      canonicalWindowStart === credit.windowStart
+    ) {
+      return credit;
+    }
+    return cleanCredit({ ...credit, windowStart: canonicalWindowStart });
+  });
+}
+
+function currentExtraDraftsWindowStart(quota: Record<string, unknown>): number | null {
+  return typeof quota.extraDraftsWindowStart === "number"
+    ? canonicalExtraDraftsWindowStart(quota.extraDraftsWindowStart)
+    : null;
+}
+
 function overageCreditRepairWindowStart(
   body: PaddleOverageBody,
   existingCredits: StoredOverageCredit[],
@@ -595,7 +619,7 @@ function overageCreditRepairWindowStart(
       transaction.eventId === body.eventId && transaction.transactionId === body.transactionId,
   );
   if (matchingTransaction) return matchingTransaction.windowStart;
-  return body.eventWindowStart ?? mondayStartUtc(body.now);
+  return body.eventWindowStart ?? windowStartUtc(body.now);
 }
 
 function storedOverageCreditTransactionFromCredits(
@@ -662,7 +686,9 @@ function applyAdjustmentToCredits(
 
     processed = true;
     extraDrafts += application.drafts;
-    const currentWindow = credit.windowStart === currentWindowStart;
+    const currentWindow =
+      currentWindowStart !== null &&
+      extraDraftsWindowMatches(credit.windowStart, currentWindowStart);
     if (currentWindow) {
       currentWindowExtraDrafts += application.drafts;
     }

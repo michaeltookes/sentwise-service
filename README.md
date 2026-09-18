@@ -24,7 +24,7 @@ reply to) to this Worker with a short-lived Clerk session token. The Worker:
    zero-data-retention terms.
 4. Returns the drafted text and token usage.
 
-Metering, weekly caps, and rate-limiting ship in **56b** (see [Metering](#metering-56b) below).
+Metering, monthly caps, and rate-limiting ship in **56b** (see [Metering](#metering-56b) below).
 Checkout / licensing (**56c**) is handled by the Paddle webhook that writes the account's entitlement
 (see [Checkout & licensing](#checkout--licensing-56c)); an active paid subscription grants drafting
 access past the 14-day trial.
@@ -43,7 +43,7 @@ access past the 14-day trial.
   1. `trialStartedAt` and `subscription` in the user's Clerk `privateMetadata` (trial enforcement,
      56a; subscription/licensing written by the Paddle webhook, 56c; subscription display, 73).
   2. Per-account **usage counters + timestamps** in a Durable Object (`AccountQuota`, 56b): the
-     weekly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
+     monthly drafts/tokens used, in-flight token reservations, a sliding rate-limit window, and random
      reservation IDs keyed by Clerk userId. No prompts, no drafts, no emails.
   3. **Aggregate, hashed usage metrics** in Workers Analytics Engine (56b): a hash of the userId
      (never the raw id) — SHA-256, or keyed **HMAC-SHA256** when `ANALYTICS_HASH_KEY` is set (S-I2) —
@@ -107,11 +107,11 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
   "quota": {
     "unit": "drafts",
     "used": 12,
-    "limit": 100,
-    "remaining": 88,
-    "resetsAt": "2026-09-07T00:00:00.000Z",
+    "limit": 120,
+    "remaining": 108,
+    "resetsAt": "2026-10-01T00:00:00.000Z",
     "tokensUsed": 240000,
-    "tokenLimit": 2000000,
+    "tokenLimit": 8000000,
     "enforcement": "soft",
     "extraPurchased": 0
   }
@@ -207,7 +207,7 @@ What is deleted:
 2. The **Clerk user** is then deleted via Clerk's REST API, which removes `trialStartedAt` and any
    `subscription` / `quota` metadata.
 3. After Clerk deletion succeeds (including idempotent 404), the Durable Object finalizes deletion
-   (`/finish-delete`): all weekly counters, in-flight reservations, settlement markers, and the
+   (`/finish-delete`): all monthly counters, in-flight reservations, settlement markers, and the
    settlement alarm are removed, while a minimal deleted tombstone remains.
 
 If Clerk returns a definitive non-404 failure response, the deletion barrier is cancelled and the
@@ -254,11 +254,11 @@ Requires `Authorization: Bearer <clerk-session-token>`. Body mirrors the app's `
   "quota": {
     "unit": "drafts",
     "used": 13,
-    "limit": 100,
-    "remaining": 87,
-    "resetsAt": "2026-09-07T00:00:00.000Z",
+    "limit": 120,
+    "remaining": 107,
+    "resetsAt": "2026-10-01T00:00:00.000Z",
     "tokensUsed": 241801,
-    "tokenLimit": 2000000,
+    "tokenLimit": 8000000,
     "enforcement": "soft",
     "extraPurchased": 0
   }
@@ -278,63 +278,77 @@ Full-featured, enforced server-side. On the first authenticated `/v1/draft` call
 
 ## Metering (56b)
 
-Per-account usage metering, weekly caps, and rate limiting. The model (owner decision 2026-08-29): a
-**weekly allotment that resets weekly**, then pay-per-use overage (the purchase flow is 56c; 56b
-meters, enforces, and surfaces the numbers).
+Per-account usage metering, monthly caps, and rate limiting. The model (owner decision 2026-09-16,
+finalizing the window unit): a **monthly allotment that resets each calendar month**, then pay-per-use
+overage (the purchase flow is 56c; 56b meters, enforces, and surfaces the numbers). The per-tier caps
+are the ones the marketing site sells — 30 / 120 follow-ups a month — so the numbers now match.
 
-**Window semantics.** The allotment window is one week starting **Monday 00:00 UTC**; it rolls on a
-lazy reset (the next request at/after `resetsAt` starts a fresh, zeroed window). Counters live in the
+**Window semantics.** The allotment window is one **calendar month in UTC**, starting at **00:00 UTC
+on the 1st** and resetting at **00:00 UTC on the 1st of the next month** (see `windowStartUtc` /
+`windowResetsAt` in `src/metering.ts` — a single, explicit window definition). Months are not a fixed
+number of milliseconds, so the reset is computed from the calendar, not by adding a constant; it is
+UTC-only, so DST is irrelevant. The window rolls on a lazy reset (the next request at/after
+`resetsAt` starts a fresh, zeroed window). Counters live in the
 `AccountQuota` Durable Object, one instance per Clerk userId. The `quota` object on `/v1/me` and
 `/v1/draft` reports `used` / `limit` / `remaining` (drafts), `tokensUsed` / `tokenLimit`, the
 `resetsAt` timestamp, the `enforcement` mode, and `extraPurchased` (overage credits added to the
 limit for the current window).
 
 **Per-request pipeline** (`POST /v1/draft`): authenticate → **rate-limit** → trial → parse →
-**token safety cap** → **atomic weekly quota reservation** → forward to Anthropic → settle usage →
+**token safety cap** → **atomic monthly quota reservation** → forward to Anthropic → settle usage →
 respond. The rate limiter runs **before** the Clerk trial lookup (S-M1) so a scripted account is
 stopped by our per-account limiter rather than exhausting Clerk's per-instance Backend API limits;
 the rate limit is env-derived, so it needs no Clerk call to evaluate. If Anthropic fails after reservation, the reserved draft is released; if immediate settlement
 fails after Anthropic succeeds, the completed draft is still returned and the settlement is queued in
 the account Durable Object for alarm retry. Abandoned reservations expire after 15 minutes so leaked
-capacity is reclaimed before the weekly reset.
+capacity is reclaimed before the monthly reset.
 
 **Enforcement modes** (`ENFORCEMENT_MODE`):
 
-- `soft` (default): meter and report, but never block on the weekly quota — `remaining` clamps at 0
+- `soft` (default): meter and report, but never block on the monthly quota — `remaining` clamps at 0
   and drafting continues past the cap. The rate limit and the per-request safety cap are always hard.
 - `hard`: also block over-quota drafts with `429 quota_exceeded`; token capacity is reserved with a
   conservative `UTF-8 input bytes + per-message framing + max_tokens` bound before forwarding.
 
 > **Trial accounts are always hard-enforced (S-M2)**, regardless of `ENFORCEMENT_MODE`, so a free
-> throwaway trial can't run unbounded Anthropic spend past its weekly caps. `ENFORCEMENT_MODE` only
+> throwaway trial can't run unbounded Anthropic spend past its monthly caps. `ENFORCEMENT_MODE` only
 > governs **paid** tiers (the measure-first decision stands for billed accounts). A trial therefore
 > reports `enforcement: "hard"` on both `/v1/draft` and `/v1/me`.
 
 **Error codes:**
 
-| HTTP | `error.type`        | When                                                                                                           |
-| ---- | ------------------- | -------------------------------------------------------------------------------------------------------------- |
-| 429  | `rate_limited`      | Over `RATE_LIMIT_PER_MIN` (sliding 60s). Includes `Retry-After`.                                               |
-| 413  | `request_too_large` | Estimated request tokens exceed `MAX_TOKENS_PER_REQUEST`.                                                      |
-| 429  | `quota_exceeded`    | Weekly cap reached under hard enforcement (`ENFORCEMENT_MODE=hard`, **or any trial account**). Has `resetsAt`. |
+| HTTP | `error.type`        | When                                                                                                            |
+| ---- | ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 429  | `rate_limited`      | Over `RATE_LIMIT_PER_MIN` (sliding 60s). Includes `Retry-After`.                                                |
+| 413  | `request_too_large` | Estimated request tokens exceed `MAX_TOKENS_PER_REQUEST`.                                                       |
+| 429  | `quota_exceeded`    | Monthly cap reached under hard enforcement (`ENFORCEMENT_MODE=hard`, **or any trial account**). Has `resetsAt`. |
 
-**Config vars** (in `wrangler.jsonc` `vars`; placeholder defaults, final numbers land with 56c):
+**Config vars** (in `wrangler.jsonc` `vars`):
 
-| Var                      | Default   | Meaning                                                                |
-| ------------------------ | --------- | ---------------------------------------------------------------------- |
-| `WEEKLY_DRAFT_LIMIT`     | `100`     | Drafts per account per week.                                           |
-| `WEEKLY_TOKEN_LIMIT`     | `2000000` | Input+output tokens per account per week.                              |
-| `RATE_LIMIT_PER_MIN`     | `10`      | Requests per 60s per account (abuse guard).                            |
-| `MAX_TOKENS_PER_REQUEST` | `55000`   | Per-request safety cap; bound as `UTF-8 bytes + framing + max_tokens`. |
-| `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).                      |
+| Var                      | Default   | Meaning                                                                          |
+| ------------------------ | --------- | -------------------------------------------------------------------------------- |
+| `MONTHLY_DRAFT_LIMIT`    | `400`     | Base drafts per account per calendar month (governs trials + fallback accounts). |
+| `MONTHLY_TOKEN_LIMIT`    | `8000000` | Input+output tokens per account per calendar month.                              |
+| `RATE_LIMIT_PER_MIN`     | `10`      | Requests per 60s per account (abuse guard).                                      |
+| `MAX_TOKENS_PER_REQUEST` | `55000`   | Per-request safety cap; bound as `UTF-8 bytes + framing + max_tokens`.           |
+| `ENFORCEMENT_MODE`       | `soft`    | `soft` (meter only) or `hard` (block over-quota).                                |
+
+The per-tier paid caps (`STARTER_DRAFT_LIMIT` `30`, `PRO_DRAFT_LIMIT` `120`, `UNLIMITED_DRAFT_LIMIT`
+`100000` fair-use) are written per-account by the Paddle webhook (see
+[Checkout & licensing](#checkout--licensing-56c)); the base `MONTHLY_DRAFT_LIMIT` applies to trials
+and any account without a written tier override.
 
 **Per-account overrides.** `privateMetadata.quota` on the Clerk user —
-`{ weeklyDraftLimit?, weeklyTokenLimit?, extraDrafts?, extraDraftsWindowStart?, processedOverageEventIds? }`
+`{ monthlyDraftLimit?, monthlyTokenLimit?, extraDrafts?, extraDraftsWindowStart?, processedOverageEventIds? }`
 — overrides the vars for that account. `extraDrafts` is added only when `extraDraftsWindowStart`
-equals the current weekly window's Monday 00:00 UTC epoch-ms `windowStart`; stale or unscoped credits
-are ignored. `weeklyDraftLimit: null` is treated as absent and is used by the Paddle webhook to clear
-Clerk's deep-merged paid override. These are read on the same `getUser` as the trial, so metering
-adds no extra Clerk round-trip.
+equals the current month window's 1st-of-month 00:00 UTC epoch-ms `windowStart`; stale or unscoped
+credits are ignored. The one weekly-stamped overage window active at the September 2026 cutover is
+canonicalized into that month; older expired weekly credits and month-boundary weeks are not revived.
+`monthlyDraftLimit: null` is treated as absent and is used by the Paddle webhook to clear Clerk's
+deep-merged paid override. (The parser still reads the legacy `weeklyDraftLimit` /
+`weeklyTokenLimit` keys as a fallback so any metadata written before the weekly→monthly switch still
+resolves.) These are read on the same `getUser` as the trial, so metering adds no extra Clerk
+round-trip.
 
 **Privacy.** The Durable Object stores only integers and timestamps; it never sees prompt or draft
 content. See the [Privacy design](#privacy-design--content-stateless-by-construction) section.
@@ -384,7 +398,7 @@ edit it there when pricing changes or a new model is added.
 Checkout and licensing run on **Paddle**. The app asks this Worker to create a Paddle transaction for
 the authenticated account, then opens that transaction in Paddle.js; Paddle then calls this Worker's
 webhook, which turns billing events into the account's entitlement — the `subscription` record read by
-[`GET /v1/me`](#subscription-item-73) and the per-tier weekly draft limit enforced by
+[`GET /v1/me`](#subscription-item-73) and the per-tier monthly draft limit enforced by
 [Metering](#metering-56b). The app never mints a license itself; **Paddle → this webhook → Clerk
 `privateMetadata`** is the only source of truth.
 
@@ -434,12 +448,12 @@ Behavior:
   tier is charged pro rata on an upgrade; the lower tier is credited pro rata on a downgrade). A
   single immediate mode keeps this endpoint's optimistic entitlement write and the
   `subscription.updated` webhook's reconciliation in agreement, avoiding a "takes effect next period"
-  state where the stored weekly limit would disagree with the tier actually being paid for.
+  state where the stored monthly limit would disagree with the tier actually being paid for.
 - Confirms Paddle's successful response reports the requested recurring price before granting the
   optimistic entitlement; missing or mismatched returned items fail as `502 subscription_change_failed`.
 - Queues the optimistic entitlement write through the account Durable Object, re-reading the latest
   Clerk metadata there before bumping the stored `subscription` record's `plan`/`priceId` and the
-  active paid tier's `privateMetadata.quota.weeklyDraftLimit`. The queued write is skipped if the
+  active paid tier's `privateMetadata.quota.monthlyDraftLimit`. The queued write is skipped if the
   latest Clerk subscription no longer has the initially observed price and ordering timestamp,
   unless it already has the requested target price. Every reconciliation/idempotency field
   (`updatedAt`, `lastEventId`, `paddleOccurredAt`, `paddleSubscriptionId`, `paddleCustomerId`,
@@ -474,11 +488,11 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 
 **Events handled** (others are acknowledged `200` and ignored):
 
-| Event                                                                                                   | Write                                                                                                                                                                                                                                                          |
-| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids). Active/trialing/past-due statuses set `privateMetadata.quota.weeklyDraftLimit`; canceled/paused statuses write `weeklyDraftLimit: null` to clear Clerk's deep-merged paid override |
-| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current Monday window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`                                                                                                   |
-| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion                                                                                                         |
+| Event                                                                                                   | Write                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscription.activated` / `.created` / `.updated` / `.canceled` / `.past_due` / `.paused` / `.resumed` | `privateMetadata.subscription` (plan/status/renewsAt + reconciliation ids). Active/trialing/past-due statuses set `privateMetadata.quota.monthlyDraftLimit`; canceled/paused statuses write `monthlyDraftLimit: null` to clear Clerk's deep-merged paid override |
+| `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current month window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`                                                                                                      |
+| `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion                                                                                                           |
 
 **Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
 is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or
@@ -494,7 +508,7 @@ failures and missing Paddle API credentials return `502` so Paddle retries.
 **Price → tier.** `data.items[].price.id` maps to a tier via `PRICE_TO_PLAN` in `src/config.ts`
 (SANDBOX ids today):
 
-| Price id                         | Tier        | Weekly draft limit (var)      |
+| Price id                         | Tier        | Monthly draft limit (var)     |
 | -------------------------------- | ----------- | ----------------------------- |
 | `pri_01m1syd7nfarp8pggpcnvjbgyy` | `starter`   | `STARTER_DRAFT_LIMIT` (30)    |
 | `pri_01m1symsxarc4c3jdea0ntb09w` | `pro`       | `PRO_DRAFT_LIMIT` (120)       |
@@ -504,10 +518,10 @@ The Durable Object also stores the selected paid plan on the pending subscriptio
 reservation, so a matching signed subscription webhook can still apply the purchased tier if a
 catalog migration removes or replaces the old price id before Paddle delivers the event.
 
-The limits are **placeholders**, tunable per-deploy without a release. ⚠️ **Open owner decision:** the
-landing page says "per **month**", but 56b enforces a **weekly** window — the window unit and the real
-per-tier numbers are unresolved. The plumbing is deliberately window-agnostic (it writes whatever the
-var holds and stamps overage to the 56b Monday window); it does not encode a final answer.
+The per-tier numbers stay tunable per-deploy via the vars without a release. The **window unit is now
+settled** (owner decision 2026-09-16): these caps are enforced over a **calendar-month** window, so
+they match the marketing site's "per **month**" copy (30 / 120 follow-ups a month). Overage is stamped
+to the current month window (see [Metering](#metering-56b)).
 
 **Billing management.** Paddle portal URLs are temporary authenticated links, so the webhook never
 persists them. The app should open `GET /v1/paddle/manage-billing` for payment-method changes or
@@ -521,7 +535,7 @@ portal-session details.
 `EXTRA_DRAFTS_PER_UNIT`. Buyer-controlled `custom_data.extraDrafts` is ignored. Each credit stores
 the Paddle transaction id and, when Paddle provides it, the transaction item id and item total.
 Approved Paddle refund/chargeback/credit adjustments mark matching credits as reversed and subtract
-any still-current weekly extras; partial adjustments are prorated from the cumulative adjusted amount
+any still-current monthly extras; partial adjustments are prorated from the cumulative adjusted amount
 before calculating each incremental draft change. Approved
 chargeback/credit reversals restore only drafts revoked by the corresponding chargeback/credit
 action. Tax/proration-only adjustment items are ignored rather than treated as whole-overage

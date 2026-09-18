@@ -386,7 +386,7 @@ export function normalizeIso(v: unknown): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tier weekly draft limit resolution (var-driven placeholders).
+// Per-tier monthly draft limit resolution (var-driven placeholders).
 // ---------------------------------------------------------------------------
 
 export interface PlanLimitEnv {
@@ -395,7 +395,7 @@ export interface PlanLimitEnv {
   UNLIMITED_DRAFT_LIMIT?: string | number;
 }
 
-/** Resolve a paid tier's weekly draft limit from vars, falling back to placeholders. */
+/** Resolve a paid tier's monthly draft limit from vars, falling back to placeholders. */
 export function resolvePlanDraftLimit(env: PlanLimitEnv, plan: PaidPlan): number {
   switch (plan) {
     case "starter":
