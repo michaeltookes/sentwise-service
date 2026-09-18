@@ -1804,6 +1804,63 @@ describe("POST /v1/paddle/webhook — overage reversals (adjustment.*)", () => {
     ]);
   });
 
+  it("revokes migrated legacy weekly-stamped credits from the monthly aggregate", async () => {
+    const monthStart = windowStartUtc(Date.now());
+    const legacyWeekStart = Date.parse("2026-08-31T00:00:00.000Z");
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: { paddleCustomerId: "ctm_123" },
+        quota: {
+          extraDrafts: 30,
+          extraDraftsWindowStart: monthStart,
+          overageCredits: [
+            {
+              eventId: "evt_txn",
+              transactionId: "txn_evt_txn",
+              extraDrafts: 25,
+              windowStart: legacyWeekStart,
+            },
+            {
+              eventId: "evt_new",
+              transactionId: "txn_evt_new",
+              extraDrafts: 5,
+              windowStart: monthStart,
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await signedReq(adjustmentBody());
+
+    expect((await res.json()) as any).toEqual({ ok: true, revoked: true, extraDrafts: 25 });
+    const quota = lastWrite()?.quota;
+    expect(quota.extraDrafts).toBe(5);
+    expect(quota.extraDraftsWindowStart).toBe(monthStart);
+    const credits = await storedPaddleOverageCredits();
+    expect(credits).toHaveLength(2);
+    expect(credits).toEqual(
+      expect.arrayContaining([
+        {
+          eventId: "evt_txn",
+          transactionId: "txn_evt_txn",
+          extraDrafts: 25,
+          windowStart: legacyWeekStart,
+          reversedDrafts: 25,
+          reversedByAdjustmentId: "adj_123",
+          reversalAdjustmentIds: ["adj_123"],
+          reversedDraftsByAdjustment: [{ adjustmentId: "adj_123", action: "refund", drafts: 25 }],
+        },
+        {
+          eventId: "evt_new",
+          transactionId: "txn_evt_new",
+          extraDrafts: 5,
+          windowStart: monthStart,
+        },
+      ]),
+    );
+  });
+
   it("resolves adjustment owners from the original transaction checkout binding", async () => {
     const monday = windowStartUtc(Date.now());
     const customData = await buildPaddleCheckoutCustomData("user_abc", env);

@@ -664,7 +664,9 @@ function applyAdjustmentToCredits(
 
     processed = true;
     extraDrafts += application.drafts;
-    const currentWindow = credit.windowStart === currentWindowStart;
+    const currentWindow =
+      currentWindowStart !== null &&
+      extraDraftsWindowMatches(credit.windowStart, currentWindowStart);
     if (currentWindow) {
       currentWindowExtraDrafts += application.drafts;
     }
