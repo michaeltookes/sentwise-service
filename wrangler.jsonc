@@ -22,7 +22,7 @@
   // terminal (TTY). A non-interactive/piped invocation can upload an EMPTY secret
   // silently (a known 56b gotcha), which then fails webhook verification with 401.
   "vars": {
-    "CLERK_PUBLISHABLE_KEY": "pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA",
+    "CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsuc2VudHdpc2UuYWkk", // production instance (clerk.sentwise.ai)
 
     // --- 56b metering limits (placeholder defaults; final numbers land with 56c) ---
     "MONTHLY_DRAFT_LIMIT": "400", // base drafts per account per calendar month (1st 00:00 UTC reset); governs trials + fallback
