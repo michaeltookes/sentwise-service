@@ -40,7 +40,13 @@
     // LIVE Paddle API (item 74 cutover, 2026-09-20); sandbox was
     // https://sandbox-api.paddle.com — flip back only for sandbox testing with
     // matching sandbox PADDLE_API_KEY / PADDLE_WEBHOOK_SECRET secrets.
+    // Live mode also requires the public tier price vars below to be set to the
+    // live Paddle price ids; when absent/incomplete, tier checkout and webhook
+    // mapping fail closed instead of accepting sandbox ids against the live API.
     "PADDLE_API_BASE": "https://api.paddle.com",
+    // "PADDLE_STARTER_PRICE_ID": "pri_...",
+    // "PADDLE_PRO_PRICE_ID": "pri_...",
+    // "PADDLE_UNLIMITED_PRICE_ID": "pri_...",
     "PADDLE_WEBHOOK_TOLERANCE_SEC": "300", // signature freshness window (seconds)
     // Per-tier MONTHLY draft limits (owner decision 2026-09-16): the caps the
     // marketing site sells — "30 follow-ups a month" / "120 a month" — enforced over

@@ -1,6 +1,6 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
-import { type Env, type PaidPlan } from "./config";
+import { hasPaddleTierPriceConfig, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import {
   paddleCheckoutBindingMatchesEvent,
@@ -99,7 +99,7 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const existingSub = asRecord(meta.subscription);
-  const mapped = planMappingForSubscriptionEvent(body.event, existingSub, body.checkoutPlan);
+  const mapped = planMappingForSubscriptionEvent(body.event, existingSub, env, body.checkoutPlan);
   if (!mapped) {
     return { ignored: "unknown_price" };
   }
@@ -169,9 +169,10 @@ export async function recordPaddleSubscriptionInClerk(
 function planMappingForSubscriptionEvent(
   event: PaddleEvent,
   existingSub: Record<string, unknown> | null,
+  env: Env,
   checkoutPlan?: PaddleSubscriptionCheckoutPlan | null,
 ): { plan: SubscriptionPlan; priceId: string | null; quotaPlan: PaidPlan | null } | null {
-  const mapped = planFromEvent(event);
+  const mapped = planFromEvent(event, env);
   if (mapped) return { ...mapped, quotaPlan: mapped.plan };
   if (checkoutPlan) {
     return {
@@ -184,6 +185,9 @@ function planMappingForSubscriptionEvent(
     !isTerminalSubscriptionEvent(event) &&
     !subscriptionEventMatchesStoredSubscription(event, existingSub)
   ) {
+    if (!hasPaddleTierPriceConfig(env)) {
+      throw new ApiError(503, "checkout_unavailable", "Paddle tier price ids are not configured.");
+    }
     return null;
   }
 

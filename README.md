@@ -432,13 +432,13 @@ returns its hosted payment link.
 
 **Clerk bearer required.** In-app upgrade/downgrade of the account's existing paid subscription to a
 different tier (item 90). The request body is `{ "priceId": "pri_..." }`, where `priceId` is the
-**target tier's** subscription price (one of the configured `PRICE_TO_PLAN` prices). Unlike
+**target tier's** subscription price (one of the configured tier price ids). Unlike
 `POST /v1/paddle/checkout`, this changes the current subscription in place rather than starting a new
 one.
 
 Behavior:
 
-- Resolves the target tier from `PRICE_TO_PLAN` (an unknown price is rejected).
+- Resolves the target tier from the configured tier-price map (an unknown price is rejected).
 - Loads the account's stored `paddleSubscriptionId`; a `404` is returned if the account has no Paddle
   subscription to change.
 - Rejects a no-op change to the price the account is already on.
@@ -505,14 +505,20 @@ candidate user does not match the Paddle customer, the event is
 acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help. Transient Paddle/Clerk lookup
 failures and missing Paddle API credentials return `502` so Paddle retries.
 
-**Price → tier.** `data.items[].price.id` maps to a tier via `PRICE_TO_PLAN` in `src/config.ts`
-(SANDBOX ids today):
+**Price → tier.** `data.items[].price.id` maps to a tier via the env-backed tier-price map in
+`src/config.ts`. Sandbox/local default ids:
 
 | Price id                         | Tier        | Monthly draft limit (var)     |
 | -------------------------------- | ----------- | ----------------------------- |
 | `pri_01m1syd7nfarp8pggpcnvjbgyy` | `starter`   | `STARTER_DRAFT_LIMIT` (30)    |
 | `pri_01m1symsxarc4c3jdea0ntb09w` | `pro`       | `PRO_DRAFT_LIMIT` (120)       |
 | `pri_01m1syrdg05f49kz705gbzn6tz` | `unlimited` | `UNLIMITED_DRAFT_LIMIT` (1e5) |
+
+When `PADDLE_API_BASE` is `https://api.paddle.com`, the Worker does **not** fall back to those
+sandbox ids. The deployment must set `PADDLE_STARTER_PRICE_ID`, `PADDLE_PRO_PRICE_ID`, and
+`PADDLE_UNLIMITED_PRICE_ID` to the live Paddle subscription prices; otherwise tier checkouts and plan
+changes reject unknown prices before calling Paddle, and first-match subscription webhooks return
+`503` so Paddle retries after the config is fixed.
 
 The Durable Object also stores the selected paid plan on the pending subscription checkout
 reservation, so a matching signed subscription webhook can still apply the purchased tier if a
@@ -573,8 +579,9 @@ Paddle secrets (below); (2) in the Paddle dashboard creates a **notification des
 `subscription.past_due`, `subscription.paused`, `subscription.resumed`, `transaction.completed`,
 `adjustment.created`, and `adjustment.updated`, and copies its signing secret into
 `PADDLE_WEBHOOK_SECRET`; (3) when moving off sandbox, flips `PADDLE_API_BASE` to
-`https://api.paddle.com` and swaps the sandbox price ids in `PRICE_TO_PLAN` for live ids. End-to-end
-verification (a real Paddle test event → a real entitlement write) happens then.
+`https://api.paddle.com` and sets `PADDLE_STARTER_PRICE_ID`, `PADDLE_PRO_PRICE_ID`, and
+`PADDLE_UNLIMITED_PRICE_ID` to the live subscription price ids. End-to-end verification (a real
+Paddle test event → a real entitlement write) happens then.
 
 ## Development
 
@@ -623,6 +630,10 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   `GET /v1/paddle/manage-billing`, cross-subscription replacement checks, and webhook fallback
   mapping. Missing credentials make those operations fail closed with `5xx` instead of acknowledging
   paid events.
+- `PADDLE_STARTER_PRICE_ID` / `PADDLE_PRO_PRICE_ID` / `PADDLE_UNLIMITED_PRICE_ID` — **56c, public
+  vars.** Required when `PADDLE_API_BASE` points at the live API. Sandbox/local mode defaults to the
+  sandbox ids committed in `src/config.ts`; live mode fails closed instead of accepting sandbox ids,
+  and the three tier ids are treated as an all-or-nothing set.
 
 Push them to the Worker with (values are read from the file, never printed):
 
