@@ -37,8 +37,10 @@
     "CF_ACCOUNT_ID": "313171820c15d1a8f14bed4dbcb699af",
 
     // --- 56c checkout + licensing (Paddle) ---
-    // SANDBOX base until the owner flips to https://api.paddle.com with live creds.
-    "PADDLE_API_BASE": "https://sandbox-api.paddle.com",
+    // LIVE Paddle API (item 74 cutover, 2026-09-20); sandbox was
+    // https://sandbox-api.paddle.com — flip back only for sandbox testing with
+    // matching sandbox PADDLE_API_KEY / PADDLE_WEBHOOK_SECRET secrets.
+    "PADDLE_API_BASE": "https://api.paddle.com",
     "PADDLE_WEBHOOK_TOLERANCE_SEC": "300", // signature freshness window (seconds)
     // Per-tier MONTHLY draft limits (owner decision 2026-09-16): the caps the
     // marketing site sells — "30 follow-ups a month" / "120 a month" — enforced over
