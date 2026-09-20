@@ -13,7 +13,8 @@ import {
   DEFAULT_PRO_DRAFT_LIMIT,
   DEFAULT_STARTER_DRAFT_LIMIT,
   DEFAULT_UNLIMITED_DRAFT_LIMIT,
-  PRICE_TO_PLAN,
+  planForPrice,
+  type PaddlePriceConfigEnv,
   type PaidPlan,
 } from "./config";
 import { numFrom } from "./metering";
@@ -251,13 +252,17 @@ export function priceIdsFromEvent(event: PaddleEvent): string[] {
 }
 
 /**
- * The paid tier for a subscription event: the first item whose price id is in
- * PRICE_TO_PLAN wins; the raw matching price id comes back too (for reconciliation).
+ * The paid tier for a subscription event: the first item whose price id is in the
+ * configured tier-price map wins; the raw matching price id comes back too
+ * (for reconciliation).
  * Returns null when no item maps to a known tier.
  */
-export function planFromEvent(event: PaddleEvent): { plan: PaidPlan; priceId: string } | null {
+export function planFromEvent(
+  event: PaddleEvent,
+  env?: PaddlePriceConfigEnv,
+): { plan: PaidPlan; priceId: string } | null {
   for (const priceId of priceIdsFromEvent(event)) {
-    const plan = PRICE_TO_PLAN[priceId];
+    const plan = planForPrice(priceId, env);
     if (plan) return { plan, priceId };
   }
   return null;

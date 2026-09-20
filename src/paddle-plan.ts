@@ -1,6 +1,6 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
-import { PRICE_TO_PLAN, type Env, type PaidPlan } from "./config";
+import { planForPrice, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import { storedPaddleSubscriptionId } from "./paddle-account";
 import { changePaddleSubscription } from "./paddle-api";
@@ -34,7 +34,7 @@ export async function handlePaddleChangePlan(
 ): Promise<Response> {
   const priceId = await parseChangePlanRequest(request);
 
-  const targetPlan = PRICE_TO_PLAN[priceId];
+  const targetPlan = planForPrice(priceId, env);
   if (!targetPlan) {
     throw new ApiError(400, "invalid_request", "Unsupported Paddle price id.");
   }
@@ -54,7 +54,7 @@ export async function handlePaddleChangePlan(
     );
   }
 
-  // Same price = same plan (PRICE_TO_PLAN is a bijection). No-op: reject rather
+  // Same price = same plan (the configured tier-price map is a bijection). No-op: reject rather
   // than round-trip Paddle. Reported as 400 invalid_request to match the shared
   // app contract (item 90).
   const currentPriceId = storedSubscriptionPriceId(account.subscription);

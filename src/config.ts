@@ -68,6 +68,9 @@ export interface Env {
   PADDLE_WEBHOOK_MAX_BODY_BYTES?: string | number; // max signed webhook payload bytes; default DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES
   PADDLE_CHECKOUT_BINDING_SECRET?: string; // stable HMAC secret for server-minted checkout binding; defaults to PADDLE_WEBHOOK_SECRET
   PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // previous checkout-binding secret accepted during rotations
+  PADDLE_STARTER_PRICE_ID?: string; // live/sandbox subscription price id for starter
+  PADDLE_PRO_PRICE_ID?: string; // live/sandbox subscription price id for pro
+  PADDLE_UNLIMITED_PRICE_ID?: string; // live/sandbox subscription price id for unlimited
 
   // 56c — per-tier monthly draft limits (the marketed caps; owner decision
   // 2026-09-16). Tunable per-deploy without shipping a new binary, and written
@@ -183,15 +186,65 @@ export const DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES = 128 * 1024;
 // The three paid launch tiers. "team" is reserved (no price mapped yet).
 export type PaidPlan = "starter" | "pro" | "unlimited";
 
-// Paddle price id -> paid tier. SANDBOX price ids (owner swaps for live ids when
-// flipping PADDLE_API_BASE to the live base). The *plan* is stable; the tier's
-// monthly draft limit is resolved from a var at runtime (see PLAN_DRAFT_LIMIT_VAR
-// / resolvePlanDraftLimit in src/paddle.ts) so it stays tunable without a release.
+// Paddle price id -> paid tier. These are the SANDBOX defaults used for local
+// development and tests. Live deployments must provide the three
+// PADDLE_*_PRICE_ID vars; live mode does not fall back to these sandbox ids.
+// The *plan* is stable; the tier's monthly draft limit is resolved from a var
+// at runtime (see PLAN_DRAFT_LIMIT_VAR / resolvePlanDraftLimit in
+// src/paddle.ts) so it stays tunable without a release.
 export const PRICE_TO_PLAN: Record<string, PaidPlan> = {
   pri_01m1syd7nfarp8pggpcnvjbgyy: "starter",
   pri_01m1symsxarc4c3jdea0ntb09w: "pro",
   pri_01m1syrdg05f49kz705gbzn6tz: "unlimited",
 };
+
+export type PaddlePriceConfigEnv = Pick<
+  Env,
+  | "PADDLE_API_BASE"
+  | "PADDLE_STARTER_PRICE_ID"
+  | "PADDLE_PRO_PRICE_ID"
+  | "PADDLE_UNLIMITED_PRICE_ID"
+>;
+
+export function priceToPlanForEnv(env?: PaddlePriceConfigEnv): Record<string, PaidPlan> {
+  const configured = configuredPriceToPlan(env);
+  if (Object.keys(configured).length > 0) return configured;
+  return usesSandboxPaddleBase(env) ? PRICE_TO_PLAN : {};
+}
+
+export function planForPrice(priceId: string, env?: PaddlePriceConfigEnv): PaidPlan | undefined {
+  return priceToPlanForEnv(env)[priceId];
+}
+
+export function hasPaddleTierPriceConfig(env?: PaddlePriceConfigEnv): boolean {
+  const plans = new Set(Object.values(priceToPlanForEnv(env)));
+  return plans.has("starter") && plans.has("pro") && plans.has("unlimited");
+}
+
+function configuredPriceToPlan(env?: PaddlePriceConfigEnv): Record<string, PaidPlan> {
+  const starter = normalizedPriceId(env?.PADDLE_STARTER_PRICE_ID);
+  const pro = normalizedPriceId(env?.PADDLE_PRO_PRICE_ID);
+  const unlimited = normalizedPriceId(env?.PADDLE_UNLIMITED_PRICE_ID);
+  if (!starter || !pro || !unlimited) return {};
+  if (new Set([starter, pro, unlimited]).size !== 3) return {};
+  return {
+    [starter]: "starter",
+    [pro]: "pro",
+    [unlimited]: "unlimited",
+  };
+}
+
+function usesSandboxPaddleBase(env?: PaddlePriceConfigEnv): boolean {
+  const base =
+    typeof env?.PADDLE_API_BASE === "string" ? env.PADDLE_API_BASE.trim().replace(/\/+$/, "") : "";
+  return base === "" || base === PADDLE_SANDBOX_API_BASE;
+}
+
+function normalizedPriceId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
 
 // Per-tier MONTHLY draft-limit defaults (owner decision 2026-09-16): the caps
 // the marketing site sells — "30 follow-ups a month" (starter), "120 a month"

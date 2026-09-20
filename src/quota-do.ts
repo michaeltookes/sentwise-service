@@ -42,7 +42,7 @@
 
 import {
   ACCOUNT_DELETION_BARRIER_TIMEOUT_MS,
-  PRICE_TO_PLAN,
+  planForPrice,
   type Env,
   type PaidPlan,
 } from "./config";
@@ -556,7 +556,7 @@ export class AccountQuota {
 
   private async handlePaddlePlanChange(body: unknown): Promise<Response> {
     try {
-      const parsed = parsePaddlePlanChangeEntitlementBody(body);
+      const parsed = parsePaddlePlanChangeEntitlementBody(body, this.env);
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(() =>
         recordPaddlePlanChangeInClerk(userId, parsed, this.env),
@@ -669,7 +669,7 @@ export class AccountQuota {
         expiresAt: now + RESERVATION_TTL_MS,
         priceId,
         quantity,
-        ...subscriptionCheckoutPlanForPrice(storageKey, priceId),
+        ...subscriptionCheckoutPlanForPrice(storageKey, priceId, this.env),
         ...(options.requireCustomerId ? { extraDrafts } : {}),
         ...(customerId ? { customerId } : {}),
       });
@@ -1431,10 +1431,11 @@ function checkoutReservationIdFromEvent(event: {
 function subscriptionCheckoutPlanForPrice(
   storageKey: PaddleCheckoutReservationStorageKey,
   priceId: string,
+  env: Env,
 ): { plan?: PaidPlan } {
   const plan =
     storageKey === PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY
-      ? PRICE_TO_PLAN[priceId]
+      ? planForPrice(priceId, env)
       : undefined;
   return plan ? { plan } : {};
 }

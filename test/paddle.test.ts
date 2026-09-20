@@ -32,6 +32,7 @@ import {
   DEFAULT_PRO_DRAFT_LIMIT,
   DEFAULT_STARTER_DRAFT_LIMIT,
   DEFAULT_UNLIMITED_DRAFT_LIMIT,
+  PADDLE_LIVE_API_BASE,
 } from "../src/config";
 
 const SECRET = "pdl_ntfset_testsecret";
@@ -277,6 +278,25 @@ describe("planFromEvent (price -> tier map)", () => {
       subscriptionEventBody({ items: [{ price: { id: "pri_unknown" }, quantity: 1 }] }),
     )!;
     expect(planFromEvent(event)).toBeNull();
+  });
+
+  it("requires configured tier prices when the Paddle API base is live", () => {
+    const sandboxEvent = parsePaddleEvent(
+      subscriptionEventBody({ items: [{ price: { id: PRO_PRICE }, quantity: 1 }] }),
+    )!;
+    expect(planFromEvent(sandboxEvent, { PADDLE_API_BASE: PADDLE_LIVE_API_BASE })).toBeNull();
+
+    const liveEvent = parsePaddleEvent(
+      subscriptionEventBody({ items: [{ price: { id: "pri_live_pro" }, quantity: 1 }] }),
+    )!;
+    expect(
+      planFromEvent(liveEvent, {
+        PADDLE_API_BASE: PADDLE_LIVE_API_BASE,
+        PADDLE_STARTER_PRICE_ID: "pri_live_starter",
+        PADDLE_PRO_PRICE_ID: "pri_live_pro",
+        PADDLE_UNLIMITED_PRICE_ID: "pri_live_unlimited",
+      }),
+    ).toEqual({ plan: "pro", priceId: "pri_live_pro" });
   });
 
   it("picks the first item that maps to a known tier", () => {

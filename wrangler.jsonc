@@ -37,8 +37,14 @@
     "CF_ACCOUNT_ID": "313171820c15d1a8f14bed4dbcb699af",
 
     // --- 56c checkout + licensing (Paddle) ---
-    // SANDBOX base until the owner flips to https://api.paddle.com with live creds.
+    // SANDBOX base until the owner sets live PADDLE_API_KEY /
+    // PADDLE_WEBHOOK_SECRET secrets and replaces the public tier price vars
+    // below with live Paddle price ids. Live mode requires those tier vars as
+    // an all-or-nothing set so checkout/webhook mapping can use real live ids.
     "PADDLE_API_BASE": "https://sandbox-api.paddle.com",
+    // "PADDLE_STARTER_PRICE_ID": "pri_...",
+    // "PADDLE_PRO_PRICE_ID": "pri_...",
+    // "PADDLE_UNLIMITED_PRICE_ID": "pri_...",
     "PADDLE_WEBHOOK_TOLERANCE_SEC": "300", // signature freshness window (seconds)
     // Per-tier MONTHLY draft limits (owner decision 2026-09-16): the caps the
     // marketing site sells — "30 follow-ups a month" / "120 a month" — enforced over

@@ -1,6 +1,6 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
-import { PRICE_TO_PLAN, type Env, type PaidPlan } from "./config";
+import { planForPrice, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import { resolvePlanDraftLimit } from "./paddle";
 import { storedPaddleSubscriptionId } from "./paddle-account";
@@ -18,6 +18,7 @@ export type PaddlePlanChangeEntitlementResult =
 
 export function parsePaddlePlanChangeEntitlementBody(
   body: unknown,
+  env: Env,
 ): PaddlePlanChangeEntitlementBody {
   const record = asRecord(body);
   const subscriptionId = record?.subscriptionId;
@@ -34,7 +35,7 @@ export function parsePaddlePlanChangeEntitlementBody(
     !isPaidPlan(plan) ||
     typeof priceId !== "string" ||
     priceId === "" ||
-    PRICE_TO_PLAN[priceId] !== plan
+    planForPrice(priceId, env) !== plan
   ) {
     throw new ApiError(400, "invalid_request", "Invalid plan-change entitlement.");
   }
