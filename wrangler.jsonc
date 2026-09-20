@@ -37,13 +37,11 @@
     "CF_ACCOUNT_ID": "313171820c15d1a8f14bed4dbcb699af",
 
     // --- 56c checkout + licensing (Paddle) ---
-    // LIVE Paddle API (item 74 cutover, 2026-09-20); sandbox was
-    // https://sandbox-api.paddle.com — flip back only for sandbox testing with
-    // matching sandbox PADDLE_API_KEY / PADDLE_WEBHOOK_SECRET secrets.
-    // Live mode also requires the public tier price vars below to be set to the
-    // live Paddle price ids; when absent/incomplete, tier checkout and webhook
-    // mapping fail closed instead of accepting sandbox ids against the live API.
-    "PADDLE_API_BASE": "https://api.paddle.com",
+    // SANDBOX base until the owner sets live PADDLE_API_KEY /
+    // PADDLE_WEBHOOK_SECRET secrets and replaces the public tier price vars
+    // below with live Paddle price ids. Live mode requires those tier vars as
+    // an all-or-nothing set so checkout/webhook mapping can use real live ids.
+    "PADDLE_API_BASE": "https://sandbox-api.paddle.com",
     // "PADDLE_STARTER_PRICE_ID": "pri_...",
     // "PADDLE_PRO_PRICE_ID": "pri_...",
     // "PADDLE_UNLIMITED_PRICE_ID": "pri_...",
