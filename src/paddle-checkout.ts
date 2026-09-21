@@ -333,11 +333,9 @@ async function recoverOrReleasePendingCheckout(
 // so no window opens where two racing requests both mint.
 //
 // Fail-safe: only release once the cancel has actually taken effect. If Paddle
-// cannot confirm the cancel (a transient 408/429/5xx surfaced as
-// transaction_cancel_failed), keep the reservation and raise the original
-// conflict so we never leave two concurrently recoverable transactions for one
-// user. A cancel that reports the transaction already terminal (4xx / 404) is
-// treated as released and we proceed.
+// cannot confirm the transaction is canceled, keep the reservation and raise the
+// original conflict so we never leave two concurrently recoverable transactions
+// for one user.
 async function supersedePendingCheckout(
   env: Env,
   userId: string,

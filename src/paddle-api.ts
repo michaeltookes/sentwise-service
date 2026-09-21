@@ -145,20 +145,16 @@ export async function cancelPaddleTransaction(env: Env, transactionId: string): 
         body: JSON.stringify({ status: "canceled" }),
       },
     );
-    if (res.ok) return;
-    // A 404, or a client error rejecting the status change, means the
-    // transaction is already gone or in a terminal state (billed/completed/
-    // canceled) that can no longer be canceled. Treat that as "already
-    // released" so callers can safely proceed. 408/429 and 5xx are transient —
-    // the transaction may still be live — so surface them as a failure.
-    if (res.status === 408 || res.status === 429) {
+    if (res.ok && (await paddleTransactionResponseStatus(res)) === "canceled") return;
+    if (res.status >= 500 || res.status === 408 || res.status === 429) {
       throw new ApiError(502, "transaction_cancel_failed", "Could not cancel the checkout.");
     }
-    if (res.status >= 400 && res.status < 500) return;
-    throw new ApiError(502, "transaction_cancel_failed", "Could not cancel the checkout.");
+    const snapshot = await fetchPaddleTransactionSnapshot(env, transactionId);
+    if (snapshot?.status === "canceled") return;
+    throw transactionCancelFailedError();
   } catch (err) {
-    if (err instanceof ApiError) throw err;
-    throw new ApiError(502, "transaction_cancel_failed", "Could not cancel the checkout.");
+    if (err instanceof ApiError && err.type === "transaction_cancel_failed") throw err;
+    throw transactionCancelFailedError();
   }
 }
 
@@ -458,6 +454,20 @@ function paddleApiBase(env: Env): string {
 function requirePaddleApiKey(type: string, message: string, env: Env): string {
   if (env.PADDLE_API_KEY) return env.PADDLE_API_KEY;
   throw new ApiError(502, type, message);
+}
+
+function transactionCancelFailedError(): ApiError {
+  return new ApiError(502, "transaction_cancel_failed", "Could not cancel the checkout.");
+}
+
+async function paddleTransactionResponseStatus(res: Response): Promise<string | null> {
+  try {
+    const body: unknown = await res.clone().json();
+    const status = asRecord(asRecord(body)?.data)?.status;
+    return typeof status === "string" && status !== "" ? status : null;
+  } catch {
+    return null;
+  }
 }
 
 function checkoutTransactionLookupUrl(

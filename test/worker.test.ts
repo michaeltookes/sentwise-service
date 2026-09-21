@@ -1447,10 +1447,11 @@ describe("POST /v1/paddle/checkout", () => {
     expect(supersedingBody.items).toEqual([{ price_id: STARTER_PRICE, quantity: 1 }]);
   });
 
-  it("supersedes when the Paddle cancel reports the old transaction already terminal (107)", async () => {
+  it("supersedes when a follow-up read proves a rejected Paddle cancel is canceled (107)", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
     const createIds = ["txn_pro", "txn_starter"];
+    let cancelRejected = false;
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = requestUrl(input);
       if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
@@ -1468,8 +1469,9 @@ describe("POST /v1/paddle/checkout", () => {
         url === "https://sandbox-api.paddle.com/transactions/txn_pro" &&
         init?.method === "PATCH"
       ) {
-        // Paddle rejects the status change because the transaction is no longer
-        // a cancelable draft (already billed/completed/canceled).
+        // Paddle rejected the status change, so the helper must read back the
+        // transaction and prove it is canceled before the reservation is released.
+        cancelRejected = true;
         return Promise.resolve(
           new Response(
             JSON.stringify({
@@ -1480,6 +1482,13 @@ describe("POST /v1/paddle/checkout", () => {
         );
       }
       if (url === "https://sandbox-api.paddle.com/transactions/txn_pro") {
+        if (cancelRejected) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: { id: "txn_pro", status: "canceled" } }), {
+              status: 200,
+            }),
+          );
+        }
         return Promise.resolve(
           new Response(
             JSON.stringify({
@@ -1517,7 +1526,7 @@ describe("POST /v1/paddle/checkout", () => {
       paddleEnv,
     );
 
-    // A terminal cancel response is treated as released — the new tier still mints.
+    // The cancel rejection is treated as released only because the readback is canceled.
     expect(second.status).toBe(200);
     expect(await second.json()).toEqual({
       transactionId: "txn_starter",
@@ -1529,6 +1538,86 @@ describe("POST /v1/paddle/checkout", () => {
         init?.method === "POST",
     );
     expect(transactionCreates).toHaveLength(2);
+  });
+
+  it("preserves the conflict when Paddle rejects cancel and readback is completed (107)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const createIds = ["txn_pro", "txn_unexpected"];
+    let cancelRejected = false;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        const id = createIds.shift() ?? "txn_extra";
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { id, checkout: { url: `https://checkout.paddle.com/pay?_ptxn=${id}` } },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      if (
+        url === "https://sandbox-api.paddle.com/transactions/txn_pro" &&
+        init?.method === "PATCH"
+      ) {
+        cancelRejected = true;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error: { type: "request_error", code: "transaction_status_change_not_allowed" },
+            }),
+            { status: 400 },
+          ),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_pro") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_pro",
+                status: cancelRejected ? "completed" : "draft",
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_pro" },
+                items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    expect(first.status).toBe(200);
+
+    const second = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: STARTER_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(second.status).toBe(409);
+    expect(((await second.json()) as any).error.type).toBe("billing_checkout_conflict");
+    const transactionCreates = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
+        init?.method === "POST",
+    );
+    expect(transactionCreates).toHaveLength(1);
   });
 
   it("preserves the conflict when the Paddle cancel fails transiently (107)", async () => {
@@ -1833,7 +1922,11 @@ describe("POST /v1/paddle/checkout", () => {
         url === "https://sandbox-api.paddle.com/transactions/txn_123" &&
         init?.method === "PATCH"
       ) {
-        return Promise.resolve(new Response("{}", { status: 200 }));
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { id: "txn_123", status: "canceled" } }), {
+            status: 200,
+          }),
+        );
       }
       const id = transactionIds.shift() ?? "txn_extra";
       return Promise.resolve(
