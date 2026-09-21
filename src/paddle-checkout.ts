@@ -307,7 +307,13 @@ async function recoverOrReleasePendingCheckout(
   const checkoutUrl = snapshot.checkoutUrl ?? reservation.checkoutUrl ?? null;
   if (isRecoverableCheckoutTransaction(snapshot.status, checkoutUrl)) {
     if (!checkoutMatchesRequest(reservation, snapshot, request)) {
-      throw checkoutConflictError();
+      return await supersedePendingCheckout(
+        env,
+        userId,
+        request,
+        reservationId,
+        reservation.transactionId,
+      );
     }
     return {
       reservationId,
@@ -316,6 +322,37 @@ async function recoverOrReleasePendingCheckout(
     };
   }
   throw pendingCheckoutError();
+}
+
+// A recoverable checkout exists for a *different* price than the current
+// request (item 107): the user opened one tier, dismissed the overlay, and is
+// now opening another. Supersede the old checkout rather than blocking — cancel
+// its Paddle transaction and release the reservation so the caller re-reserves
+// and mints the new tier. Returning null drives reserveCheckout's retry loop to
+// claim a fresh reservation, which the account-quota Durable Object serializes,
+// so no window opens where two racing requests both mint.
+//
+// Fail-safe: only release once the cancel has actually taken effect. If Paddle
+// cannot confirm the transaction is canceled, keep the reservation and raise the
+// original conflict so we never leave two concurrently recoverable transactions
+// for one user.
+async function supersedePendingCheckout(
+  env: Env,
+  userId: string,
+  request: CheckoutRequestBody,
+  reservationId: string,
+  transactionId: string,
+): Promise<null> {
+  try {
+    await cancelPaddleTransaction(env, transactionId);
+  } catch (err) {
+    if (err instanceof ApiError && err.type === "transaction_cancel_failed") {
+      throw checkoutConflictError();
+    }
+    throw err;
+  }
+  await releaseCheckoutReservation(env, userId, request.kind, reservationId);
+  return null;
 }
 
 async function recoverOrReleaseUnrecordedCheckout(
@@ -337,7 +374,13 @@ async function recoverOrReleaseUnrecordedCheckout(
     throw pendingCheckoutError();
   }
   if (!checkoutMatchesRequest(reservation, snapshot, request)) {
-    throw checkoutConflictError();
+    return await supersedePendingCheckout(
+      env,
+      userId,
+      request,
+      reservation.reservationId,
+      snapshot.transactionId,
+    );
   }
 
   const recordResult = await recordCheckoutReservation(

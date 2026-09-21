@@ -438,7 +438,9 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
       if (url === "https://sandbox-api.paddle.com/transactions/txn_overage_open") {
         expect(init?.method).toBe("PATCH");
         expect(init?.body).toBe(JSON.stringify({ status: "canceled" }));
-        return Promise.resolve(new Response(JSON.stringify({ data: { id: "txn_overage_open" } })));
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { id: "txn_overage_open", status: "canceled" } })),
+        );
       }
       return Promise.resolve(new Response("{}", { status: 404 }));
     });
