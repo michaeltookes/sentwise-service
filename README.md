@@ -412,9 +412,15 @@ rejected while the account already has an active/trialing/past-due Paddle subscr
 changes must go through [`POST /v1/paddle/change-plan`](#post-v1paddlechange-plan) (an in-place
 Paddle subscription update) instead of creating a second recurring subscription. Subscription
 checkout creation is also serialized per account with a short-lived
-Durable Object reservation id included in Paddle `custom_data`; a second request is rejected while a
-checkout transaction is pending, a retry resumes only a matching requested price/quantity, and only
-the matching applied subscription webhook clears the lock.
+Durable Object reservation id included in Paddle `custom_data`; a concurrent request that races the
+in-flight mint is rejected while a checkout transaction is pending, and a retry for the _same_
+price/quantity resumes the existing recoverable transaction rather than minting a second one. A
+request for a _different_ price/quantity **supersedes** the recoverable checkout (item 107): the
+Worker cancels the old draft transaction, releases the reservation, and mints the new one — so
+comparing tiers (open one, close the overlay, open another) never dead-ends. If Paddle cannot
+confirm the cancel (a transient failure), the original conflict is surfaced and the reservation is
+left intact, so an account never has two concurrently recoverable transactions. The matching applied
+subscription webhook clears the lock.
 Overage checkout requires an active Paddle subscription with a stored
 `paddleCustomerId`; the Worker passes that `customer_id` to Paddle so the later webhook credits the
 same bound customer.
