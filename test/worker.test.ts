@@ -1346,34 +1346,147 @@ describe("POST /v1/paddle/checkout", () => {
         init?.method === "POST",
     );
     expect(transactionCreates).toHaveLength(1);
+    // Same-price reopen recovers the existing transaction — it must not cancel it.
+    const cancelCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
+    expect(cancelCalls).toHaveLength(0);
   });
 
-  it("rejects a recovered subscription checkout for a different tier", async () => {
+  it("supersedes a recovered subscription checkout for a different tier (107)", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const createIds = ["txn_pro", "txn_starter"];
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = requestUrl(input);
       if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        const id = createIds.shift() ?? "txn_extra";
         return Promise.resolve(
           new Response(
             JSON.stringify({
-              data: {
-                id: "txn_123",
-                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_123" },
-              },
+              data: { id, checkout: { url: `https://checkout.paddle.com/pay?_ptxn=${id}` } },
             }),
             { status: 201 },
           ),
         );
       }
-      if (url === "https://sandbox-api.paddle.com/transactions/txn_123") {
+      if (
+        url === "https://sandbox-api.paddle.com/transactions/txn_pro" &&
+        init?.method === "PATCH"
+      ) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { id: "txn_pro", status: "canceled" } }), {
+            status: 200,
+          }),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_pro") {
         return Promise.resolve(
           new Response(
             JSON.stringify({
               data: {
-                id: "txn_123",
+                id: "txn_pro",
                 status: "draft",
-                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_123" },
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_pro" },
+                items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({
+      transactionId: "txn_pro",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_pro",
+    });
+
+    const second = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: STARTER_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    // The different-tier request supersedes rather than conflicting.
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({
+      transactionId: "txn_starter",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_starter",
+    });
+
+    // Old transaction canceled via the Paddle API.
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/transactions/txn_pro",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ status: "canceled" }) }),
+    );
+
+    // Exactly two mints: the original Pro and the superseding Starter.
+    const transactionCreates = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
+        init?.method === "POST",
+    );
+    expect(transactionCreates).toHaveLength(2);
+    const supersedingBody = JSON.parse(transactionCreates[1][1]?.body as string) as Record<
+      string,
+      any
+    >;
+    expect(supersedingBody.items).toEqual([{ price_id: STARTER_PRICE, quantity: 1 }]);
+  });
+
+  it("supersedes when the Paddle cancel reports the old transaction already terminal (107)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const createIds = ["txn_pro", "txn_starter"];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        const id = createIds.shift() ?? "txn_extra";
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { id, checkout: { url: `https://checkout.paddle.com/pay?_ptxn=${id}` } },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      if (
+        url === "https://sandbox-api.paddle.com/transactions/txn_pro" &&
+        init?.method === "PATCH"
+      ) {
+        // Paddle rejects the status change because the transaction is no longer
+        // a cancelable draft (already billed/completed/canceled).
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error: { type: "request_error", code: "transaction_status_change_not_allowed" },
+            }),
+            { status: 400 },
+          ),
+        );
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_pro") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_pro",
+                status: "draft",
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_pro" },
                 items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
               },
             }),
@@ -1404,9 +1517,107 @@ describe("POST /v1/paddle/checkout", () => {
       paddleEnv,
     );
 
+    // A terminal cancel response is treated as released — the new tier still mints.
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({
+      transactionId: "txn_starter",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_starter",
+    });
+    const transactionCreates = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
+        init?.method === "POST",
+    );
+    expect(transactionCreates).toHaveLength(2);
+  });
+
+  it("preserves the conflict when the Paddle cancel fails transiently (107)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    mocks.getUser.mockResolvedValue(userWith({ subscription: null }));
+    const createIds = ["txn_pro", "txn_unexpected"];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url === "https://sandbox-api.paddle.com/transactions" && init?.method === "POST") {
+        const id = createIds.shift() ?? "txn_extra";
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { id, checkout: { url: `https://checkout.paddle.com/pay?_ptxn=${id}` } },
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      if (
+        url === "https://sandbox-api.paddle.com/transactions/txn_pro" &&
+        init?.method === "PATCH"
+      ) {
+        // Transient Paddle outage — the cancel cannot be confirmed.
+        return Promise.resolve(new Response("upstream error", { status: 500 }));
+      }
+      if (url === "https://sandbox-api.paddle.com/transactions/txn_pro") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "txn_pro",
+                status: "draft",
+                checkout: { url: "https://checkout.paddle.com/pay?_ptxn=txn_pro" },
+                items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    expect(first.status).toBe(200);
+
+    const second = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: STARTER_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    // A transient cancel failure must not open a second live checkout.
     expect(second.status).toBe(409);
     expect(((await second.json()) as any).error.type).toBe("billing_checkout_conflict");
-    const transactionCreates = fetchMock.mock.calls.filter(
+    let transactionCreates = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
+        init?.method === "POST",
+    );
+    expect(transactionCreates).toHaveLength(1);
+
+    // The reservation is untouched: reopening the original tier still recovers it.
+    const third = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    expect(third.status).toBe(200);
+    expect(await third.json()).toEqual({
+      transactionId: "txn_pro",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_pro",
+    });
+    transactionCreates = fetchMock.mock.calls.filter(
       ([input, init]) =>
         requestUrl(input) === "https://sandbox-api.paddle.com/transactions" &&
         init?.method === "POST",
