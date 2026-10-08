@@ -70,9 +70,11 @@ access past the 14-day trial.
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin, /admin/comp
   -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
+  -> src/comp.ts            layer an admin-granted comp entitlement over the natural state (111) — pure
+  -> src/admin-comp.ts      ADMIN_TOKEN-guarded comp grant/revoke/inspect — ids, plans, timestamps only
   -> src/anthropic.ts       forward to Anthropic, map the response — no logging, no storage
   -> src/quota-do.ts        per-account usage counters + serialized metadata writes (Durable Object)
   -> src/analytics.ts       one aggregate hashed metric per draft — no content
@@ -153,6 +155,16 @@ poisoning an otherwise-valid record. Any legacy stored `manageBillingUrl` is ign
 record carries extra reconciliation/idempotency fields (`paddleSubscriptionId`, `paddleCustomerId`,
 `priceId`, `updatedAt`, `lastEventId`) that this endpoint reads past — only the public wire fields
 above are returned.
+
+**Comp entitlement (item 111).** An admin-granted comp (see
+[`/admin/comp`](#admincomp--comp-entitlements-maintainer-only-item-111)) is layered over the states
+above at read time: while the account has **no** active real paid subscription and an unexpired
+`privateMetadata.comp`, the field reports the granted tier as
+`{ "plan": "<tier>", "status": "active", "renewsAt": "<comp expiry>", "manageBillingUrl": null }` —
+**deliberately indistinguishable from a paid plan**, so the app needs no changes and no comp marker
+appears on the wire (`renewsAt` carries the comp expiry). A real paid subscription
+(`active`/`trialing`/`past_due`) always wins and makes the comp inert; an expired comp simply stops
+applying on the next read (lazy expiry — no cron).
 
 ### `GET /v1/paddle/manage-billing`
 
@@ -393,6 +405,72 @@ degrades to **503 `analytics_unavailable`**. Reads aggregate hashed metrics only
 The per-model cost table lives in `src/config.ts` (`MODEL_COSTS`, Sonnet 4.6 as the default row);
 edit it there when pricing changes or a new model is added.
 
+### `/admin/comp` — comp entitlements (maintainer only, item 111)
+
+Grants internal/QA accounts a **complimentary paid-equivalent plan** server-side, so sanctioned
+accounts (e.g. the QA agent) keep working past the 14-day trial and paid-tier behavior is testable
+without ever touching a checkout — the billing guardrail stays intact. Guarded by the **same
+`ADMIN_TOKEN` bearer gate as `/admin/margin`**: when `ADMIN_TOKEN` is unset the route returns
+**404** (invisible); a missing/empty/wrong bearer returns **401** (constant-time compare).
+
+**Storage & layering (grant never clobbers real billing state).** The grant writes only
+`privateMetadata.comp` (`{ plan, grantedAt, expiresAt }`) — the Paddle `subscription` record and the
+webhook-managed `quota` key are never touched. At read time (`src/comp.ts`, pure):
+
+- A **real paid subscription wins** — while the stored subscription is `active`/`trialing`/
+  `past_due` on a paid plan, the comp is inert (the edge case of a comped account that also buys a
+  real subscription resolves in favor of the real subscription).
+- Otherwise an unexpired comp reports as an **active paid plan of the granted tier** on `/v1/me`
+  (indistinguishable from paid; `renewsAt` = comp expiry), drafting is allowed past the trial, and
+  **metering/caps follow the granted tier** (`STARTER/PRO/UNLIMITED_DRAFT_LIMIT`) with that tier's
+  normal soft/hard enforcement mode.
+- **Expiry is lazy**: once `expiresAt` passes, the next read reverts the account to its natural
+  trial/Paddle state automatically — no cron, no cleanup write needed. Revoke does the same
+  immediately by deleting the key.
+- Comped accounts **bypass Paddle entirely**: `/v1/me` shows an active plan so the app never prompts
+  checkout, and `GET /v1/paddle/manage-billing` for a comp with no real Paddle subscription fails
+  cleanly with **404 `billing_subscription_not_found`** (never a 500). `DELETE /v1/me` is not
+  blocked by a comp-derived subscription (there is no Paddle subscription to cancel first).
+
+**Plans:** `starter` | `pro` | `unlimited` only — `team` is reserved and can never be comped.
+**Addressing:** `userId` (Clerk user id) or `email` (resolved via Clerk; 404 when no account
+matches, 409 when more than one does — use `userId` then). **Expiry:** `days` (integer, default
+**90**, max 3650) or an explicit future ISO `expiresAt` — not both.
+
+```bash
+# Grant (90-day default expiry):
+curl -s -X POST https://sentwise-inference.sentwise-service.workers.dev/admin/comp \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"email": "luciusfox@prowlqa.dev", "plan": "pro"}'
+
+# Grant with an explicit lifetime:
+curl -s -X POST https://sentwise-inference.sentwise-service.workers.dev/admin/comp \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"email": "luciusfox@prowlqa.dev", "plan": "unlimited", "days": 30}'
+
+# Inspect:
+curl -s "https://sentwise-inference.sentwise-service.workers.dev/admin/comp?email=luciusfox@prowlqa.dev" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Revoke (back to the account's natural trial/Paddle state):
+curl -s -X DELETE https://sentwise-inference.sentwise-service.workers.dev/admin/comp \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"email": "luciusfox@prowlqa.dev"}'
+```
+
+A grant responds `{ granted, userId, email, plan, grantedAt, expiresAt }`; a revoke responds
+`{ revoked, userId, email, previous }`; inspect responds `{ userId, email, comp, active }`.
+
+**Audit.** Each grant/revoke emits one structured Analytics Engine datapoint — hashed account id
+(who), `admin_comp_grant`/`admin_comp_revoke` (what), tier, and expiry — consistent with the
+no-console-logging policy (`scripts/check-no-body-logging.sh`; production retains no invocation
+logs). The `admin_comp_*` outcome never matches the margin dashboard's `blob3 = 'ok'` filter, so
+audit rows never skew margin aggregates. The route's JSON response is the human-readable record of
+the same fields, and `grantedAt`/`expiresAt` live durably in the Clerk metadata itself.
+
 ## Checkout & licensing (56c)
 
 Checkout and licensing run on **Paddle**. The app asks this Worker to create a Paddle transaction for
@@ -617,8 +695,8 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   userId pseudonym from unkeyed SHA-256 to keyed **HMAC-SHA256** (prevents offline re-identification).
   **Unset = unchanged (SHA-256).** ⚠️ Enabling it changes every pseudonym, so hash continuity on the
   margin dashboard is discontinued from that point (accepted).
-- `ADMIN_TOKEN` — **56b, optional.** Bearer token that guards `GET /admin/margin`; when unset the
-  endpoint 404s.
+- `ADMIN_TOKEN` — **56b, optional.** Bearer token that guards `GET /admin/margin` and the
+  `/admin/comp` comp-entitlement route (item 111); when unset both endpoints 404.
 - `CF_ANALYTICS_API_TOKEN` — **56b, optional.** A Cloudflare API token with **Account Analytics
   read** permission, used by `/admin/margin` to query the Analytics Engine SQL API. When unset,
   `/admin/margin` returns `503 analytics_unavailable`.
