@@ -74,6 +74,26 @@ export function parseSubscriptionOverride(raw: unknown): Subscription | null {
 }
 
 /**
+ * Whether a resolved subscription grants drafting access (56c). A paid tier is
+ * good while `active`/`trialing`/`past_due` (past_due is a short billing grace);
+ * `canceled`/`lapsed`, and the pre-purchase `trial`/`none` plans, are not.
+ * (Moved here from src/auth.ts for item 111 so the pure comp layer can use it
+ * without an import cycle; auth.ts re-exports it unchanged.)
+ */
+export function hasPaidAccess(subscription: Subscription): boolean {
+  const paidPlan =
+    subscription.plan === "starter" ||
+    subscription.plan === "pro" ||
+    subscription.plan === "unlimited" ||
+    subscription.plan === "team";
+  const activeStatus =
+    subscription.status === "active" ||
+    subscription.status === "trialing" ||
+    subscription.status === "past_due";
+  return paidPlan && activeStatus;
+}
+
+/**
  * Derive the account's subscription. Uses a valid `privateMetadata.subscription`
  * override when present (56c writes this on checkout); otherwise derives a
  * placeholder from the trial:

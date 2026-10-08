@@ -4,7 +4,13 @@ import { getCachedClerkUser, invalidateClerkUser } from "./clerk-user-cache";
 import { ApiError } from "./errors";
 import { computeTrial, type TrialState } from "./trial";
 import { parseQuotaOverride, type QuotaOverride } from "./metering";
-import { deriveSubscription, type Subscription } from "./subscription";
+import { applyCompEntitlement, parseCompEntitlement } from "./comp";
+import { resolvePlanDraftLimit } from "./paddle";
+import { deriveSubscription, hasPaidAccess, type Subscription } from "./subscription";
+
+// Re-exported unchanged after the item-111 move into subscription.ts (pure home,
+// avoids an auth <-> comp import cycle); callers keep importing it from here.
+export { hasPaidAccess };
 
 export interface AuthedUser {
   userId: string;
@@ -20,6 +26,11 @@ export interface AccountInfo {
   // 56b: per-account limit overrides from privateMetadata.quota, read on the SAME
   // Clerk getUser as the trial (no extra Clerk round-trip). Not exposed on /v1/me.
   quotaOverride: QuotaOverride;
+  // 111: true when `subscription` is comp-derived (an active privateMetadata.comp
+  // with no real paid subscription). Internal — never exposed on /v1/me; used by
+  // DELETE /v1/me so a comp never blocks account deletion behind a nonexistent
+  // Paddle subscription.
+  compApplied: boolean;
 }
 
 export class ClerkDeletionOutcomeUnknownError extends ApiError {
@@ -173,7 +184,7 @@ async function accountInfoFromUser(
   }
 
   const email = primaryEmail(user);
-  const quotaOverride = parseQuotaOverride(meta.quota);
+  let quotaOverride = parseQuotaOverride(meta.quota);
 
   // Report a not-yet-started trial when there's no stamp yet (viewing before the
   // first draft); otherwise compute it. Subscription is derived on the SAME
@@ -181,9 +192,20 @@ async function accountInfoFromUser(
   const trial: TrialState = startedAt
     ? computeTrial(startedAt)
     : { startedAt: "", endsAt: "", active: false };
-  const subscription = deriveSubscription(trial, meta.subscription);
+  const natural = deriveSubscription(trial, meta.subscription);
 
-  return { userId, email, trial, subscription, quotaOverride };
+  // 111: layer an admin-granted comp over the natural state. A real paid
+  // subscription wins (comp inert); otherwise an unexpired comp presents as an
+  // active paid plan of the granted tier and the tier's monthly draft cap
+  // applies, so metering/enforcement behave exactly as that tier normally does.
+  const comp = parseCompEntitlement(meta.comp);
+  const layered = applyCompEntitlement(natural, comp, Date.now());
+  const subscription = layered.subscription;
+  if (layered.compApplied && comp) {
+    quotaOverride = { ...quotaOverride, monthlyDraftLimit: resolvePlanDraftLimit(env, comp.plan) };
+  }
+
+  return { userId, email, trial, subscription, quotaOverride, compApplied: layered.compApplied };
 }
 
 /** Return whether Clerk still has this user; 404 means already deleted. */
@@ -248,24 +270,6 @@ export async function requireActiveTrial(userId: string, env: Env): Promise<Acco
 }
 
 /**
- * Whether a resolved subscription grants drafting access (56c). A paid tier is
- * good while `active`/`trialing`/`past_due` (past_due is a short billing grace);
- * `canceled`/`lapsed`, and the pre-purchase `trial`/`none` plans, are not.
- */
-export function hasPaidAccess(subscription: Subscription): boolean {
-  const paidPlan =
-    subscription.plan === "starter" ||
-    subscription.plan === "pro" ||
-    subscription.plan === "unlimited" ||
-    subscription.plan === "team";
-  const activeStatus =
-    subscription.status === "active" ||
-    subscription.status === "trialing" ||
-    subscription.status === "past_due";
-  return paidPlan && activeStatus;
-}
-
-/**
  * Delete the Clerk user (73, account deletion). Idempotent: a user that is
  * already gone (Clerk 404) resolves successfully so DELETE /v1/me stays 204 on
  * retry. Definitive non-404 Clerk responses become a user-safe 502; rejected
@@ -307,7 +311,7 @@ interface ClerkUserLike {
   emailAddresses?: Array<{ id: string; emailAddress: string }>;
 }
 
-function primaryEmail(user: ClerkUserLike): string | null {
+export function primaryEmail(user: ClerkUserLike): string | null {
   const list = user.emailAddresses ?? [];
   const primary = list.find((e) => e.id === user.primaryEmailAddressId);
   return (primary ?? list[0])?.emailAddress ?? null;
