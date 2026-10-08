@@ -435,7 +435,10 @@ webhook-managed `quota` key are never touched. At read time (`src/comp.ts`, pure
 **Plans:** `starter` | `pro` | `unlimited` only — `team` is reserved and can never be comped.
 **Addressing:** `userId` (Clerk user id) or `email` (resolved via Clerk; 404 when no account
 matches, 409 when more than one does — use `userId` then). **Expiry:** `days` (integer, default
-**90**, max 3650) or an explicit future ISO `expiresAt` — not both.
+**90**, max 3650) or an explicit future ISO `expiresAt` — not both. Timestamps must include
+the date, time with seconds, and `Z` or a `±HH:MM` timezone offset (for example,
+`2027-10-08T12:00:00Z` or `2027-10-08T07:00:00-05:00`); fractional seconds are optional.
+Valid timestamps are stored in UTC. Date-only, timezone-free, and non-ISO inputs are rejected.
 
 ```bash
 # Grant (90-day default expiry):

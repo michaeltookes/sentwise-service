@@ -239,16 +239,61 @@ describe("POST /admin/comp (grant)", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
-  it("honors an explicit future expiresAt", async () => {
+  it.each([
+    "10/08/2027",
+    "Oct 8 2027",
+    "2027-10-08",
+    "2027-10-08 12:00:00Z",
+    "2027-10-08T12:00:00",
+    "2027-10-08T12:00:00.000",
+    "2027-10-08T12:00:00Z trailing",
+    "2027-13-08T12:00:00Z",
+    "2027-10-08T25:00:00Z",
+    "2027-10-08T12:00:00+25:00",
+    "2027-02-29T12:00:00Z",
+    "2027-04-31T12:00:00-05:00",
+    1822996800000,
+  ])("rejects invalid ISO expiresAt %j before accessing Clerk", async (expiresAt) => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-08T12:00:00.000Z"));
+    mocks.getUser.mockResolvedValue(userWith({}));
+    const writeDataPoint = vi.fn();
+    const res = await worker.fetch(
+      adminReq("POST", { userId: "user_123", plan: "pro", expiresAt }),
+      { ...adminEnv, USAGE_ANALYTICS: { writeDataPoint } },
+    );
+    expect(res.status).toBe(400);
+    expect(await errType(res)).toBe("invalid_request");
+    expect(mocks.getUser).not.toHaveBeenCalled();
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    expect(writeDataPoint).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["2027-10-08T12:00:00.123Z", "2027-10-08T12:00:00.123Z"],
+    ["2027-10-08T12:00:00Z", "2027-10-08T12:00:00.000Z"],
+    ["2027-10-08T12:00:00.1Z", "2027-10-08T12:00:00.100Z"],
+    ["2027-10-08T00:00:00+05:30", "2027-10-07T18:30:00.000Z"],
+    ["2027-10-08T23:00:00.123-05:00", "2027-10-09T04:00:00.123Z"],
+    ["2028-02-29T12:00:00Z", "2028-02-29T12:00:00.000Z"],
+  ])("normalizes valid ISO expiresAt %s to UTC", async (expiresAt, normalized) => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-08T12:00:00.000Z"));
     mocks.getUser.mockResolvedValue(userWith({}));
     mocks.updateUserMetadata.mockResolvedValue(undefined);
-    const expiresAt = new Date(Date.now() + 10 * DAY_MS).toISOString();
     const res = await worker.fetch(
       adminReq("POST", { userId: "user_123", plan: "unlimited", expiresAt }),
       adminEnv,
     );
     expect(res.status).toBe(200);
-    expect(((await res.json()) as any).expiresAt).toBe(expiresAt);
+    expect(((await res.json()) as any).expiresAt).toBe(normalized);
+    expect(mocks.updateUserMetadata).toHaveBeenCalledWith("user_123", {
+      privateMetadata: {
+        comp: {
+          plan: "unlimited",
+          grantedAt: "2026-10-08T12:00:00.000Z",
+          expiresAt: normalized,
+        },
+      },
+    });
   });
 
   it("emits a structured audit datapoint (hashed id / tier / action / expiry)", async () => {

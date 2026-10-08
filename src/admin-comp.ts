@@ -225,8 +225,16 @@ function resolveExpiry(body: Record<string, unknown>, now: number): string {
     throw new ApiError(400, "invalid_request", "Provide days or expiresAt, not both.");
   }
   if (hasExpiresAt) {
-    const ms = typeof body.expiresAt === "string" ? Date.parse(body.expiresAt) : NaN;
-    if (Number.isNaN(ms)) {
+    // Require an explicit timezone so the expiry always identifies an instant.
+    const isoTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+    if (typeof body.expiresAt !== "string" || !isoTimestamp.test(body.expiresAt)) {
+      throw new ApiError(400, "invalid_request", "expiresAt must be an ISO 8601 timestamp.");
+    }
+    const ms = Date.parse(body.expiresAt);
+    const date = body.expiresAt.slice(0, 10);
+    // Date.parse can roll impossible calendar dates (e.g. February 30) forward.
+    // Check the input date separately, before the timezone offset is applied.
+    if (Number.isNaN(ms) || new Date(`${date}T00:00:00.000Z`).toISOString().slice(0, 10) !== date) {
       throw new ApiError(400, "invalid_request", "expiresAt must be an ISO 8601 timestamp.");
     }
     if (ms <= now || ms > now + COMP_MAX_DAYS * DAY_MS) {
