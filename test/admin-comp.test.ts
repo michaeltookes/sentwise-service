@@ -84,7 +84,8 @@ function activeComp(plan = "pro") {
 }
 
 async function errType(res: Response): Promise<string> {
-  return ((await res.json()) as { error: { type: string } }).error.type;
+  const body: { error: { type: string } } = await res.json();
+  return body.error.type;
 }
 
 beforeEach(() => {
@@ -256,7 +257,7 @@ describe("POST /admin/comp (grant)", () => {
     mocks.updateUserMetadata.mockResolvedValue(undefined);
     const res = await worker.fetch(adminReq("POST", { userId: "user_123", plan: "pro" }), {
       ...adminEnv,
-      USAGE_ANALYTICS: { writeDataPoint } as unknown as AnalyticsEngineDataset,
+      USAGE_ANALYTICS: { writeDataPoint },
     });
     expect(res.status).toBe(200);
     const expiresAt = ((await res.json()) as any).expiresAt as string;
@@ -279,7 +280,7 @@ describe("DELETE /admin/comp (revoke)", () => {
 
     const res = await worker.fetch(adminReq("DELETE", { userId: "user_123" }), {
       ...adminEnv,
-      USAGE_ANALYTICS: { writeDataPoint } as unknown as AnalyticsEngineDataset,
+      USAGE_ANALYTICS: { writeDataPoint },
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
