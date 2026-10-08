@@ -125,11 +125,13 @@ function shapeWindow(agg: Row | undefined, top: Row[], windowDays: number) {
   };
 }
 
-export async function handleMargin(
-  request: Request,
-  env: Env,
-  fetchImpl: typeof fetch = fetch,
-): Promise<Response> {
+/**
+ * Shared ADMIN_TOKEN bearer gate for /admin/* routes. Returns the error response
+ * to send (404 when ADMIN_TOKEN is unset — the endpoint stays invisible; 401 on
+ * a missing/empty/wrong bearer), or null when the caller is authorized. The
+ * comparison is constant-time over SHA-256 digests.
+ */
+export async function authorizeAdmin(request: Request, env: Env): Promise<Response | null> {
   // 404 when the feature is not configured — the endpoint should be invisible.
   if (!env.ADMIN_TOKEN) return jsonError(404, "not_found", "Not found.");
 
@@ -138,6 +140,16 @@ export async function handleMargin(
   if (!token || !(await constantTimeEqual(token, env.ADMIN_TOKEN))) {
     return jsonError(401, "unauthenticated", "Admin token required.");
   }
+  return null;
+}
+
+export async function handleMargin(
+  request: Request,
+  env: Env,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  const denied = await authorizeAdmin(request, env);
+  if (denied) return denied;
 
   if (!env.CF_ANALYTICS_API_TOKEN || !env.CF_ACCOUNT_ID) {
     return jsonError(503, "analytics_unavailable", "Analytics API is not configured.");

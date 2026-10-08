@@ -34,6 +34,7 @@ import {
 import { recordUsage } from "./analytics";
 import { invalidateClerkUser } from "./clerk-user-cache";
 import { handleMargin } from "./admin";
+import { handleAdminComp } from "./admin-comp";
 import { recordInterest } from "./interest";
 import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
 import { handlePaddleManageBilling } from "./paddle-management";
@@ -60,6 +61,8 @@ export { AccountQuota } from "./quota-do";
  *   GET    /v1/paddle/manage-billing -> JSON fresh Paddle billing-management URL
  *   POST   /v1/paddle/webhook -> Paddle checkout/licensing events -> entitlement writes (56c; signature-auth, no bearer)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
+ *   GET/POST/DELETE /admin/comp -> inspect/grant/revoke a comp entitlement for a
+ *          named account (item 111; ADMIN_TOKEN; 404 when unset)
  *
  * Content-stateless by design: no prompt/draft content is stored or logged. The
  * only state is counters, timestamps, and random reservation IDs — trial in Clerk,
@@ -88,6 +91,15 @@ export default {
 
       if (pathname === "/admin/margin" && request.method === "GET") {
         return await handleMargin(request, env);
+      }
+
+      // 111 — comp entitlement for non-billable internal/QA accounts. Same
+      // ADMIN_TOKEN gate as /admin/margin (invisible 404 when unset).
+      if (
+        pathname === "/admin/comp" &&
+        (request.method === "GET" || request.method === "POST" || request.method === "DELETE")
+      ) {
+        return await handleAdminComp(request, env);
       }
 
       // 56c — Paddle checkout/licensing webhook. Authenticated by the Paddle
@@ -146,7 +158,9 @@ export default {
         // drops any entry a concurrent GET /v1/me cached in this isolate.
         invalidateClerkUser(userId);
         const account = await resolveAccountIfExists(userId, env, { initialize: false });
-        if (account && hasPaidAccess(account.subscription)) {
+        // 111: a comp-derived subscription has no Paddle subscription behind it —
+        // it must never block deletion behind "cancel your Paddle subscription".
+        if (account && !account.compApplied && hasPaidAccess(account.subscription)) {
           throw activeSubscriptionDeletionError();
         }
         if (account && (await hasOpenPaddleCheckout(userId, env))) {
@@ -161,7 +175,11 @@ export default {
         if (account) {
           try {
             const latestAccount = await resolveAccountIfExists(userId, env, { initialize: false });
-            if (latestAccount && hasPaidAccess(latestAccount.subscription)) {
+            if (
+              latestAccount &&
+              !latestAccount.compApplied &&
+              hasPaidAccess(latestAccount.subscription)
+            ) {
               throw activeSubscriptionDeletionError();
             }
           } catch (err) {
@@ -325,7 +343,8 @@ export default {
         pathname === "/v1/paddle/webhook" ||
         pathname === "/healthz" ||
         isCallbackPath(pathname) ||
-        (pathname === "/admin/margin" && !!env.ADMIN_TOKEN)
+        (pathname === "/admin/margin" && !!env.ADMIN_TOKEN) ||
+        (pathname === "/admin/comp" && !!env.ADMIN_TOKEN)
       ) {
         return jsonError(405, "method_not_allowed", "Method not allowed.");
       }
