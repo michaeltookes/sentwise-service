@@ -28,12 +28,12 @@
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20260820.1",
     "@eslint/js": "^10.0.1",
-    "eslint": "^10.9.0",
+    "eslint": "^10.12.0",
     "eslint-config-prettier": "^10.1.8",
-    "prettier": "^3.9.6",
-    "typescript": "^5.6.0",
-    "typescript-eslint": "^8.67.0",
-    "vitest": "^4.1.0",
+    "prettier": "^3.9.9",
+    "typescript": "^7.0.2",
+    "typescript-eslint": "^8.71.1",
+    "vitest": "^5.0.3",
     "wrangler": "^4.0.0"
   },
   "overrides": {
