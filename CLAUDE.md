@@ -3,12 +3,14 @@
 Cloudflare Worker behind Sentwise: runs model calls for signed-in users and handles accounts, metering, and checkout/licensing (Clerk, Paddle). Deployed with Wrangler.
 
 ## Rules
+
 - **Never commit secrets.** Worker secrets live in Wrangler (`wrangler secret`) and `.dev.vars` (gitignored); config files carry variable names only.
 - **Never commit directly to `main`.** Branch first. **Exception:** changes only under `docs/` may go to `main`.
 - **Never open pull requests** unless asked; push the branch and report. Commit and push only when asked.
 - Production deploys are Michael's. Agents may run tests and `wrangler dev`, never `wrangler deploy` to production.
 
 ## Backlog
+
 `docs/backlog.md` (create on the first item; numbered items, newest at the bottom of each priority tier). Items that touch the app and the service together are tracked in `michaeltookes/sentwise` and referenced here by number.
 
 ## Orchestration
