@@ -18,6 +18,6 @@ Cloudflare Worker behind Sentwise: runs model calls for signed-in users and hand
 This repo is one lane of the Genkei Labs factory. Priorities across repos, decisions, and the cross-repo ledger live in the private `genkei-ops` repo at `~/Desktop/Current Projects/genkei-ops` (local only).
 
 - Unit of work: a backlog item ID in `docs/backlog.md` (a number; shared app+service items use the sentwise number). Work orders arrive from the orchestrator session (a peer message), from a builder prompt, or from Michael. QA findings from Lucius arrive as backlog items marked "found by".
-- Before proposing next steps, read `genkei-ops/docs/inbox.md` and `genkei-ops/docs/backlog.md`; never re-propose work that is done or assigned there.
-- When a work order finishes or blocks: append one line to `genkei-ops/docs/inbox.md` (format in that file) and, if a peer session named `genkei-ops…` exists, message it the same line.
-- Never open PRs. Push the branch and report; Michael merges.
+- Before proposing next steps, if the private ledger files are available and readable, read `~/Desktop/Current Projects/genkei-ops/docs/inbox.md` and `~/Desktop/Current Projects/genkei-ops/docs/backlog.md`; never re-propose work that is done or assigned there. Otherwise, continue with this repo's `docs/backlog.md` (if present) and the current work order, and report that cross-repo status could not be checked.
+- When a work order finishes or blocks: if `~/Desktop/Current Projects/genkei-ops/docs/inbox.md` exists and is writable, append one line (format in that file) and, if a peer session named `genkei-ops…` exists, message it the same line. Otherwise, report the status in the task response without blocking work or creating a replacement ledger in this repo.
+- Never open PRs unless asked. Commit and push only when asked, then report; Michael merges.
