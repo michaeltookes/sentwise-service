@@ -4,7 +4,7 @@ Cloudflare Worker behind Sentwise: runs model calls for signed-in users and hand
 
 ## Rules
 
-- **Never commit secrets.** Worker secrets live in Wrangler (`wrangler secret`) and `.dev.vars` (gitignored); config files carry variable names only.
+- **Never commit secrets.** Worker secret values live in Wrangler (`wrangler secret`) and `.dev.vars` (gitignored); config files may reference secret variable names but must not contain their values. Public configuration values and binding settings may be committed.
 - **Never commit directly to `main`.** Branch first. **Exception:** changes only under `docs/` may go to `main`.
 - **Never open pull requests** unless asked; push the branch and report. Commit and push only when asked.
 - Production deploys are Michael's. Agents may run tests and `wrangler dev`, never `wrangler deploy` to production.
