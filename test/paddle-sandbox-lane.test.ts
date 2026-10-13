@@ -46,6 +46,12 @@ import {
 } from "../src/paddle-env";
 import { quotaPeek } from "../src/quota-client";
 import {
+  PADDLE_OVERAGE_CREDITS_STORAGE_KEY,
+  PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+  PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY,
+  PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
+} from "../src/paddle-entitlement";
+import {
   PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
   PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
 } from "../src/quota-do";
@@ -1504,4 +1510,192 @@ describe("plan change takes lane and subscription id from one snapshot (pass-2 r
       expect(fetchMock).not.toHaveBeenCalled();
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Codex pass-3 regression guards
+// ---------------------------------------------------------------------------
+
+describe("lane switches retire the DO overage ledger (pass-3 P2)", () => {
+  // Legacy-mode env matching the Durable Object's own bindings, so the Worker
+  // and the DO agree on secrets and the price map.
+  const legacyEnv: Env = {
+    ...testEnv,
+    CLERK_SECRET_KEY: "sk_test",
+    ANTHROPIC_API_KEY: "sk-ant-test",
+    CLERK_PUBLISHABLE_KEY: "pk_test",
+  };
+
+  async function seedLedger(): Promise<void> {
+    const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName("user_lane"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put(PADDLE_OVERAGE_CREDITS_STORAGE_KEY, [{ transactionId: "txn_old" }]);
+      await state.storage.put(`${PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX}txn_old`, {
+        transactionId: "txn_old",
+        extraDrafts: 10,
+      });
+      await state.storage.put(PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY, [
+        { adjustmentId: "adj_old" },
+      ]);
+      await state.storage.put(`${PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX}adj_old`, {
+        adjustmentId: "adj_old",
+      });
+    });
+  }
+
+  async function ledgerKeys(): Promise<string[]> {
+    const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName("user_lane"));
+    return runInDurableObject(stub, async (_instance, state) => {
+      const keys: string[] = [];
+      for (const key of [
+        PADDLE_OVERAGE_CREDITS_STORAGE_KEY,
+        PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY,
+      ]) {
+        if ((await state.storage.get(key)) !== undefined) keys.push(key);
+      }
+      for (const prefix of [
+        PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
+        PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
+      ]) {
+        keys.push(...(await state.storage.list({ prefix })).keys());
+      }
+      return keys;
+    });
+  }
+
+  async function liveReplacementEvent(): Promise<string> {
+    return JSON.stringify({
+      event_id: "evt_live_replace",
+      event_type: "subscription.created",
+      occurred_at: new Date().toISOString(),
+      data: {
+        id: "sub_live_new",
+        status: "active",
+        customer_id: "ctm_live_new",
+        next_billed_at: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+        custom_data: await buildPaddleCheckoutCustomData("user_lane", legacyEnv),
+        // The DO's legacy price map knows this id.
+        items: [{ price: { id: SANDBOX_PRICES.pro }, quantity: 1 }],
+      },
+    });
+  }
+
+  it("a live subscription replacing a sandbox one clears the old ledger", async () => {
+    await seedLedger();
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(CUSTOMER_EMAIL, { subscription: SANDBOX_SUBSCRIPTION }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(Response.json({ data: { customer_id: "ctm_live_new", status: "active" } })),
+      ),
+    );
+
+    const res = await postWebhook(
+      "/v1/paddle/webhook",
+      legacyEnv,
+      await liveReplacementEvent(),
+      legacyEnv.PADDLE_WEBHOOK_SECRET ?? "",
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ applied: true });
+    expect(await ledgerKeys()).toEqual([]);
+  });
+
+  it("a same-lane renewal keeps the ledger", async () => {
+    await seedLedger();
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(CUSTOMER_EMAIL, {
+        subscription: {
+          ...LIVE_SUBSCRIPTION,
+          paddleSubscriptionId: "sub_live_new",
+          paddleCustomerId: "ctm_live_new",
+          paddleOccurredAt: "2026-01-01T00:00:00.000Z",
+        },
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("{}", { status: 404 }))),
+    );
+
+    const res = await postWebhook(
+      "/v1/paddle/webhook",
+      legacyEnv,
+      await liveReplacementEvent(),
+      legacyEnv.PADDLE_WEBHOOK_SECRET ?? "",
+    );
+
+    expect(res.status).toBe(200);
+    expect(await ledgerKeys()).not.toEqual([]);
+  });
+});
+
+describe("a dropped sandbox completion releases its reservation (pass-3 P2)", () => {
+  async function droppedEvent(reservationId: string): Promise<string> {
+    const env = laneEnv("sandbox");
+    return JSON.stringify({
+      event_id: "evt_dropped",
+      event_type: "subscription.created",
+      occurred_at: new Date().toISOString(),
+      data: {
+        id: "sub_sbx_dropped",
+        status: "active",
+        customer_id: "ctm_sbx_dropped",
+        next_billed_at: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+        custom_data: await buildPaddleCheckoutCustomData(
+          "user_lane",
+          paddleEnvForStoredLane(env, "sandbox"),
+          reservationId,
+        ),
+        items: [{ price: { id: SANDBOX_PRICES.pro }, quantity: 1 }],
+      },
+    });
+  }
+
+  function seedSandboxReservation(reservationId: string) {
+    return seedReservation("user_lane", {
+      reservationId,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      transactionId: "txn_sbx_done",
+      priceId: SANDBOX_PRICES.pro,
+      quantity: 1,
+      paddleEnvironment: "sandbox",
+    });
+  }
+
+  it("clears the buyer's sandbox reservation without granting anything", async () => {
+    await seedSandboxReservation("res_dropped");
+    // The QA buyer switched to a non-QA email before the webhook arrived.
+    mocks.getUser.mockResolvedValue(userWithEmail(CUSTOMER_EMAIL, { subscription: null }));
+
+    const res = await postWebhook(
+      "/v1/paddle/webhook/sandbox",
+      laneEnv("sandbox"),
+      await droppedEvent("res_dropped"),
+      SANDBOX_SECRET,
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ mapped: false });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    expect(await storedReservation("user_lane")).toBeUndefined();
+  });
+
+  it("leaves a different reservation in place", async () => {
+    await seedSandboxReservation("res_other");
+    mocks.getUser.mockResolvedValue(userWithEmail(CUSTOMER_EMAIL, { subscription: null }));
+
+    await postWebhook(
+      "/v1/paddle/webhook/sandbox",
+      laneEnv("sandbox"),
+      await droppedEvent("res_dropped"),
+      SANDBOX_SECRET,
+    );
+
+    expect(await storedReservation("user_lane")).toMatchObject({ reservationId: "res_other" });
+  });
 });

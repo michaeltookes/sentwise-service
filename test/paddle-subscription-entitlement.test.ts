@@ -141,10 +141,31 @@ describe("subscription replacements across Paddle environments", () => {
     );
   });
 
-  it.each(["active", "canceled"])("rejects an older live %s event", async (status) => {
+  // Pass-3 review: timestamps are compared only within one Paddle environment.
+  it("accepts a live purchase whose webhook is older than a later sandbox event", async () => {
+    // The live checkout completed before the sandbox subscription's last
+    // lifecycle event, but its webhook arrives afterwards. Paddle confirms it
+    // is active, so it replaces the sandbox subscription.
     const event = await liveEvent({ occurredAt: "2026-10-10T12:00:00Z" });
-    event.eventType = status === "canceled" ? "subscription.canceled" : "subscription.activated";
-    event.data.status = status;
+    event.eventType = "subscription.activated";
+
+    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
+      applied: true,
+    });
+    expect(metadata.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_live",
+      status: "active",
+    });
+    expect(storedPaddleLane(metadata.subscription)).toBe("production");
+  });
+
+  it("rejects an older live canceled event after checking Paddle", async () => {
+    const event = await liveEvent({ occurredAt: "2026-10-10T12:00:00Z" });
+    event.eventType = "subscription.canceled";
+    event.data.status = "canceled";
+    vi.mocked(fetch).mockResolvedValue(
+      Response.json({ data: { customer_id: "ctm_live", status: "canceled" } }),
+    );
     const previous = structuredClone(metadata);
 
     expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
@@ -152,7 +173,19 @@ describe("subscription replacements across Paddle environments", () => {
     });
     expect(metadata).toEqual(previous);
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("still rejects an older event for the same subscription in the same lane", async () => {
+    delete metadata.subscription.paddleEnvironment;
+    metadata.subscription.paddleSubscriptionId = "sub_live";
+    metadata.subscription.paddleCustomerId = "ctm_live";
+    const event = await liveEvent({ occurredAt: "2026-10-10T12:00:00Z" });
+    event.eventType = "subscription.updated";
+
+    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
+      stale: true,
+    });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
   it.each(["canceled", "paused"])(
@@ -394,7 +427,15 @@ describe("the environment marker survives Clerk's deep merge correctly", () => {
           metadata.subscription.paddleSubscriptionId = "sub_live";
           metadata.subscription.paddleCustomerId = "ctm_live";
         } else if (scenario === "stale") {
+          // Pass-3: an older live event is only stale when Paddle says the
+          // live subscription is not active (timestamps aren't compared
+          // across lanes).
           event = await liveEvent({ occurredAt: "2026-10-10T12:00:00Z" });
+          event.eventType = "subscription.canceled";
+          event.data.status = "canceled";
+          vi.mocked(fetch).mockResolvedValue(
+            Response.json({ data: { customer_id: "ctm_live", status: "canceled" } }),
+          );
         } else {
           mocks.updateUserMetadata.mockRejectedValueOnce(new Error("Clerk unavailable"));
         }
