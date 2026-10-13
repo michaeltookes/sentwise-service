@@ -709,7 +709,9 @@ One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddl
   where it lives before a new one is minted.
 - **Lane lock: transitions are refused, not reconciled.** An account's lane is decided by the
   first billing state it acquires and stored in Clerk `privateMetadata.paddleLane`
-  (`"sandbox" | "production"`), written on the first checkout reservation or subscription
+  (`"sandbox" | "production"`). The first checkout takes the lock with a compare-and-set in the
+  account's Durable Object (so two first checkouts spanning an email change can't both win) and
+  mirrors it to Clerk; the first subscription the webhook records also writes it
   (accounts that predate the key are locked by the lane of their stored subscription). After that,
   neither `PADDLE_ENV` nor an email change moves the account:
   - checkout and plan changes from the other lane return `409 billing_lane_locked`, naming the
@@ -746,12 +748,27 @@ The only way a QA account leaves its locked Paddle lane. Same `ADMIN_TOKEN` gate
 `403 paddle_lane_reset_forbidden` and writes nothing); an account with a **live** subscription in
 force is refused with `409 billing_live_subscription_active` (the route never touches live Paddle).
 
+A live record written before Paddle's raw status was kept (status `"canceled"`, no
+`paddleStatus`) is checked at Paddle first; if it is still active or paused, or Paddle can't say,
+the reset is refused with 409 (`billing_live_subscription_active` / `billing_live_status_unknown`).
+
 It cancels the account's sandbox subscription at the Paddle sandbox immediately (failure is
 `502 subscription_cancel_failed` and nothing is cleared), then, serialized in the account's Durable
-Object: releases its checkout reservations, retires the overage ledger while keeping replay
-tombstones, and clears the Clerk subscription record, the Paddle-written quota fields, and the lane
-lock. The response lists `previousLane`, `canceledSubscriptionId`, `releasedReservations` and
-`retiredCredits`.
+Object:
+
+- re-validates the account (no live subscription in force, same subscription as the one cancelled)
+  and aborts with `409 billing_live_subscription_active` / `409 billing_state_changed` if it changed;
+- settles each pending checkout: it is released only when its transaction is confirmed cancelled or
+  in a safe terminal state (completed); an unknown outcome is `502 transaction_cancel_failed` with
+  nothing cleared, and a checkout still being created is `409 billing_checkout_pending`;
+- retires the overage ledger while keeping replay tombstones, and clears the Clerk subscription
+  record, the Paddle-written quota fields, and the lane lock;
+- bumps the account's reset generation (`paddleLaneGeneration`) and retires the cancelled
+  subscription id (`paddleRetiredSubscriptionIds`). Checkouts stamp the generation into their
+  Paddle custom data, and the webhook ignores (`{ "ignored": "lane_reset" }`) any event for a
+  retired subscription or from a checkout made before the current generation, so the reset's own
+  delayed cancellation webhook can never restore what it cleared. The response lists `previousLane`, `canceledSubscriptionId`, `releasedReservations` and
+  `retiredCredits`.
 
 ```bash
 curl -s -X POST https://sentwise-inference.sentwise-service.workers.dev/admin/paddle-lane-reset \
