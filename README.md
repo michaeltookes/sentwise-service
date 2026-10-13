@@ -592,20 +592,20 @@ candidate user does not match the Paddle customer, the event is
 acknowledged `200` (`{ mapped: false }`) — retrying wouldn't help. Transient Paddle/Clerk lookup
 failures and missing Paddle API credentials return `502` so Paddle retries.
 
-**Price → tier.** `data.items[].price.id` maps to a tier via the env-backed tier-price map in
-`src/config.ts`. Sandbox/local default ids:
+**Price → tier.** `data.items[].price.id` maps to a tier only through the deployment's three price
+vars (there is no compiled-in price map):
 
-| Price id                         | Tier        | Monthly draft limit (var)     |
-| -------------------------------- | ----------- | ----------------------------- |
-| `pri_01m1syd7nfarp8pggpcnvjbgyy` | `starter`   | `STARTER_DRAFT_LIMIT` (30)    |
-| `pri_01m1symsxarc4c3jdea0ntb09w` | `pro`       | `PRO_DRAFT_LIMIT` (120)       |
-| `pri_01m1syrdg05f49kz705gbzn6tz` | `unlimited` | `UNLIMITED_DRAFT_LIMIT` (1e5) |
+| Var                         | Tier        | Monthly draft limit (var)     |
+| --------------------------- | ----------- | ----------------------------- |
+| `PADDLE_STARTER_PRICE_ID`   | `starter`   | `STARTER_DRAFT_LIMIT` (30)    |
+| `PADDLE_PRO_PRICE_ID`       | `pro`       | `PRO_DRAFT_LIMIT` (120)       |
+| `PADDLE_UNLIMITED_PRICE_ID` | `unlimited` | `UNLIMITED_DRAFT_LIMIT` (1e5) |
 
-When `PADDLE_API_BASE` is `https://api.paddle.com`, the Worker does **not** fall back to those
-sandbox ids. The deployment must set `PADDLE_STARTER_PRICE_ID`, `PADDLE_PRO_PRICE_ID`, and
-`PADDLE_UNLIMITED_PRICE_ID` to the live Paddle subscription prices; otherwise tier checkouts and plan
+The three ids are an all-or-nothing set of distinct values. Without them, tier checkouts and plan
 changes reject unknown prices before calling Paddle, and first-match subscription webhooks return
-`503` so Paddle retries after the config is fixed.
+`503` so Paddle retries after the config is fixed. `PADDLE_API_BASE` defaults to the live API
+(`https://api.paddle.com`); the [sandbox deployment](docs/sandbox-deployment.md) sets the sandbox
+base and the sandbox catalog's ids in its own wrangler environment.
 
 The Durable Object also stores the selected paid plan on the pending subscription checkout
 reservation, so a matching signed subscription webhook can still apply the purchased tier if a
@@ -665,10 +665,10 @@ Paddle secrets (below); (2) in the Paddle dashboard creates a **notification des
 `subscription.activated`, `subscription.created`, `subscription.updated`, `subscription.canceled`,
 `subscription.past_due`, `subscription.paused`, `subscription.resumed`, `transaction.completed`,
 `adjustment.created`, and `adjustment.updated`, and copies its signing secret into
-`PADDLE_WEBHOOK_SECRET`; (3) when moving off sandbox, flips `PADDLE_API_BASE` to
-`https://api.paddle.com` and sets `PADDLE_STARTER_PRICE_ID`, `PADDLE_PRO_PRICE_ID`, and
-`PADDLE_UNLIMITED_PRICE_ID` to the live subscription price ids. End-to-end verification (a real
-Paddle test event → a real entitlement write) happens then.
+`PADDLE_WEBHOOK_SECRET`; (3) sets `PADDLE_STARTER_PRICE_ID`, `PADDLE_PRO_PRICE_ID`, and
+`PADDLE_UNLIMITED_PRICE_ID` to the live subscription price ids (done at the item 74 cutover).
+Purchase-path testing against the Paddle sandbox uses the separate sandbox deployment
+([docs/sandbox-deployment.md](docs/sandbox-deployment.md)), never the production Worker.
 
 ## Development
 
@@ -718,9 +718,13 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   mapping. Missing credentials make those operations fail closed with `5xx` instead of acknowledging
   paid events.
 - `PADDLE_STARTER_PRICE_ID` / `PADDLE_PRO_PRICE_ID` / `PADDLE_UNLIMITED_PRICE_ID` — **56c, public
-  vars.** Required when `PADDLE_API_BASE` points at the live API. Sandbox/local mode defaults to the
-  sandbox ids committed in `src/config.ts`; live mode fails closed instead of accepting sandbox ids,
-  and the three tier ids are treated as an all-or-nothing set.
+  vars.** Required for checkout in every deployment; there is no compiled-in fallback. The three tier
+  ids are treated as an all-or-nothing set.
+- `APP_CALLBACK_SCHEME` — **public var (item 123).** URL scheme `/auth/callback` and
+  `/openrouter/callback` forward to; defaults to `sentwise`. The sandbox deployment sets
+  `sentwise-qa` for the QA app build.
+- `USAGE_DATASET_NAME` — **public var (item 123).** Analytics Engine dataset `/admin/margin` reads;
+  defaults to `sentwise_usage` and must match the deployment's `USAGE_ANALYTICS` binding.
 
 Push them to the Worker with (values are read from the file, never printed):
 
@@ -757,6 +761,14 @@ store counters and hashed ids only; see [Metering](#metering-56b).
 ```bash
 npm run deploy     # runs typecheck + tests first (predeploy), then wrangler deploy
 ```
+
+### Sandbox deployment (item 123)
+
+A second deployment, `sentwise-inference-sandbox`, runs the same code configured for the Paddle
+sandbox and a Clerk development instance; QA builds of the app point at it. It is defined as the
+`sandbox` environment in `wrangler.jsonc` and deployed with `npm run deploy:sandbox` or the
+dispatch-only **Deploy sandbox** workflow. Setup, the lockstep rule, and every value still to fill
+in: [docs/sandbox-deployment.md](docs/sandbox-deployment.md).
 
 ## License
 
