@@ -6,7 +6,9 @@ name: Deploy sandbox
 # The production workflow (deploy.yml) is separate and untouched by this one.
 #
 # Lockstep rule: deploy the same ref production runs (normally the head of
-# main after a production deploy, or the same tag).
+# main after a production deploy, or a tag/commit in main's history).
+# The account-level Cloudflare token requires the existing production
+# environment approval, even though Wrangler targets the sandbox Worker.
 #
 # Repository secrets (SANDBOX_ prefix, mapped to the production secret names
 # at deploy time and uploaded with the deploy):
@@ -28,7 +30,7 @@ on:
         options: [sandbox]
         default: sandbox
       ref:
-        description: "Git ref to deploy (use the same ref production runs)"
+        description: "main, or a release tag/commit in main's history (match production)"
         required: true
         type: string
         default: main
@@ -43,12 +45,28 @@ concurrency:
 jobs:
   deploy:
     name: Deploy sentwise-inference-sandbox
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: production
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify and check out deployment ref
+        env:
+          DEPLOY_REF: ${{ inputs.ref }}
+        run: |
+          # Resolve once, then check ancestry before running any selected code.
+          # HEAD is the main commit fetched by the trusted checkout above.
+          deploy_sha=$(git rev-parse --verify --end-of-options "${DEPLOY_REF}^{commit}")
+          if ! git merge-base --is-ancestor "$deploy_sha" HEAD; then
+            echo "::error::The deployment ref must be a commit in main's history."
+            exit 1
+          fi
+          git checkout --detach "$deploy_sha"
       - uses: actions/setup-node@v4
         with:
           node-version-file: ".nvmrc"

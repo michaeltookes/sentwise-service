@@ -38,18 +38,29 @@ The `workers.dev` hostname needs no DNS. A custom domain (for example
 
 The sandbox exists to test the release production is running, so **deploy the same commit to both**.
 Production deploys from `main` on every push. After a production deploy (or before a QA run on a
-release tag), dispatch **Deploy sandbox** with `ref` set to that same commit or tag. A QA run records
-the tag the sandbox was deployed from, and a mismatch with the release under test stops the run.
+release tag), dispatch **Deploy sandbox** from `main` with `ref` set to that same commit or tag.
+The selected commit must be in `main`'s history. A QA run records the tag the sandbox was deployed
+from, and a mismatch with the release under test stops the run.
 
 ## Deploying
 
 ### From GitHub Actions (normal path)
 
-**Actions → Deploy sandbox → Run workflow**, `environment: sandbox`, `ref: <the ref production runs>`.
-The job lints, typechecks, and tests that ref, maps the `SANDBOX_`-prefixed repository secrets to the
-production secret names, refuses a live Clerk or Paddle key, uploads the secrets with the deploy
-(`wrangler deploy --env sandbox --secrets-file`), and smoke-checks `/healthz`. The production
-`deploy.yml` is untouched by this workflow.
+**Actions → Deploy sandbox → Run workflow**, **Use workflow from: main**, `environment: sandbox`,
+`ref: <the ref production runs>` (`main`, a release tag, or a commit SHA).
+
+The job requires approval through the existing protected **`production` GitHub environment** because
+it uses the same account-level Cloudflare token. That environment must retain its required reviewer
+and `main`-only deployment branch policy. This is the approval gate; Wrangler still deploys to the
+sandbox Worker. Dispatches from other workflow branches are skipped.
+
+After approval, the job fetches `main` and verifies that the requested ref resolves to a commit in
+its history. It checks out that exact SHA before installing dependencies, running repository code,
+or making deployment credentials available. Unmerged branch commits and tags pointing to them are
+rejected. The job then lints, typechecks, and tests the selected commit, maps the `SANDBOX_`-prefixed
+repository secrets to the production secret names, refuses a live Clerk or Paddle key, uploads the
+secrets with the deploy (`wrangler deploy --env sandbox --secrets-file`), and smoke-checks `/healthz`.
+The production `deploy.yml` is untouched by this workflow.
 
 Clearing an optional `SANDBOX_` repository secret overwrites its deployed value with an empty string
 on the next successful workflow deployment. Clearing `SANDBOX_ADMIN_TOKEN` disables `/admin/*`;
