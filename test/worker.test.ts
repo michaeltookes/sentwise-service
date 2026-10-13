@@ -1777,6 +1777,64 @@ describe("POST /v1/paddle/checkout", () => {
     expect(transactionCreates).toHaveLength(2);
   });
 
+  it("refuses a new subscription checkout while the stored Paddle subscription is paused (sentwise#124)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_paused" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleStatus: "paused",
+          paddleSubscriptionId: "sub_paused",
+          paddleCustomerId: "ctm_123",
+        },
+      }),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_active");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("still allows a new subscription checkout after a real cancellation", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_canceled" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleStatus: "canceled",
+          paddleSubscriptionId: "sub_canceled",
+          paddleCustomerId: "ctm_123",
+        },
+      }),
+    );
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(((await res.json().catch(() => ({}))) as any).error?.type).not.toBe(
+      "billing_subscription_active",
+    );
+  });
+
   it("rechecks subscription state after reserving a serialized checkout slot", async () => {
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
     mocks.getUser.mockResolvedValueOnce(userWith({ subscription: null })).mockResolvedValueOnce(
