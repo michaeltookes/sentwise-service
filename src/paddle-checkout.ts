@@ -1,25 +1,10 @@
 import { createClerkClient } from "@clerk/backend";
-import { isClerkNotFoundError, primaryEmail } from "./auth";
+import { isClerkNotFoundError } from "./auth";
 import { DEFAULT_EXTRA_DRAFTS_PER_UNIT, planForPrice, type Env } from "./config";
 import { ApiError } from "./errors";
-import { invalidateClerkUser } from "./clerk-user-cache";
-import {
-  explicitPaddleLaneLock,
-  laneOfEnv,
-  paddleLaneDecision,
-  paddleLaneGeneration,
-  paddleLaneLockedError,
-  paddleEnvForStoredLane,
-  paddleLaneForEmail,
-  rootPaddleEnv,
-  storedPaddleLane,
-  type PaddleLane,
-} from "./paddle-env";
 import { numFrom } from "./metering";
 import {
   buildPaddleCheckoutCustomData,
-  hasLivePaddleSubscriptionInForce,
-  storedPaddleRawStatus,
   paddleCheckoutBindingMatchesCustomData,
   storedPaddleCustomerId,
   storedPaddleSubscriptionId,
@@ -33,7 +18,6 @@ import {
   PaddleCheckoutCreationOutcomeUnknownError,
 } from "./paddle-api";
 import {
-  quotaLockPaddleLane,
   quotaPeekPaddleOverageCheckout,
   quotaPeekPaddleSubscriptionCheckout,
   quotaRecordPaddleOverageCheckout,
@@ -64,7 +48,6 @@ interface PendingCheckoutReservation {
   quantity?: number;
   extraDrafts?: number;
   customerId?: string;
-  paddleEnvironment?: "sandbox";
 }
 
 export async function handlePaddleCheckout(
@@ -79,9 +62,7 @@ export async function handlePaddleCheckout(
   let account = await loadCheckoutAccount(userId, env);
   let customerId = storedPaddleCustomerId(account.subscription);
 
-  assertCheckoutEligible(body, account.subscription, customerId, env);
-  if (!account.laneLockWritten) await writePaddleLaneLock(userId, env);
-  const laneGeneration = account.laneGeneration;
+  assertCheckoutEligible(body, account.subscription, customerId);
 
   const checkoutReservationId = crypto.randomUUID();
   const existingTransaction = await reserveCheckout(
@@ -95,7 +76,7 @@ export async function handlePaddleCheckout(
     try {
       account = await loadCheckoutAccount(userId, env);
       customerId = storedPaddleCustomerId(account.subscription);
-      assertCheckoutEligible(body, account.subscription, customerId, env);
+      assertCheckoutEligible(body, account.subscription, customerId);
     } catch (err) {
       if (isCheckoutEligibilityError(err)) {
         await cancelPaddleTransaction(env, existingTransaction.transactionId);
@@ -109,7 +90,7 @@ export async function handlePaddleCheckout(
   try {
     account = await loadCheckoutAccount(userId, env);
     customerId = storedPaddleCustomerId(account.subscription);
-    assertCheckoutEligible(body, account.subscription, customerId, env);
+    assertCheckoutEligible(body, account.subscription, customerId);
   } catch (err) {
     await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
       () => undefined,
@@ -122,12 +103,7 @@ export async function handlePaddleCheckout(
     transaction = await createPaddleCheckoutTransaction(env, {
       priceId: body.priceId,
       quantity: body.quantity,
-      customData: await buildPaddleCheckoutCustomData(
-        userId,
-        env,
-        checkoutReservationId,
-        laneGeneration,
-      ),
+      customData: await buildPaddleCheckoutCustomData(userId, env, checkoutReservationId),
       customerId,
     });
   } catch (err) {
@@ -173,17 +149,8 @@ function assertCheckoutEligible(
   body: CheckoutRequestBody,
   rawSubscription: unknown,
   customerId: string | null,
-  env: Env,
 ): void {
-  if (
-    body.kind === "subscription" &&
-    (hasActivePaddleSubscription(rawSubscription) ||
-      // 123: a PAUSED subscription still exists at Paddle — resume it, don't
-      // start a second one.
-      (storedPaddleSubscriptionId(rawSubscription) !== null &&
-        storedPaddleRawStatus(rawSubscription) === "paused") ||
-      (laneOfEnv(env) === "sandbox" && hasLivePaddleSubscriptionInForce(rawSubscription)))
-  ) {
+  if (body.kind === "subscription" && hasActivePaddleSubscription(rawSubscription)) {
     throw new ApiError(
       409,
       "billing_subscription_active",
@@ -224,21 +191,14 @@ async function hasOpenCheckoutReservation(
   if (!reservation.pending) return false;
   const reservationId = reservation.reservationId;
   if (!reservationId) return true;
-  // 123: look the transaction up where it was created, never in the lane the
-  // account happens to be in now (a live transaction is "not found" in the
-  // sandbox and must not be mistaken for gone).
-  const transactionEnv = reservationPaddleEnv(env, reservation);
   if (!reservation.transactionId) {
-    return await hasOpenUnrecordedCheckoutReservation(transactionEnv, userId, kind, {
+    return await hasOpenUnrecordedCheckoutReservation(env, userId, kind, {
       ...reservation,
       reservationId,
     });
   }
 
-  const snapshot = await pendingCheckoutTransactionSnapshot(
-    transactionEnv,
-    reservation.transactionId,
-  );
+  const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
   if (!snapshot || snapshot.status === "canceled") {
     await releaseCheckoutReservation(env, userId, kind, reservationId);
     return false;
@@ -339,25 +299,16 @@ async function recoverOrReleasePendingCheckout(
     );
   }
 
-  const transactionEnv = reservationPaddleEnv(env, reservation);
-  const snapshot = await pendingCheckoutTransactionSnapshot(
-    transactionEnv,
-    reservation.transactionId,
-  );
+  const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
   if (!snapshot || snapshot.status === "canceled") {
     await releaseCheckoutReservation(env, userId, request.kind, reservationId);
     return null;
   }
   const checkoutUrl = snapshot.checkoutUrl ?? reservation.checkoutUrl ?? null;
   if (isRecoverableCheckoutTransaction(snapshot.status, checkoutUrl)) {
-    // 123: a checkout from the other lane is never handed back (the app would
-    // open it with the wrong Paddle environment) — cancel it where it lives.
-    if (
-      !checkoutMatchesRequest(reservation, snapshot, request) ||
-      reservationLaneDiffers(env, reservation)
-    ) {
+    if (!checkoutMatchesRequest(reservation, snapshot, request)) {
       return await supersedePendingCheckout(
-        transactionEnv,
+        env,
         userId,
         request,
         reservationId,
@@ -412,8 +363,7 @@ async function recoverOrReleaseUnrecordedCheckout(
 ): Promise<PendingCheckoutTransaction | null> {
   if (!reservationExpired(reservation)) throw pendingCheckoutError();
 
-  const transactionEnv = reservationPaddleEnv(env, reservation);
-  const snapshot = await unrecordedCheckoutTransactionSnapshot(transactionEnv, userId, reservation);
+  const snapshot = await unrecordedCheckoutTransactionSnapshot(env, userId, reservation);
   if (!snapshot || snapshot.status === "canceled") {
     await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
     return null;
@@ -423,12 +373,9 @@ async function recoverOrReleaseUnrecordedCheckout(
   if (!isRecoverableCheckoutTransaction(snapshot.status, checkoutUrl)) {
     throw pendingCheckoutError();
   }
-  if (
-    !checkoutMatchesRequest(reservation, snapshot, request) ||
-    reservationLaneDiffers(env, reservation)
-  ) {
+  if (!checkoutMatchesRequest(reservation, snapshot, request)) {
     return await supersedePendingCheckout(
-      transactionEnv,
+      env,
       userId,
       request,
       reservation.reservationId,
@@ -455,20 +402,11 @@ async function recoverOrReleaseUnrecordedCheckout(
     };
   }
   if ("unusable" in recordResult) {
-    await cancelPaddleTransaction(transactionEnv, snapshot.transactionId);
+    await cancelPaddleTransaction(env, snapshot.transactionId);
     await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
     throw subscriptionRequiredError();
   }
   throw pendingCheckoutError();
-}
-
-/** 123 — the Paddle env a reservation's transaction lives in. */
-function reservationPaddleEnv(env: Env, reservation: { paddleEnvironment?: string }): Env {
-  return paddleEnvForStoredLane(env, storedPaddleLane(reservation));
-}
-
-function reservationLaneDiffers(env: Env, reservation: { paddleEnvironment?: string }): boolean {
-  return storedPaddleLane(reservation) !== laneOfEnv(env);
 }
 
 async function hasOpenUnrecordedCheckoutReservation(
@@ -581,10 +519,7 @@ function isCheckoutEligibilityError(err: unknown): boolean {
     err instanceof ApiError &&
     (err.type === "billing_subscription_active" ||
       err.type === "billing_subscription_required" ||
-      err.type === "billing_customer_not_bound" ||
-      err.type === "billing_environment_mismatch" ||
-      // 123: a lane lock persisted while a recovered checkout was pending.
-      err.type === "billing_lane_locked")
+      err.type === "billing_customer_not_bound")
   );
 }
 
@@ -650,14 +585,12 @@ async function parseCheckoutRequest(request: Request, env: Env): Promise<Checkou
   return { kind, priceId, quantity };
 }
 
-async function loadCheckoutAccount(
-  userId: string,
-  env: Env,
-): Promise<{ subscription: unknown; laneLockWritten: boolean; laneGeneration: number }> {
+async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscription: unknown }> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
-  let user;
   try {
-    user = await clerk.users.getUser(userId);
+    const user = await clerk.users.getUser(userId);
+    const meta = asRecord(user.privateMetadata) ?? {};
+    return { subscription: meta.subscription };
   } catch (err) {
     if (isClerkNotFoundError(err)) {
       throw new ApiError(404, "account_not_found", "Your account could not be found.");
@@ -668,53 +601,6 @@ async function loadCheckoutAccount(
       "Could not load your account. Please try again.",
     );
   }
-  const meta = asRecord(user.privateMetadata) ?? {};
-  // 123 — lane lock: an account locked to the other environment is refused
-  // outright (only the admin reset moves it), whatever its email says now.
-  const decision = paddleLaneDecision(rootPaddleEnv(env), primaryEmail(user), meta);
-  if (decision.locked !== null && (decision.conflict || decision.locked !== laneOfEnv(env))) {
-    throw paddleLaneLockedError(decision.locked);
-  }
-  // Every account read (including the post-reservation/recovery recheck) must
-  // still agree with the chosen lane before its customer ID can be used.
-  if (paddleLaneForEmail(rootPaddleEnv(env), primaryEmail(user)) !== laneOfEnv(env)) {
-    throw new ApiError(
-      409,
-      "billing_environment_mismatch",
-      "Your billing environment changed. Refresh and try again.",
-    );
-  }
-  return {
-    subscription: subscriptionForCheckoutLane(meta.subscription, laneOfEnv(env)),
-    laneLockWritten: explicitPaddleLaneLock(meta) !== null,
-    laneGeneration: paddleLaneGeneration(meta),
-  };
-}
-
-/**
- * 123 — the first checkout locks the account's lane. The fresh lock check and
- * the conditional write run together inside the account's serialized
- * AccountQuota operation (compare-and-set), so two first checkouts spanning an
- * email change can never both see "no lock" and overwrite each other.
- */
-async function writePaddleLaneLock(userId: string, env: Env): Promise<void> {
-  await quotaLockPaddleLane(env, userId, { lane: laneOfEnv(env) });
-  invalidateClerkUser(userId);
-}
-
-/**
- * 123 — the stored subscription as seen by a checkout in `lane`. A record from
- * the same lane is used as-is. A stranded SANDBOX record seen from production is
- * ignored (it is not a paid plan and its customer id doesn't exist live). A LIVE
- * record seen from the sandbox still blocks a second subscription while active or paused,
- * but its live customer id is never sent to the sandbox API.
- */
-function subscriptionForCheckoutLane(raw: unknown, lane: PaddleLane): unknown {
-  const stored = storedPaddleLane(raw);
-  if (stored === lane) return raw;
-  if (stored === "sandbox") return null;
-  const record = asRecord(raw);
-  return record ? { ...record, paddleCustomerId: null } : raw;
 }
 
 function checkoutKindForPrice(priceId: string, env: Env): CheckoutRequestBody["kind"] | null {

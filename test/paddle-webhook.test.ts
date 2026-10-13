@@ -29,7 +29,6 @@ import {
   PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
   PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY,
   PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
-  PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY,
   recordPaddleOverageInClerk,
   type PaddleOverageLedgerStore,
 } from "../src/paddle-entitlement";
@@ -1656,7 +1655,6 @@ describe("POST /v1/paddle/webhook — overage (transaction.completed)", () => {
     const values = new Map<string, unknown>(
       existingCredits.map((credit) => [testOverageCreditStorageKey(credit), credit]),
     );
-    values.set(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY, "production");
     const putKeys: string[] = [];
     const ledgerStore: PaddleOverageLedgerStore = {
       get: <T = unknown>(key: string) => Promise.resolve(values.get(key) as T | undefined),

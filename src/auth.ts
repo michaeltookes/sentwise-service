@@ -6,12 +6,6 @@ import { computeTrial, type TrialState } from "./trial";
 import { parseQuotaOverride, type QuotaOverride } from "./metering";
 import { applyCompEntitlement, parseCompEntitlement } from "./comp";
 import { resolvePlanDraftLimit } from "./paddle";
-import {
-  lockedPaddleLane,
-  paddleLaneForEmail,
-  storedPaddleLane,
-  type PaddleLane,
-} from "./paddle-env";
 import { deriveSubscription, hasPaidAccess, type Subscription } from "./subscription";
 
 // Re-exported unchanged after the item-111 move into subscription.ts (pure home,
@@ -37,9 +31,6 @@ export interface AccountInfo {
   // DELETE /v1/me so a comp never blocks account deletion behind a nonexistent
   // Paddle subscription.
   compApplied: boolean;
-  // 123: the account's Paddle lane lock (explicit, or inferred from a stored
-  // subscription). Internal — feeds /v1/me `billing`, never exposed itself.
-  paddleLaneLock?: PaddleLane | null;
 }
 
 export class ClerkDeletionOutcomeUnknownError extends ApiError {
@@ -201,15 +192,7 @@ async function accountInfoFromUser(
   const trial: TrialState = startedAt
     ? computeTrial(startedAt)
     : { startedAt: "", endsAt: "", active: false };
-  // 123: a subscription created in the Paddle SANDBOX only counts while this
-  // account is still in the sandbox lane. Once the lane closes (PADDLE_ENV back
-  // to production) or the email leaves @prowlqa.dev it is stranded test data:
-  // not a paid plan, and its webhook-written tier caps and extras don't apply.
-  const strandedSandbox =
-    storedPaddleLane(meta.subscription) === "sandbox" &&
-    paddleLaneForEmail(env, email) !== "sandbox";
-  if (strandedSandbox) quotaOverride = withoutPaddleEntitlement(quotaOverride);
-  const natural = deriveSubscription(trial, strandedSandbox ? null : meta.subscription);
+  const natural = deriveSubscription(trial, meta.subscription);
 
   // 111: layer an admin-granted comp over the natural state. A real paid
   // subscription wins (comp inert); otherwise an unexpired comp presents as an
@@ -222,26 +205,10 @@ async function accountInfoFromUser(
     quotaOverride = { ...quotaOverride, monthlyDraftLimit: resolvePlanDraftLimit(env, comp.plan) };
   }
 
-  return {
-    userId,
-    email,
-    trial,
-    subscription,
-    quotaOverride,
-    compApplied: layered.compApplied,
-    paddleLaneLock: lockedPaddleLane(meta),
-  };
+  return { userId, email, trial, subscription, quotaOverride, compApplied: layered.compApplied };
 }
 
 /** Return whether Clerk still has this user; 404 means already deleted. */
-function withoutPaddleEntitlement(override: QuotaOverride): QuotaOverride {
-  const rest = { ...override };
-  delete rest.monthlyDraftLimit;
-  delete rest.extraDrafts;
-  delete rest.extraDraftsWindowStart;
-  return rest;
-}
-
 export async function clerkUserExists(userId: string, env: Env): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), CLERK_DELETE_TIMEOUT_MS);

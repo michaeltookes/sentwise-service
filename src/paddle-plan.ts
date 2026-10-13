@@ -1,17 +1,9 @@
 import { createClerkClient } from "@clerk/backend";
-import { isClerkNotFoundError, primaryEmail } from "./auth";
+import { isClerkNotFoundError } from "./auth";
 import { planForPrice, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import { storedPaddleSubscriptionId } from "./paddle-account";
 import { changePaddleSubscription } from "./paddle-api";
-import {
-  laneOfEnv,
-  paddleLaneDecision,
-  paddleLaneForEmail,
-  paddleLaneLockedError,
-  rootPaddleEnv,
-  storedPaddleLane,
-} from "./paddle-env";
 import {
   quotaRecordPaddlePlanChange,
   type PaddlePlanChangeEntitlementResult,
@@ -52,27 +44,6 @@ export async function handlePaddleChangePlan(
 
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
   const account = await loadChangePlanAccount(clerk, userId);
-
-  // 123 — lane lock first: an account locked to the other environment is
-  // refused with the reset route named, whatever its email says now.
-  const decision = paddleLaneDecision(rootPaddleEnv(env), account.email, account.meta);
-  if (decision.locked !== null && (decision.conflict || decision.locked !== laneOfEnv(env))) {
-    throw paddleLaneLockedError(decision.locked);
-  }
-
-  // 123: the subscription id below comes from THIS fresh snapshot, so check the
-  // stored lane and current email against the same snapshot. Neither a webhook
-  // replacement nor an email change may send this mutation to the wrong lane.
-  if (
-    storedPaddleLane(account.subscription) !== laneOfEnv(env) ||
-    paddleLaneForEmail(rootPaddleEnv(env), account.email) !== laneOfEnv(env)
-  ) {
-    throw new ApiError(
-      409,
-      "billing_environment_mismatch",
-      "This subscription can't be changed here. Manage it from billing.",
-    );
-  }
 
   const subscriptionId = storedPaddleSubscriptionId(account.subscription);
   if (!subscriptionId) {
@@ -148,11 +119,11 @@ async function parseChangePlanRequest(request: Request): Promise<string> {
 async function loadChangePlanAccount(
   clerk: ReturnType<typeof createClerkClient>,
   userId: string,
-): Promise<{ subscription: unknown; email: string | null; meta: Record<string, unknown> }> {
+): Promise<{ subscription: unknown }> {
   try {
     const user = await clerk.users.getUser(userId);
     const meta = asRecord(user.privateMetadata) ?? {};
-    return { subscription: meta.subscription, email: primaryEmail(user), meta };
+    return { subscription: meta.subscription };
   } catch (err) {
     if (isClerkNotFoundError(err)) {
       throw new ApiError(404, "account_not_found", "Your account could not be found.");

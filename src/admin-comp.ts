@@ -144,7 +144,7 @@ interface CompTarget {
   email?: string;
 }
 
-export function parseTarget(raw: { userId?: unknown; email?: unknown }): CompTarget {
+function parseTarget(raw: { userId?: unknown; email?: unknown }): CompTarget {
   const userId = nonEmptyString(raw.userId);
   const email = nonEmptyString(raw.email);
   if ((userId === null) === (email === null)) {
@@ -156,7 +156,7 @@ export function parseTarget(raw: { userId?: unknown; email?: unknown }): CompTar
 type ClerkClient = ReturnType<typeof createClerkClient>;
 type ClerkUser = Awaited<ReturnType<ClerkClient["users"]["getUser"]>>;
 
-export async function resolveTargetUser(
+async function resolveTargetUser(
   clerk: ClerkClient,
   target: CompTarget,
 ): Promise<{ userId: string; user: ClerkUser }> {
@@ -265,7 +265,7 @@ function resolveExpiry(body: Record<string, unknown>, now: number): string {
   return new Date(now + days * DAY_MS).toISOString();
 }
 
-export async function jsonBody(request: Request): Promise<Record<string, unknown>> {
+async function jsonBody(request: Request): Promise<Record<string, unknown>> {
   let body: unknown;
   try {
     body = await request.json();

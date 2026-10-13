@@ -18,7 +18,6 @@
   //   CLERK_SECRET_KEY, ANTHROPIC_API_KEY            (56a)
   //   ADMIN_TOKEN, CF_ANALYTICS_API_TOKEN            (56b margin dashboard)
   //   PADDLE_WEBHOOK_SECRET, PADDLE_API_KEY          (56c checkout + licensing)
-  //   PADDLE_SANDBOX_API_KEY, PADDLE_SANDBOX_WEBHOOK_SECRET  (123 sandbox QA lane)
   // NOTE: `wrangler secret put` reads the value from stdin — run it from a REAL
   // terminal (TTY). A non-interactive/piped invocation can upload an EMPTY secret
   // silently (a known 56b gotcha), which then fails webhook verification with 401.
@@ -48,22 +47,6 @@
     "PADDLE_PRO_PRICE_ID": "pri_01m307vkn7zf0k194trcmx0qg1",
     "PADDLE_UNLIMITED_PRICE_ID": "pri_01m307xfej4zjp0n7wkf4rf9cd",
     "PADDLE_WEBHOOK_TOLERANCE_SEC": "300", // signature freshness window (seconds)
-
-    // --- 123 Paddle sandbox lane (QA purchase path) ---
-    // "production": everyone on the live values above (PADDLE_API_BASE is then
-    // forced to the live base). "sandbox": accounts whose primary email is
-    // @prowlqa.dev use the Paddle SANDBOX (sandbox API base, the
-    // PADDLE_SANDBOX_* secrets and price vars) and the sandbox webhook
-    // destination /v1/paddle/webhook/sandbox opens; every other account stays on
-    // the live values. Flip to "sandbox" only after the sandbox secrets and the
-    // vars below are set. See sentwise docs/billing-qa.md.
-    "PADDLE_ENV": "production",
-    // Set with `wrangler secret put` (values are not committed here):
-    //   PADDLE_SANDBOX_API_KEY, PADDLE_SANDBOX_WEBHOOK_SECRET
-    // Set as vars (dashboard or here, once the sandbox catalog exists):
-    //   PADDLE_SANDBOX_CLIENT_TOKEN, PADDLE_SANDBOX_STARTER_PRICE_ID,
-    //   PADDLE_SANDBOX_PRO_PRICE_ID, PADDLE_SANDBOX_UNLIMITED_PRICE_ID
-    //   (optional: PADDLE_SANDBOX_EXTRA_DRAFTS_PRICE_ID)
     // Per-tier MONTHLY draft limits (owner decision 2026-09-16): the caps the
     // marketing site sells — "30 follow-ups a month" / "120 a month" — enforced over
     // a calendar-month UTC window. The webhook writes the resolved value per-account

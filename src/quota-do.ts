@@ -52,22 +52,9 @@ import { parseInterestTopic, recordInterestInClerk } from "./interest";
 import {
   parsePaddleOverageBody,
   parsePaddleOverageReversalBody,
-  PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY,
   recordPaddleOverageInClerk,
-  retireOverageLedgerWithTombstones,
   revokePaddleOverageInClerk,
 } from "./paddle-entitlement";
-import {
-  assertResetStillValid,
-  clearPaddleLaneInClerk,
-  clerkCreditedTransactionIds,
-  loadPaddleResetMetadata,
-  PADDLE_LANE_LOCK_STORAGE_KEY,
-  writePaddleLaneLockToClerk,
-  parsePaddleLaneLockBody,
-  parsePaddleLaneResetBody,
-  settleReservationForReset,
-} from "./paddle-lane-reset";
 import {
   type PaddleSubscriptionCheckoutPlan,
   parsePaddleSubscriptionBody,
@@ -78,13 +65,6 @@ import {
   recordPaddlePlanChangeInClerk,
 } from "./paddle-plan-entitlement";
 import { cancelPaddleTransaction } from "./paddle-api";
-import {
-  paddleLaneLockedError,
-  PADDLE_LANE_HEADER,
-  paddleEnvForStoredLane,
-  paddleLaneFromHeader,
-  storedPaddleLane,
-} from "./paddle-env";
 import {
   activeReservations,
   pruneStamps,
@@ -164,9 +144,6 @@ interface PaddleCheckoutReservation {
   plan?: PaidPlan;
   customerId?: string;
   blocked?: boolean;
-  // 123: set when the reservation was made in the Paddle sandbox lane, so its
-  // transaction is always checked and cancelled in that environment.
-  paddleEnvironment?: "sandbox";
 }
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -239,14 +216,6 @@ export class AccountQuota {
     pathname: string,
     request: Request,
   ): Promise<Response> {
-    // 123 — the Paddle lane the Worker resolved for this request (internal
-    // header; the DO is not reachable from outside the Worker). The Worker is the
-    // gate for who enters the sandbox; here the lane may also be the stored lane
-    // of an existing sandbox object, so it is not downgraded by PADDLE_ENV.
-    const paddleEnv = paddleEnvForStoredLane(
-      this.env,
-      paddleLaneFromHeader(request.headers.get(PADDLE_LANE_HEADER)),
-    );
     switch (pathname) {
       case "/check":
         return this.handleCheck(await request.json<CheckBody>());
@@ -261,18 +230,15 @@ export class AccountQuota {
       case "/interest":
         return this.handleInterest(await request.json<unknown>());
       case "/paddle-subscription":
-        return this.handlePaddleSubscription(await request.json<unknown>(), paddleEnv);
+        return this.handlePaddleSubscription(await request.json<unknown>());
       case "/paddle-plan-change":
-        return this.handlePaddlePlanChange(await request.json<unknown>(), paddleEnv);
+        return this.handlePaddlePlanChange(await request.json<unknown>());
       case "/paddle-overage":
-        return this.handlePaddleOverage(await request.json<unknown>(), paddleEnv);
+        return this.handlePaddleOverage(await request.json<unknown>());
       case "/paddle-overage-reversal":
-        return this.handlePaddleOverageReversal(await request.json<unknown>(), paddleEnv);
+        return this.handlePaddleOverageReversal(await request.json<unknown>());
       case "/paddle-subscription-checkout-reserve":
-        return this.handlePaddleSubscriptionCheckoutReserve(
-          await request.json<unknown>(),
-          paddleEnv,
-        );
+        return this.handlePaddleSubscriptionCheckoutReserve(await request.json<unknown>());
       case "/paddle-subscription-checkout-record":
         return this.handlePaddleSubscriptionCheckoutRecord(await request.json<unknown>());
       case "/paddle-subscription-checkout-peek":
@@ -280,17 +246,13 @@ export class AccountQuota {
       case "/paddle-subscription-checkout-release":
         return this.handlePaddleSubscriptionCheckoutRelease(await request.json<unknown>());
       case "/paddle-overage-checkout-reserve":
-        return this.handlePaddleOverageCheckoutReserve(await request.json<unknown>(), paddleEnv);
+        return this.handlePaddleOverageCheckoutReserve(await request.json<unknown>());
       case "/paddle-overage-checkout-record":
         return this.handlePaddleOverageCheckoutRecord(await request.json<unknown>());
       case "/paddle-overage-checkout-peek":
         return this.handlePaddleOverageCheckoutPeek(await request.json<unknown>());
       case "/paddle-overage-checkout-release":
         return this.handlePaddleOverageCheckoutRelease(await request.json<unknown>());
-      case "/paddle-lane-reset":
-        return this.handlePaddleLaneReset(await request.json<unknown>());
-      case "/paddle-lane-lock":
-        return this.handlePaddleLaneLock(await request.json<unknown>());
       default:
         return new Response("not found", { status: 404 });
     }
@@ -571,33 +533,19 @@ export class AccountQuota {
     }
   }
 
-  private async handlePaddleSubscription(body: unknown, env: Env): Promise<Response> {
+  private async handlePaddleSubscription(body: unknown): Promise<Response> {
     try {
       const parsed = parsePaddleSubscriptionBody(body);
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(async () => {
         const checkoutPlan = await this.paddleSubscriptionCheckoutPlanForEvent(parsed.event);
-        return recordPaddleSubscriptionInClerk(
-          userId,
-          { ...parsed, checkoutPlan },
-          env,
-          this.storage,
-        );
+        return recordPaddleSubscriptionInClerk(userId, { ...parsed, checkoutPlan }, this.env);
       });
       if ("applied" in result || "idempotent" in result) {
         await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
         if (!subscriptionEventAllowsOverageCheckout(parsed.event)) {
           await this.cancelPaddleOverageCheckoutReservation();
         }
-      } else if (
-        ("ignored" in result && result.ignored === "lane_locked") ||
-        ("stale" in result && !subscriptionEventAllowsOverageCheckout(parsed.event))
-      ) {
-        // 123: the event's checkout is finished at Paddle even though its
-        // entitlement was intentionally ignored (lane lock, or a terminal
-        // event that lost ordering). Release its reservation so later
-        // checkouts and account deletion are never blocked by it.
-        await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
       }
       return Response.json(result);
     } catch (err) {
@@ -606,84 +554,12 @@ export class AccountQuota {
     }
   }
 
-  /**
-   * 123 — QA-only admin lane reset (the Clerk + durable half; the admin route
-   * has already cancelled the sandbox subscription at Paddle). Serialized with
-   * every other billing write for this account.
-   */
-  private async handlePaddleLaneReset(body: unknown): Promise<Response> {
+  private async handlePaddlePlanChange(body: unknown): Promise<Response> {
     try {
-      const { lane, expectedSubscriptionId } = parsePaddleLaneResetBody(body);
-      const userId = this.requireUserId();
-      const result = await this.enqueuePrivateMetadataWrite(async () => {
-        const meta = await loadPaddleResetMetadata(userId, this.env);
-        // Re-validate inside the serialized operation: a live checkout that
-        // completed after the admin handler looked aborts the reset (409).
-        assertResetStillValid(meta, expectedSubscriptionId);
-        // Settle every pending checkout BEFORE clearing anything: a reservation
-        // is released only on a confirmed cancellation or safe terminal state;
-        // an unknown outcome throws 502 with nothing cleared.
-        const settled: string[] = [];
-        for (const key of [
-          PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
-          PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
-        ] as const) {
-          const reservation = parsePaddleCheckoutReservation(await this.storage.get<unknown>(key));
-          if (!reservation) continue;
-          await settleReservationForReset(this.env, reservation, Date.now());
-          settled.push(key);
-        }
-        for (const key of settled) await this.storage.delete(key);
-        const releasedReservations = settled.length;
-        const retiredCredits = await retireOverageLedgerWithTombstones(
-          this.storage,
-          lane,
-          clerkCreditedTransactionIds(meta),
-        );
-        await this.storage.delete(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY);
-        await this.storage.delete(PADDLE_LANE_LOCK_STORAGE_KEY);
-        await clearPaddleLaneInClerk(userId, this.env, meta, expectedSubscriptionId);
-        return { releasedReservations, retiredCredits };
-      });
-      return Response.json(result);
-    } catch (err) {
-      if (err instanceof ApiError) return err.toResponse();
-      throw err;
-    }
-  }
-
-  /** 123 — compare-and-set the lane lock, serialized with every billing write. */
-  private async handlePaddleLaneLock(body: unknown): Promise<Response> {
-    try {
-      const { lane } = parsePaddleLaneLockBody(body);
-      const userId = this.requireUserId();
-      // Compare-and-set in DO storage: the first checkout to get here wins;
-      // a concurrent checkout for the other lane is refused.
-      const existing = await this.storage.transaction(async (txn) => {
-        const current = await txn.get<unknown>(PADDLE_LANE_LOCK_STORAGE_KEY);
-        if (current === "sandbox" || current === "production") return current;
-        await txn.put(PADDLE_LANE_LOCK_STORAGE_KEY, lane);
-        return null;
-      });
-      if (existing !== null && existing !== lane) {
-        return paddleLaneLockedError(existing).toResponse();
-      }
-      await this.enqueuePrivateMetadataWrite(() =>
-        writePaddleLaneLockToClerk(userId, this.env, lane),
-      );
-      return Response.json({ locked: lane });
-    } catch (err) {
-      if (err instanceof ApiError) return err.toResponse();
-      throw err;
-    }
-  }
-
-  private async handlePaddlePlanChange(body: unknown, env: Env): Promise<Response> {
-    try {
-      const parsed = parsePaddlePlanChangeEntitlementBody(body, env);
+      const parsed = parsePaddlePlanChangeEntitlementBody(body, this.env);
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(() =>
-        recordPaddlePlanChangeInClerk(userId, parsed, env),
+        recordPaddlePlanChangeInClerk(userId, parsed, this.env),
       );
       return Response.json(result);
     } catch (err) {
@@ -692,7 +568,7 @@ export class AccountQuota {
     }
   }
 
-  private async handlePaddleOverage(body: unknown, env: Env): Promise<Response> {
+  private async handlePaddleOverage(body: unknown): Promise<Response> {
     try {
       const parsed = parsePaddleOverageBody(body);
       const userId = this.requireUserId();
@@ -701,7 +577,7 @@ export class AccountQuota {
         parsed.customerId,
       );
       const result = await this.enqueuePrivateMetadataWrite(() =>
-        recordPaddleOverageInClerk(userId, parsed, env, this.storage, {
+        recordPaddleOverageInClerk(userId, parsed, this.env, this.storage, {
           allowInactiveSubscription,
         }),
       );
@@ -713,12 +589,12 @@ export class AccountQuota {
     }
   }
 
-  private async handlePaddleOverageReversal(body: unknown, env: Env): Promise<Response> {
+  private async handlePaddleOverageReversal(body: unknown): Promise<Response> {
     try {
       const parsed = parsePaddleOverageReversalBody(body);
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(() =>
-        revokePaddleOverageInClerk(userId, parsed, env, this.storage),
+        revokePaddleOverageInClerk(userId, parsed, this.env, this.storage),
       );
       return Response.json(result);
     } catch (err) {
@@ -727,32 +603,24 @@ export class AccountQuota {
     }
   }
 
-  private async handlePaddleSubscriptionCheckoutReserve(
-    body: unknown,
-    env: Env,
-  ): Promise<Response> {
+  private async handlePaddleSubscriptionCheckoutReserve(body: unknown): Promise<Response> {
     return this.handlePaddleCheckoutReserve(
       body,
       PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
       { requireCustomerId: false },
-      env,
     );
   }
 
-  private async handlePaddleOverageCheckoutReserve(body: unknown, env: Env): Promise<Response> {
-    return this.handlePaddleCheckoutReserve(
-      body,
-      PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
-      { requireCustomerId: true },
-      env,
-    );
+  private async handlePaddleOverageCheckoutReserve(body: unknown): Promise<Response> {
+    return this.handlePaddleCheckoutReserve(body, PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY, {
+      requireCustomerId: true,
+    });
   }
 
   private async handlePaddleCheckoutReserve(
     body: unknown,
     storageKey: PaddleCheckoutReservationStorageKey,
     options: { requireCustomerId: boolean },
-    env: Env,
   ): Promise<Response> {
     const record = asRecord(body);
     const now = normalizedNow(typeof record?.now === "number" ? record.now : undefined);
@@ -801,8 +669,7 @@ export class AccountQuota {
         expiresAt: now + RESERVATION_TTL_MS,
         priceId,
         quantity,
-        ...subscriptionCheckoutPlanForPrice(storageKey, priceId, env),
-        ...(env.PADDLE_LANE === "sandbox" ? { paddleEnvironment: "sandbox" } : {}),
+        ...subscriptionCheckoutPlanForPrice(storageKey, priceId, this.env),
         ...(options.requireCustomerId ? { extraDrafts } : {}),
         ...(customerId ? { customerId } : {}),
       });
@@ -1013,11 +880,7 @@ export class AccountQuota {
     if (!reservation) return;
     if (!reservation.transactionId) return;
 
-    // 123: cancel in the environment the reservation was made in.
-    await cancelPaddleTransaction(
-      paddleEnvForStoredLane(this.env, storedPaddleLane(reservation)),
-      reservation.transactionId,
-    );
+    await cancelPaddleTransaction(this.env, reservation.transactionId);
     await this.clearPaddleCheckoutReservation(
       PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
       reservation.reservationId,
@@ -1525,7 +1388,6 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
     ...(plan ? { plan } : {}),
     ...(customerId ? { customerId } : {}),
     ...(reservation.blocked === true ? { blocked: true } : {}),
-    ...(reservation.paddleEnvironment === "sandbox" ? { paddleEnvironment: "sandbox" } : {}),
   };
 }
 
@@ -1540,7 +1402,6 @@ function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation
   quantity?: number;
   extraDrafts?: number;
   customerId?: string;
-  paddleEnvironment?: "sandbox";
 } {
   return {
     pending: true,
@@ -1553,7 +1414,6 @@ function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation
     ...(reservation.quantity ? { quantity: reservation.quantity } : {}),
     ...(reservation.extraDrafts ? { extraDrafts: reservation.extraDrafts } : {}),
     ...(reservation.customerId ? { customerId: reservation.customerId } : {}),
-    ...(reservation.paddleEnvironment ? { paddleEnvironment: reservation.paddleEnvironment } : {}),
   };
 }
 
