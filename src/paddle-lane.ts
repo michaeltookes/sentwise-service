@@ -27,12 +27,16 @@ interface LaneUser {
   storedSubscription: unknown;
 }
 
+// Every caller here decides where a STATE-CHANGING Paddle call goes (checkout,
+// plan change, portal session), so the lane is always read from a fresh Clerk
+// record, never the 30s display cache: a stale email must not send a QA buyer
+// to a live, chargeable checkout (or a customer to the sandbox).
 async function loadLaneUser(userId: string, env: Env): Promise<LaneUser | null> {
   // Production-only deployments (the default) never pay for a lookup.
   if (!sandboxInPlay(env)) return { email: null, storedSubscription: null };
   let user;
   try {
-    user = await getCachedClerkUser(env, userId, { useCache: true });
+    user = await getCachedClerkUser(env, userId, { useCache: false });
   } catch (err) {
     if (isClerkNotFoundError(err)) return null;
     throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
