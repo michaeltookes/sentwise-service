@@ -19,7 +19,7 @@ function parseJsonc(text: string): unknown {
   let out = "";
   let i = 0;
   while (i < text.length) {
-    const ch = text[i]!;
+    const ch = text[i];
     const next = text[i + 1];
     if (ch === '"') {
       let j = i + 1;
@@ -72,7 +72,7 @@ describe("sandbox wrangler environment", () => {
     const prod = bindingNames(config);
     const sb = bindingNames(sandbox!);
     for (const kind of Object.keys(prod)) {
-      expect(sb[kind], kind).toEqual(expect.arrayContaining(prod[kind]!));
+      expect(sb[kind], kind).toEqual(expect.arrayContaining(prod[kind]));
     }
   });
 
