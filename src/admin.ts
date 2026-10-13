@@ -9,7 +9,7 @@
 //   - SQL API failure              -> 503 analytics_unavailable
 
 import type { Env } from "./config";
-import { ASSUMED_MONTHLY_REVENUE_USD, USAGE_DATASET } from "./config";
+import { ASSUMED_MONTHLY_REVENUE_USD, usageDatasetName } from "./config";
 import { jsonError } from "./errors";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -156,6 +156,7 @@ export async function handleMargin(
   }
 
   const now = Date.now();
+  const dataset = usageDatasetName(env);
   try {
     const windows: Record<string, ReturnType<typeof shapeWindow>> = {};
     for (const [key, days] of [
@@ -163,8 +164,8 @@ export async function handleMargin(
       ["30d", 30],
     ] as const) {
       const since = isoForSql(now - days * DAY_MS);
-      const [agg] = await runSql(env, aggregateSql(USAGE_DATASET, since), fetchImpl);
-      const top = await runSql(env, topAccountsSql(USAGE_DATASET, since), fetchImpl);
+      const [agg] = await runSql(env, aggregateSql(dataset, since), fetchImpl);
+      const top = await runSql(env, topAccountsSql(dataset, since), fetchImpl);
       windows[key] = shapeWindow(agg, top, days);
     }
     return Response.json({

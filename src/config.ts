@@ -56,6 +56,11 @@ export interface Env {
   // 56b — margin dashboard config. CF_ACCOUNT_ID is a public var; the two tokens
   // are secrets set via `wrangler secret put` and are optional (endpoint degrades).
   CF_ACCOUNT_ID?: string;
+  // Analytics Engine dataset /admin/margin queries. Must match the
+  // analytics_engine_datasets binding of the same deployment; defaults to
+  // USAGE_DATASET. A second deployment writes to its own dataset so its usage
+  // never appears on another deployment's dashboard.
+  USAGE_DATASET_NAME?: string;
   ADMIN_TOKEN?: string; // guards GET /admin/margin; endpoint 404s when unset
   CF_ANALYTICS_API_TOKEN?: string; // Cloudflare API token for the Analytics Engine SQL API
 
@@ -144,8 +149,16 @@ export const DEFAULT_ENFORCEMENT_MODE: EnforcementMode = "soft";
 // 56b — margin dashboard.
 // ---------------------------------------------------------------------------
 
-// Workers Analytics Engine dataset name (must match the binding in wrangler.jsonc).
+// Default Workers Analytics Engine dataset name (must match the binding in
+// wrangler.jsonc). Overridable per deployment with the USAGE_DATASET_NAME var.
 export const USAGE_DATASET = "sentwise_usage";
+
+// The dataset name is interpolated into Analytics Engine SQL, so only plain
+// identifiers are accepted; anything else falls back to the default.
+export function usageDatasetName(env: Pick<Env, "USAGE_DATASET_NAME">): string {
+  const configured = env.USAGE_DATASET_NAME?.trim() ?? "";
+  return /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(configured) ? configured : USAGE_DATASET;
+}
 
 // Assumed per-active-account monthly revenue, for margin math on /admin/margin.
 export const ASSUMED_MONTHLY_REVENUE_USD = 19;

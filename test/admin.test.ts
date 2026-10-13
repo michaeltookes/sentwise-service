@@ -8,7 +8,7 @@ import {
   isoForSql,
   topAccountsSql,
 } from "../src/admin";
-import { USAGE_DATASET } from "../src/config";
+import { USAGE_DATASET, usageDatasetName } from "../src/config";
 
 function baseEnv(overrides: Partial<Env>): Env {
   return {
@@ -143,5 +143,19 @@ describe("GET /admin/margin success", () => {
     const res = await handleMargin(marginReq("correct-token"), env, fetchMock);
     expect(res.status).toBe(503);
     expect(((await res.json()) as any).error.type).toBe("analytics_unavailable");
+  });
+});
+
+describe("usageDatasetName", () => {
+  it("defaults to the production dataset and accepts a configured identifier", () => {
+    expect(usageDatasetName({})).toBe(USAGE_DATASET);
+    expect(usageDatasetName({ USAGE_DATASET_NAME: "" })).toBe(USAGE_DATASET);
+    expect(usageDatasetName({ USAGE_DATASET_NAME: " other_usage " })).toBe("other_usage");
+  });
+
+  it("rejects anything that is not a plain identifier", () => {
+    for (const bad of ["x; DROP", "a-b", "1abc", "a b", "x".repeat(65)]) {
+      expect(usageDatasetName({ USAGE_DATASET_NAME: bad })).toBe(USAGE_DATASET);
+    }
   });
 });
