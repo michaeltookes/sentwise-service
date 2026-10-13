@@ -70,7 +70,7 @@ access past the 14-day trial.
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, POST /v1/paddle/webhook/sandbox, /admin/margin, /admin/comp, POST /admin/paddle-lane-reset
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin, /admin/comp
   -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
   -> src/comp.ts            layer an admin-granted comp entitlement over the natural state (111) — pure
@@ -83,7 +83,6 @@ src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/inter
   -> src/paddle-management.ts  fresh Paddle billing-management redirects — no URL persistence
   -> src/paddle-plan.ts     in-app plan change: PATCH the Paddle subscription + write the new tier limit (90)
   -> src/paddle-webhook.ts  dispatch signed events to serialized entitlement writes (56c) — no body logging
-  -> src/paddle-env.ts      PADDLE_ENV + @prowlqa.dev -> production or sandbox Paddle lane (123) — pure
 ```
 
 ## API
@@ -117,8 +116,7 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
     "tokenLimit": 8000000,
     "enforcement": "soft",
     "extraPurchased": 0
-  },
-  "billing": { "environment": "production", "checkoutAvailable": true }
+  }
 }
 ```
 
@@ -128,18 +126,6 @@ This read is served from a short-TTL (30s) in-memory per-user cache in front of 
 (S-M1) so it can't be used to hammer Clerk's Backend API. Drafting access is always re-checked fresh
 on `/v1/draft`, so a cached view can only lag account state by at most the TTL — it can never grant
 access. `DELETE /v1/me` always bypasses the cache, and starting the trial invalidates it.
-
-#### `billing` (item 123)
-
-Which Paddle checkout the app must open for this account. Production accounts always get
-`{ "environment": "production", "checkoutAvailable": true }` and the app uses its embedded live
-token and price ids. When `PADDLE_ENV=sandbox` **and** the account's primary email is
-`@prowlqa.dev` it returns
-`{ "environment": "sandbox", "checkoutAvailable": true, "clientSideToken": "test_…", "prices": { "starter", "pro", "unlimited" } }`,
-or `{ "environment": "sandbox", "checkoutAvailable": false }` if any sandbox value (API key,
-webhook secret, client token, three distinct price ids) is missing; that account's
-`POST /v1/paddle/checkout` then returns `503 sandbox_checkout_unavailable`.
-See [Paddle sandbox lane](#paddle-sandbox-lane-123).
 
 #### `subscription` (item 73)
 
@@ -684,98 +670,6 @@ Paddle secrets (below); (2) in the Paddle dashboard creates a **notification des
 `PADDLE_UNLIMITED_PRICE_ID` to the live subscription price ids. End-to-end verification (a real
 Paddle test event → a real entitlement write) happens then.
 
-### Paddle sandbox lane (123)
-
-One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddle-env.ts`):
-
-| `PADDLE_ENV`                     | Who starts sandbox checkouts                              | Live destination     | Sandbox destination                                              |
-| -------------------------------- | --------------------------------------------------------- | -------------------- | ---------------------------------------------------------------- |
-| `production` (committed default) | nobody; `PADDLE_API_BASE` is forced to the live base      | `/v1/paddle/webhook` | open only while `PADDLE_SANDBOX_WEBHOOK_SECRET` is set, else 404 |
-| `sandbox`                        | accounts whose primary email is exactly `@prowlqa.dev`    | `/v1/paddle/webhook` | `/v1/paddle/webhook/sandbox`                                     |
-| unset                            | nobody; legacy behavior (`PADDLE_API_BASE` as configured) | `/v1/paddle/webhook` | as for `production`                                              |
-
-- A sandbox-lane request **replaces** every Paddle value: sandbox API base, `PADDLE_SANDBOX_API_KEY`,
-  `PADDLE_SANDBOX_WEBHOOK_SECRET`, the `PADDLE_SANDBOX_*_PRICE_ID` vars, and a checkout-binding
-  secret of its own. It never falls back to a live key, secret, or price id, and a live-lane request
-  never sees a sandbox one.
-- Each webhook destination verifies with **its own lane's secret only**. A sandbox event is applied
-  only to a QA account or to an account whose stored subscription was itself created in the
-  sandbox, and never overwrites a live subscription that is still in force.
-- **Objects remember their lane.** A checkout reservation made in the sandbox lane and a
-  subscription written by a sandbox webhook carry `paddleEnvironment: "sandbox"`. Work on an
-  existing object (checking or cancelling a pending transaction, manage billing) goes to the lane it
-  was created in, whatever `PADDLE_ENV` says now, so a live transaction is never looked up in the
-  sandbox (and mistaken for gone) or vice versa. A pending checkout from the other lane is cancelled
-  where it lives before a new one is minted.
-- **Lane lock: transitions are refused, not reconciled.** An account's lane is decided by the
-  first billing state it acquires and stored in Clerk `privateMetadata.paddleLane`
-  (`"sandbox" | "production"`). The first checkout takes the lock with a compare-and-set in the
-  account's Durable Object (so two first checkouts spanning an email change can't both win) and
-  mirrors it to Clerk; the first subscription the webhook records also writes it
-  (accounts that predate the key are locked by the lane of their stored subscription). After that,
-  neither `PADDLE_ENV` nor an email change moves the account:
-  - checkout and plan changes from the other lane return `409 billing_lane_locked`, naming the
-    reset route; nothing is reserved or written;
-  - `/v1/me` reports `{ "environment": "<locked lane>", "checkoutAvailable": false }` while the lock
-    conflicts with the lane the account would get today;
-  - a webhook event from the other environment is acknowledged as `{ "ignored": "lane_locked" }`
-    and writes nothing (a finished checkout's reservation is still released);
-  - a non-QA account can never acquire sandbox state.
-- **Leaving a lane:** only the QA-only admin reset below. A sandbox subscription whose lane was
-  closed (or whose account's email left `@prowlqa.dev`) is not a paid plan, and Manage billing still
-  opens the sandbox portal so it can be cancelled.
-- **Paused is live.** A paused Paddle subscription keeps Paddle's raw status (`paddleStatus:
-"paused"`; the display `status` stays `"canceled"`). It blocks a second subscription and a
-  replacement, and a later resume event applies to it.
-- **Replay tombstones.** Whenever an overage ledger is retired, its transaction ids are kept as
-  environment-scoped tombstones in the account's Durable Object, so a redelivered old
-  `transaction.completed` is never credited again.
-- The Worker tells the AccountQuota Durable Object the lane with an internal header (the DO is not
-  reachable from outside the Worker); the Worker is the gate for who enters the sandbox.
-- The lane for state-changing routes (checkout, plan change, manage billing) is read from a fresh
-  Clerk record, never the 30s `/v1/me` display cache, so a just-changed email can't route a
-  mutation to the wrong Paddle environment. Checkout revalidates the lane on every account
-  recheck and cancels a recovered checkout if the email changed lanes. Plan changes validate
-  the lane against the record supplying the subscription identifiers. Billing management resolves
-  both from one record. Production-only deployments need no separate lane lookup.
-- Setup on Paddle's side (sandbox account, catalog, notification destination, test cards) is in the
-  app repo's `docs/billing-qa.md`.
-
-### `POST /admin/paddle-lane-reset` — leave a locked Paddle lane (QA only, item 123)
-
-The only way a QA account leaves its locked Paddle lane. Same `ADMIN_TOKEN` gate as `/admin/comp`
-(404 when unset, 401 otherwise). Only `@prowlqa.dev` accounts can be reset (anything else is
-`403 paddle_lane_reset_forbidden` and writes nothing); an account with a **live** subscription in
-force is refused with `409 billing_live_subscription_active` (the route never touches live Paddle).
-
-A live record written before Paddle's raw status was kept (status `"canceled"`, no
-`paddleStatus`) is checked at Paddle first; if it is still active or paused, or Paddle can't say,
-the reset is refused with 409 (`billing_live_subscription_active` / `billing_live_status_unknown`).
-
-It cancels the account's sandbox subscription at the Paddle sandbox immediately (failure is
-`502 subscription_cancel_failed` and nothing is cleared), then, serialized in the account's Durable
-Object:
-
-- re-validates the account (no live subscription in force, same subscription as the one cancelled)
-  and aborts with `409 billing_live_subscription_active` / `409 billing_state_changed` if it changed;
-- settles each pending checkout: it is released only when its transaction is confirmed cancelled or
-  in a safe terminal state (completed); an unknown outcome is `502 transaction_cancel_failed` with
-  nothing cleared, and a checkout still being created is `409 billing_checkout_pending`;
-- retires the overage ledger while keeping replay tombstones, and clears the Clerk subscription
-  record, the Paddle-written quota fields, and the lane lock;
-- bumps the account's reset generation (`paddleLaneGeneration`) and retires the cancelled
-  subscription id (`paddleRetiredSubscriptionIds`). Checkouts stamp the generation into their
-  Paddle custom data, and the webhook ignores (`{ "ignored": "lane_reset" }`) any event for a
-  retired subscription or from a checkout made before the current generation, so the reset's own
-  delayed cancellation webhook can never restore what it cleared. The response lists `previousLane`, `canceledSubscriptionId`, `releasedReservations` and
-  `retiredCredits`.
-
-```bash
-curl -s -X POST https://sentwise-inference.sentwise-service.workers.dev/admin/paddle-lane-reset \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -H "content-type: application/json" \
-  -d '{"email":"qa-buyer@prowlqa.dev"}'
-```
-
 ## Development
 
 Requires Node ≥ 22 (`.nvmrc`) and a Cloudflare account (Wrangler 4).
@@ -827,19 +721,6 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   vars.** Required when `PADDLE_API_BASE` points at the live API. Sandbox/local mode defaults to the
   sandbox ids committed in `src/config.ts`; live mode fails closed instead of accepting sandbox ids,
   and the three tier ids are treated as an all-or-nothing set.
-- `PADDLE_ENV` — **123, public var.** `production` (committed) or `sandbox`; see
-  [Paddle sandbox lane](#paddle-sandbox-lane-123).
-- `PADDLE_SANDBOX_API_KEY` / `PADDLE_SANDBOX_WEBHOOK_SECRET` — **123, secrets.** The Paddle
-  **sandbox** API key and the sandbox notification-destination secret for
-  `/v1/paddle/webhook/sandbox`. Used only for `@prowlqa.dev` accounts while `PADDLE_ENV=sandbox`.
-  `PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET` is optional (defaults to the sandbox webhook secret).
-  Set `PADDLE_SANDBOX_CHECKOUT_BINDING_PREVIOUS_SECRET` to the old binding secret during rotation
-  so pending sandbox checkouts remain verifiable. This accepts old checkout bindings only; webhook
-  signatures still require the current sandbox webhook secret. Live binding secrets are never used
-  to verify sandbox checkouts.
-- `PADDLE_SANDBOX_CLIENT_TOKEN` / `PADDLE_SANDBOX_STARTER_PRICE_ID` / `PADDLE_SANDBOX_PRO_PRICE_ID` /
-  `PADDLE_SANDBOX_UNLIMITED_PRICE_ID` (optional `PADDLE_SANDBOX_EXTRA_DRAFTS_PRICE_ID`) — **123,
-  public vars.** The sandbox Paddle.js token and catalog, returned to QA accounts on `/v1/me`.
 
 Push them to the Worker with (values are read from the file, never printed):
 
@@ -852,9 +733,6 @@ grep '^CF_ANALYTICS_API_TOKEN=' ~/.config/sentwise-service/.env | cut -d= -f2- |
 # 56c checkout + licensing:
 grep '^PADDLE_WEBHOOK_SECRET=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_WEBHOOK_SECRET
 grep '^PADDLE_API_KEY='        ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_API_KEY
-# 123 sandbox QA lane (sandbox credentials only):
-grep '^PADDLE_SANDBOX_API_KEY='        ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_SANDBOX_API_KEY
-grep '^PADDLE_SANDBOX_WEBHOOK_SECRET=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_SANDBOX_WEBHOOK_SECRET
 ```
 
 > ⚠️ **Empty-secret gotcha.** `wrangler secret put` reads the value from stdin. The piped form above

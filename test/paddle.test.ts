@@ -622,20 +622,7 @@ describe("buildSubscriptionRecord", () => {
       updatedAt: "2026-09-05T10:00:00.000Z", // from occurred_at
       paddleOccurredAt: "2026-09-05T10:00:00.000Z",
       lastEventId: "evt_sub_1",
-      paddleStatus: "active",
     });
-  });
-
-  it("keeps Paddle's raw paused status next to the canonical display status", () => {
-    const event = parsePaddleEvent(
-      subscriptionEventBody({ status: "paused" }).replace(
-        '"subscription.created"',
-        '"subscription.paused"',
-      ),
-    )!;
-    const record = buildSubscriptionRecord(event, "pro", PRO_PRICE, Date.now());
-    expect(record.status).toBe("canceled");
-    expect(record.paddleStatus).toBe("paused");
   });
 
   it("falls back updatedAt to now when occurred_at is absent", () => {

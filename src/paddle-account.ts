@@ -1,6 +1,5 @@
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { PADDLE_LANE_GENERATION_CUSTOM_DATA_KEY, storedPaddleLane } from "./paddle-env";
 import {
   clerkUserIdFromCustomData,
   computeHmacSha256Hex,
@@ -29,19 +28,14 @@ export async function buildPaddleCheckoutCustomData(
   userId: string,
   env: Env,
   checkoutReservationId?: string,
-  laneGeneration = 0,
 ): Promise<Record<string, string>> {
-  const customData: Record<string, string> = {
+  const customData = {
     clerkUserId: userId,
     sentwiseCheckoutBinding: await paddleCheckoutBindingToken(userId, env),
   };
-  if (checkoutReservationId) customData.sentwiseCheckoutReservationId = checkoutReservationId;
-  // 123: the account's admin-reset generation, so events from checkouts made
-  // before a reset can never restore the state that reset cleared.
-  if (laneGeneration > 0) {
-    customData[PADDLE_LANE_GENERATION_CUSTOM_DATA_KEY] = String(laneGeneration);
-  }
-  return customData;
+  return checkoutReservationId
+    ? { ...customData, sentwiseCheckoutReservationId: checkoutReservationId }
+    : customData;
 }
 
 export async function paddleCheckoutBindingMatchesEvent(
@@ -79,37 +73,6 @@ export function storedPaddleSubscriptionId(rawSubscription: unknown): string | n
   const subscription = asRecord(rawSubscription);
   const id = subscription?.paddleSubscriptionId;
   return typeof id === "string" && id !== "" ? id : null;
-}
-
-/** Live subscriptions that must be managed before a sandbox subscription can replace them. */
-export function hasLivePaddleSubscriptionInForce(rawSubscription: unknown): boolean {
-  const subscription = asRecord(rawSubscription);
-  return (
-    storedPaddleLane(subscription) === "production" &&
-    storedPaddleSubscriptionId(subscription) !== null &&
-    isPaddleSubscriptionInForce(subscription)
-  );
-}
-
-/**
- * Paddle's own status for a stored subscription record. The record's `status`
- * is the canonical display status (a paused subscription shows as "canceled");
- * `paddleStatus` keeps Paddle's raw value so a paused subscription is never
- * mistaken for a closed one.
- */
-export function storedPaddleRawStatus(rawSubscription: unknown): string | null {
-  const subscription = asRecord(rawSubscription);
-  const raw = subscription?.paddleStatus;
-  if (typeof raw === "string" && raw !== "") return raw;
-  const status = subscription?.status;
-  return typeof status === "string" && status !== "" ? status : null;
-}
-
-/** Active, trialing, past due, or PAUSED: the subscription still exists at Paddle. */
-export function isPaddleSubscriptionInForce(rawSubscription: unknown): boolean {
-  return ["active", "trialing", "past_due", "paused"].includes(
-    String(storedPaddleRawStatus(rawSubscription)),
-  );
 }
 
 export function supersededPaddleSubscriptionIds(rawSubscription: unknown): string[] {

@@ -11,7 +11,7 @@
 // webhook body.
 
 import { createClerkClient } from "@clerk/backend";
-import { isClerkNotFoundError, primaryEmail } from "./auth";
+import { isClerkNotFoundError } from "./auth";
 import {
   DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES,
   DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC,
@@ -25,7 +25,6 @@ import {
   paddleCustomerMatchesStoredAccount,
 } from "./paddle-account";
 import { fetchPaddleCustomerEmail, fetchPaddleTransactionSnapshot } from "./paddle-api";
-import { isQaAccountEmail, storedPaddleLane } from "./paddle-env";
 import {
   adjustedTransactionIdFromEvent,
   adjustmentIdFromEvent,
@@ -46,8 +45,6 @@ import {
   type PaddleEvent,
 } from "./paddle";
 import {
-  quotaReleasePaddleOverageCheckout,
-  quotaReleasePaddleSubscriptionCheckout,
   quotaPeekPaddleOverageCheckout,
   quotaRecordPaddleOverage,
   quotaRecordPaddleOverageReversal,
@@ -106,20 +103,6 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
     return ack({ mapped: false });
   }
 
-  // 123 — a sandbox event may only touch a QA account, or an account whose
-  // stored subscription was itself created in the sandbox (so a stranded test
-  // subscription still receives its cancellation after the email changes). A
-  // correctly signed sandbox event for any other account is dropped, so a
-  // sandbox purchase can never grant (or revoke) a real customer's entitlement.
-  if (env.PADDLE_LANE === "sandbox" && !(await sandboxEventMayTouch(clerk, userId))) {
-    // The entitlement is dropped, but the account's own pending sandbox
-    // checkout must not stay reserved forever (a QA buyer whose email changed
-    // before the webhook arrived would otherwise be blocked from every later
-    // checkout and from deleting the account).
-    await releaseDroppedSandboxReservation(event, env, userId);
-    return ack({ mapped: false });
-  }
-
   if (isSubscriptionEvent(event.eventType)) {
     return await applySubscriptionEvent(event, env, userId);
   }
@@ -133,54 +116,6 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 // ---------------------------------------------------------------------------
 // Subscription lifecycle → subscription record + per-tier quota limit.
 // ---------------------------------------------------------------------------
-
-async function releaseDroppedSandboxReservation(
-  event: PaddleEvent,
-  env: Env,
-  userId: string,
-): Promise<void> {
-  const customData = event.data.custom_data;
-  const record =
-    typeof customData === "object" && customData !== null
-      ? (customData as Record<string, unknown>)
-      : null;
-  const reservationId =
-    typeof record?.sentwiseCheckoutReservationId === "string"
-      ? record.sentwiseCheckoutReservationId.trim()
-      : "";
-  if (!reservationId) return;
-  // Only the account's own server-minted sandbox checkout can be released.
-  if (!(await paddleCheckoutBindingMatchesEvent(event, userId, env))) return;
-  // Each release is a no-op unless the stored reservation has this id.
-  try {
-    await quotaReleasePaddleSubscriptionCheckout(env, userId, reservationId);
-    await quotaReleasePaddleOverageCheckout(env, userId, reservationId);
-  } catch (err) {
-    // A deleted (or deleting) account has no reservation left to release.
-    if (
-      err instanceof ApiError &&
-      (err.type === "account_deleted" || err.type === "account_deletion_in_progress")
-    ) {
-      return;
-    }
-    throw err;
-  }
-}
-
-async function sandboxEventMayTouch(
-  clerk: ReturnType<typeof createClerkClient>,
-  userId: string,
-): Promise<boolean> {
-  try {
-    const user = await clerk.users.getUser(userId);
-    if (isQaAccountEmail(primaryEmail(user))) return true;
-    const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
-    return storedPaddleLane(meta.subscription) === "sandbox";
-  } catch (err) {
-    if (isClerkNotFoundError(err)) return false;
-    throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
-  }
-}
 
 async function applySubscriptionEvent(
   event: PaddleEvent,

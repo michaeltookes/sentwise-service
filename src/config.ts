@@ -72,30 +72,6 @@ export interface Env {
   PADDLE_PRO_PRICE_ID?: string; // live/sandbox subscription price id for pro
   PADDLE_UNLIMITED_PRICE_ID?: string; // live/sandbox subscription price id for unlimited
 
-  // 123 — Paddle sandbox lane (QA purchase path). PADDLE_ENV is "production" or
-  // "sandbox". "production" is the normal live config above, for everyone.
-  // "sandbox" ENABLES the sandbox lane: accounts whose primary email is
-  // @prowlqa.dev are served entirely from the PADDLE_SANDBOX_* values below
-  // (sandbox API base, key, webhook secret, price ids); every other account stays
-  // on the production values. Unset keeps the legacy behavior (PADDLE_API_BASE as
-  // configured, no sandbox lane). Resolution lives in src/paddle-env.ts.
-  PADDLE_ENV?: string;
-  PADDLE_SANDBOX_API_KEY?: string; // SECRET — sandbox API key (pdl_sdbx_…)
-  PADDLE_SANDBOX_WEBHOOK_SECRET?: string; // SECRET — sandbox notification-destination secret
-  PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET?: string; // SECRET (optional) — defaults to the sandbox webhook secret
-  PADDLE_SANDBOX_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // SECRET (optional) — previous sandbox binding secret accepted during rotations
-  PADDLE_SANDBOX_CLIENT_TOKEN?: string; // public sandbox Paddle.js client-side token (test_…)
-  PADDLE_SANDBOX_STARTER_PRICE_ID?: string; // sandbox price id for starter
-  PADDLE_SANDBOX_PRO_PRICE_ID?: string; // sandbox price id for pro
-  PADDLE_SANDBOX_UNLIMITED_PRICE_ID?: string; // sandbox price id for unlimited
-  PADDLE_SANDBOX_EXTRA_DRAFTS_PRICE_ID?: string; // sandbox one-time overage price id (optional)
-  // Internal, never configured: the lane a request was resolved to. Set only by
-  // paddleEnvForLane() and forwarded to the AccountQuota DO as a header.
-  PADDLE_LANE?: "sandbox" | "production";
-  // Internal, never configured: the unresolved Worker env behind a lane env, so
-  // work on a stored object can re-route to the lane it was created in.
-  PADDLE_ROOT_ENV?: Env;
-
   // 56c — per-tier monthly draft limits (the marketed caps; owner decision
   // 2026-09-16). Tunable per-deploy without shipping a new binary, and written
   // per-account into Clerk `privateMetadata.quota.monthlyDraftLimit` by the

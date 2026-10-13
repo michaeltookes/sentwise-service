@@ -2,7 +2,6 @@
 // Object (56b). Keeps the DO-plumbing out of src/index.ts.
 
 import type { Env, PaidPlan } from "./config";
-import { PADDLE_LANE_HEADER } from "./paddle-env";
 import { ApiError, type ErrorExtra } from "./errors";
 import type { ResolvedLimits, WindowState } from "./metering";
 import type { InterestTopic } from "./interest";
@@ -67,8 +66,6 @@ export type PaddleSubscriptionResult =
   | { idempotent: true }
   | { stale: true }
   | { ignored: "unknown_price" }
-  | { ignored: "lane_locked" }
-  | { ignored: "lane_reset" }
   | { mapped: false };
 export type PaddlePlanChangeEntitlementResult =
   { applied: true; status: string | null } | { stale: true; status: string | null };
@@ -85,7 +82,6 @@ export type PaddleSubscriptionCheckoutReservationResult =
       quantity?: number;
       extraDrafts?: number;
       customerId?: string;
-      paddleEnvironment?: "sandbox";
     };
 export type PaddleOverageCheckoutReservationResult = PaddleSubscriptionCheckoutReservationResult;
 export type PaddleSubscriptionCheckoutPeekResult =
@@ -102,12 +98,7 @@ async function call<T>(env: Env, userId: string, op: string, body: unknown): Pro
   const stub = env.ACCOUNT_QUOTA.get(id);
   const res = await stub.fetch(`https://account-quota.internal${op}`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      // 123 — the DO rebuilds the same lane env from this; it re-checks
-      // PADDLE_ENV itself, so the header alone can never enable the sandbox.
-      ...(env.PADDLE_LANE === "sandbox" ? { [PADDLE_LANE_HEADER]: "sandbox" } : {}),
-    },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -443,27 +434,4 @@ export function quotaFinishAccountDeletion(
  */
 export function quotaWipe(env: Env, userId: string): Promise<{ wiped: boolean; deleted: boolean }> {
   return call<{ wiped: boolean; deleted: boolean }>(env, userId, "/wipe", {});
-}
-
-/** 123 — QA-only admin lane reset (serialized in the account's DO). */
-export function quotaResetPaddleLane(
-  env: Env,
-  userId: string,
-  body: { lane: "sandbox" | "production"; expectedSubscriptionId: string | null },
-): Promise<{ releasedReservations: number; retiredCredits: number }> {
-  return call<{ releasedReservations: number; retiredCredits: number }>(
-    env,
-    userId,
-    "/paddle-lane-reset",
-    body,
-  );
-}
-
-/** 123 — compare-and-set the account's Paddle lane lock (serialized in its DO). */
-export function quotaLockPaddleLane(
-  env: Env,
-  userId: string,
-  body: { lane: "sandbox" | "production" },
-): Promise<{ locked: "sandbox" | "production" }> {
-  return call<{ locked: "sandbox" | "production" }>(env, userId, "/paddle-lane-lock", body);
 }

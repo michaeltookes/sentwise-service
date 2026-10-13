@@ -16,10 +16,6 @@ export default defineConfig({
           PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET: "old_checkout_binding_secret",
           PADDLE_API_KEY: "pdl_apikey",
           PADDLE_API_BASE: "https://sandbox-api.paddle.com",
-          // Legacy Paddle mode (no sandbox lane) so the suite keeps exercising
-          // PADDLE_API_BASE as configured; the lane is covered by
-          // test/paddle-sandbox-lane.test.ts with explicit envs.
-          PADDLE_ENV: "",
           // Deployed wrangler.jsonc now carries the LIVE tier price ids (item
           // 74); blank them here so tests exercise the sandbox fallback map.
           PADDLE_STARTER_PRICE_ID: "",

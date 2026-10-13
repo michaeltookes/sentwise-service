@@ -9,12 +9,10 @@ import {
 } from "./paddle-api";
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { paddleEnvForStoredLane, storedPaddleLane, type PaddleLane } from "./paddle-env";
 
 interface PaddleBillingAccount {
   subscriptionId: string;
   customerId: string | null;
-  lane: PaddleLane;
 }
 
 export async function handlePaddleManageBilling(
@@ -32,11 +30,7 @@ export async function handlePaddleManageBilling(
     );
   }
 
-  const url = await resolveManagementUrl(
-    paddleEnvForStoredLane(env, account.lane),
-    account,
-    action,
-  );
+  const url = await resolveManagementUrl(env, account, action);
   if (!url) {
     throw new ApiError(
       502,
@@ -103,17 +97,13 @@ async function loadPaddleBillingAccount(
   env: Env,
 ): Promise<PaddleBillingAccount | null> {
   try {
-    // Resolve the lane and identifiers from one fresh record so a webhook or
-    // cached display cannot mix sandbox identifiers with the live API.
-    const user = await getCachedClerkUser(env, userId, { useCache: false });
+    // S-M1: pure read of billing metadata — cache-eligible (short TTL). A stale
+    // subscription id only affects which portal URL we mint, never entitlement.
+    const user = await getCachedClerkUser(env, userId, { useCache: true });
     const meta = user.privateMetadata ?? {};
     const subscriptionId = storedPaddleSubscriptionId(meta.subscription);
     if (!subscriptionId) return null;
-    return {
-      subscriptionId,
-      customerId: storedPaddleCustomerId(meta.subscription),
-      lane: storedPaddleLane(meta.subscription),
-    };
+    return { subscriptionId, customerId: storedPaddleCustomerId(meta.subscription) };
   } catch (err) {
     if (isClerkNotFoundError(err)) return null;
     throw new ApiError(502, "account_lookup_failed", "Could not load your account.");
