@@ -4,6 +4,7 @@ import { planForPrice, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import { storedPaddleSubscriptionId } from "./paddle-account";
 import { changePaddleSubscription } from "./paddle-api";
+import { laneOfEnv, storedPaddleLane } from "./paddle-env";
 import {
   quotaRecordPaddlePlanChange,
   type PaddlePlanChangeEntitlementResult,
@@ -44,6 +45,18 @@ export async function handlePaddleChangePlan(
 
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
   const account = await loadChangePlanAccount(clerk, userId);
+
+  // 123: the subscription id below comes from THIS fresh snapshot, so check the
+  // lane against the same snapshot — a webhook that swapped the subscription
+  // between environments after the lane was resolved must never send one
+  // environment's id to the other's API.
+  if (storedPaddleLane(account.subscription) !== laneOfEnv(env)) {
+    throw new ApiError(
+      409,
+      "billing_environment_mismatch",
+      "This subscription can't be changed here. Manage it from billing.",
+    );
+  }
 
   const subscriptionId = storedPaddleSubscriptionId(account.subscription);
   if (!subscriptionId) {

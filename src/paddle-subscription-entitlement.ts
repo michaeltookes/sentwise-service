@@ -163,12 +163,11 @@ export async function recordPaddleSubscriptionInClerk(
       supersededSubscriptionIds,
       isDifferentSubscription ? existingSubscriptionId : null,
     ),
-    // Clerk deep-merges metadata: explicitly remove a prior sandbox stamp.
-    ...(incomingLane === "sandbox"
-      ? { paddleEnvironment: "sandbox" as const }
-      : crossLane
-        ? { paddleEnvironment: null }
-        : {}),
+    // 123: Clerk deep-merges metadata, so the environment is written explicitly
+    // on EVERY subscription write: "sandbox" for sandbox events, null (which
+    // Clerk treats as "remove the key") for live ones. A live write can never
+    // leave an older sandbox stamp next to live ids.
+    paddleEnvironment: incomingLane === "sandbox" ? ("sandbox" as const) : null,
   };
   const existingQuota = asRecord(meta.quota) ?? {};
   const quota = quotaForSubscriptionStatus(
