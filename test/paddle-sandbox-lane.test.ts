@@ -1047,3 +1047,68 @@ describe("incomplete sandbox lane fails closed (P3)", () => {
     expect((await postCheckout(incompleteEnv(), LIVE_PRICES.pro)).status).toBe(200);
   });
 });
+
+describe("mutation lanes come from a fresh Clerk read (PR #36 review)", () => {
+  async function warmDisplayCache(email: string, env: Env): Promise<void> {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(email, { subscription: null }));
+    await getMe(env); // GET /v1/me populates the 30s display cache
+  }
+
+  it("a cached production email does not keep a now-QA account on live checkout", async () => {
+    const env = laneEnv("sandbox");
+    await warmDisplayCache(CUSTOMER_EMAIL, env);
+    // The primary email changes to the QA domain after the cached read.
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: null }));
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(transactionCreated()),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postCheckout(env, SANDBOX_PRICES.pro);
+
+    expect(res.status).toBe(200);
+    expect(urlOf(fetchMock.mock.calls[0][0])).toBe(`${PADDLE_SANDBOX_API_BASE}/transactions`);
+    for (const call of fetchMock.mock.calls) {
+      expect(urlOf(call[0])).not.toContain("://api.paddle.com");
+    }
+  });
+
+  it("a cached QA email does not send a now-production account to the sandbox", async () => {
+    const env = laneEnv("sandbox");
+    await warmDisplayCache(QA_EMAIL, env);
+    mocks.getUser.mockResolvedValue(userWithEmail(CUSTOMER_EMAIL, { subscription: null }));
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(transactionCreated()),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    // A sandbox price is refused: the fresh lane is production.
+    expect((await postCheckout(env, SANDBOX_PRICES.pro)).status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect((await postCheckout(env, LIVE_PRICES.pro)).status).toBe(200);
+    expect(urlOf(fetchMock.mock.calls[0][0])).toBe(`${PADDLE_LIVE_API_BASE}/transactions`);
+  });
+
+  it("a cached QA email does not decide a plan change's lane", async () => {
+    const env = laneEnv("sandbox");
+    await warmDisplayCache(QA_EMAIL, env);
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(CUSTOMER_EMAIL, { subscription: SANDBOX_SUBSCRIPTION }),
+    );
+    const fetchMock = vi.fn(() => Promise.resolve(new Response("{}")));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      new Request("https://sentwise-inference.test/v1/paddle/change-plan", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: SANDBOX_PRICES.unlimited }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(409);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

@@ -715,7 +715,10 @@ One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddl
   still blocks a sandbox checkout.
 - The Worker tells the AccountQuota Durable Object the lane with an internal header (the DO is not
   reachable from outside the Worker); the Worker is the gate for who enters the sandbox.
-- Production-only deployments (lane off, no sandbox credentials) make no extra Clerk lookups.
+- The lane for state-changing routes (checkout, plan change, manage billing) is read from a fresh
+  Clerk record, never the 30s `/v1/me` display cache, so a just-changed email can't route a
+  mutation to the wrong Paddle environment. Production-only deployments (lane off, no sandbox
+  credentials) skip that lookup entirely.
 - Setup on Paddle's side (sandbox account, catalog, notification destination, test cards) is in the
   app repo's `docs/billing-qa.md`.
 
