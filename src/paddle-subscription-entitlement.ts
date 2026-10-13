@@ -2,10 +2,9 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { hasPaddleTierPriceConfig, type Env, type PaidPlan } from "./config";
 import { laneOfEnv, storedPaddleLane } from "./paddle-env";
-
-const LIVE_RECORD_IN_FORCE = new Set(["active", "trialing", "past_due", "paused"]);
 import { ApiError } from "./errors";
 import {
+  hasLivePaddleSubscriptionInForce,
   paddleCheckoutBindingMatchesEvent,
   paddleCustomerMatchesAccount,
   storedPaddleSubscriptionId,
@@ -117,12 +116,7 @@ export async function recordPaddleSubscriptionInClerk(
   const incomingLane = laneOfEnv(env);
   const existingLane = storedPaddleLane(existingSub);
   const crossLane = !!existingSub && existingLane !== incomingLane;
-  if (
-    crossLane &&
-    incomingLane === "sandbox" &&
-    storedPaddleSubscriptionId(existingSub) !== null &&
-    LIVE_RECORD_IN_FORCE.has(String(existingSub?.status))
-  ) {
+  if (crossLane && incomingLane === "sandbox" && hasLivePaddleSubscriptionInForce(existingSub)) {
     return { stale: true };
   }
 
@@ -171,9 +165,7 @@ export async function recordPaddleSubscriptionInClerk(
   };
   const existingQuota = asRecord(meta.quota) ?? {};
   const quota = quotaForSubscriptionStatus(
-    crossLane && existingLane === "sandbox"
-      ? quotaWithoutSandboxOverage(existingQuota)
-      : existingQuota,
+    crossLane ? quotaWithoutPaddleOverage(existingQuota) : existingQuota,
     record.status,
     mapped.quotaPlan,
     env,
@@ -337,9 +329,9 @@ function isPaddleSubscriptionStatus(value: unknown): value is string {
   );
 }
 
-function quotaWithoutSandboxOverage(quota: Record<string, unknown>): Record<string, unknown> {
+function quotaWithoutPaddleOverage(quota: Record<string, unknown>): Record<string, unknown> {
   // Null removes keys under Clerk's deep merge. Omitting them would retain the
-  // test purchases and their replay state as live entitlement.
+  // other environment's purchases and replay state as current entitlement.
   return {
     ...quota,
     extraDrafts: null,

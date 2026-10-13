@@ -712,13 +712,18 @@ One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddl
   webhook-written tier caps and extras are ignored, a live checkout isn't blocked by it (and never
   receives its sandbox customer id), and plan changes return `409 billing_environment_mismatch`.
   Manage billing still opens the sandbox portal so it can be cancelled. A live subscription in force
-  still blocks a sandbox checkout.
+  (including a paused subscription) still blocks a sandbox checkout.
+- Replacing a subscription with one from the other environment clears overage credits and their
+  transaction/replay metadata, so purchases from either environment cannot become entitlement in
+  the other. Account quota settings unrelated to overage are preserved.
 - The Worker tells the AccountQuota Durable Object the lane with an internal header (the DO is not
   reachable from outside the Worker); the Worker is the gate for who enters the sandbox.
 - The lane for state-changing routes (checkout, plan change, manage billing) is read from a fresh
   Clerk record, never the 30s `/v1/me` display cache, so a just-changed email can't route a
-  mutation to the wrong Paddle environment. Production-only deployments (lane off, no sandbox
-  credentials) skip that lookup entirely.
+  mutation to the wrong Paddle environment. Checkout revalidates the lane on every account
+  recheck and cancels a recovered checkout if the email changed lanes. Plan changes validate
+  the lane against the record supplying the subscription identifiers. Billing management resolves
+  both from one record. Production-only deployments need no separate lane lookup.
 - Setup on Paddle's side (sandbox account, catalog, notification destination, test cards) is in the
   app repo's `docs/billing-qa.md`.
 
@@ -779,6 +784,10 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   **sandbox** API key and the sandbox notification-destination secret for
   `/v1/paddle/webhook/sandbox`. Used only for `@prowlqa.dev` accounts while `PADDLE_ENV=sandbox`.
   `PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET` is optional (defaults to the sandbox webhook secret).
+  Set `PADDLE_SANDBOX_CHECKOUT_BINDING_PREVIOUS_SECRET` to the old binding secret during rotation
+  so pending sandbox checkouts remain verifiable. This accepts old checkout bindings only; webhook
+  signatures still require the current sandbox webhook secret. Live binding secrets are never used
+  to verify sandbox checkouts.
 - `PADDLE_SANDBOX_CLIENT_TOKEN` / `PADDLE_SANDBOX_STARTER_PRICE_ID` / `PADDLE_SANDBOX_PRO_PRICE_ID` /
   `PADDLE_SANDBOX_UNLIMITED_PRICE_ID` (optional `PADDLE_SANDBOX_EXTRA_DRAFTS_PRICE_ID`) — **123,
   public vars.** The sandbox Paddle.js token and catalog, returned to QA accounts on `/v1/me`.

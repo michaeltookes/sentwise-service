@@ -83,6 +83,7 @@ export interface Env {
   PADDLE_SANDBOX_API_KEY?: string; // SECRET — sandbox API key (pdl_sdbx_…)
   PADDLE_SANDBOX_WEBHOOK_SECRET?: string; // SECRET — sandbox notification-destination secret
   PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET?: string; // SECRET (optional) — defaults to the sandbox webhook secret
+  PADDLE_SANDBOX_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // SECRET (optional) — previous sandbox binding secret accepted during rotations
   PADDLE_SANDBOX_CLIENT_TOKEN?: string; // public sandbox Paddle.js client-side token (test_…)
   PADDLE_SANDBOX_STARTER_PRICE_ID?: string; // sandbox price id for starter
   PADDLE_SANDBOX_PRO_PRICE_ID?: string; // sandbox price id for pro

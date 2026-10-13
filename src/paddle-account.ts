@@ -1,5 +1,6 @@
 import { type Env } from "./config";
 import { ApiError } from "./errors";
+import { storedPaddleLane } from "./paddle-env";
 import {
   clerkUserIdFromCustomData,
   computeHmacSha256Hex,
@@ -73,6 +74,16 @@ export function storedPaddleSubscriptionId(rawSubscription: unknown): string | n
   const subscription = asRecord(rawSubscription);
   const id = subscription?.paddleSubscriptionId;
   return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** Live subscriptions that must be managed before a sandbox subscription can replace them. */
+export function hasLivePaddleSubscriptionInForce(rawSubscription: unknown): boolean {
+  const subscription = asRecord(rawSubscription);
+  return (
+    storedPaddleLane(subscription) === "production" &&
+    storedPaddleSubscriptionId(subscription) !== null &&
+    ["active", "trialing", "past_due", "paused"].includes(String(subscription?.status))
+  );
 }
 
 export function supersededPaddleSubscriptionIds(rawSubscription: unknown): string[] {

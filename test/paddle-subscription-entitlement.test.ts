@@ -237,6 +237,32 @@ describe("the environment marker survives Clerk's deep merge correctly", () => {
     };
   }
 
+  it("applies an initial sandbox subscription signed with the previous binding secret", async () => {
+    metadata.subscription = null;
+    const previousSecret = "old_sandbox_binding";
+    const rotatedEnv = paddleEnvForStoredLane(
+      {
+        ...sandboxEnv.PADDLE_ROOT_ENV!,
+        PADDLE_SANDBOX_CHECKOUT_BINDING_PREVIOUS_SECRET: previousSecret,
+      },
+      "sandbox",
+    );
+    const event = await sandboxEvent();
+    event.data.custom_data = await buildPaddleCheckoutCustomData("user_lane", {
+      ...sandboxEnv,
+      PADDLE_CHECKOUT_BINDING_SECRET: previousSecret,
+    });
+
+    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, rotatedEnv)).toEqual({
+      applied: true,
+    });
+    expect(metadata.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_sandbox_new",
+      paddleEnvironment: "sandbox",
+      status: "active",
+    });
+  });
+
   it("every live write sends an explicit null marker, even within the live lane", async () => {
     delete metadata.subscription.paddleEnvironment;
     metadata.subscription.paddleSubscriptionId = "sub_live";
@@ -289,6 +315,14 @@ describe("the environment marker survives Clerk's deep merge correctly", () => {
       paddleCustomerId: "ctm_sandbox_new",
       paddleEnvironment: "sandbox",
     });
+    // The existing quota represents the canceled live plan's paid overage.
+    // None of its credits, transaction ledger, or replay state become sandbox data.
+    expect(metadata.quota).toEqual({
+      monthlyDraftLimit: 120,
+      monthlyTokenLimit: 500000,
+      enforcement: "hard",
+    });
+    expect(metadata.unrelated).toEqual({ keep: true });
     for (const call of vi.mocked(fetch).mock.calls) {
       const target = call[0];
       const url = typeof target === "string" || target instanceof URL ? String(target) : target.url;

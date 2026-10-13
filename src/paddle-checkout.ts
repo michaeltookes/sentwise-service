@@ -1,11 +1,19 @@
 import { createClerkClient } from "@clerk/backend";
-import { isClerkNotFoundError } from "./auth";
+import { isClerkNotFoundError, primaryEmail } from "./auth";
 import { DEFAULT_EXTRA_DRAFTS_PER_UNIT, planForPrice, type Env } from "./config";
 import { ApiError } from "./errors";
-import { laneOfEnv, paddleEnvForStoredLane, storedPaddleLane, type PaddleLane } from "./paddle-env";
+import {
+  laneOfEnv,
+  paddleEnvForStoredLane,
+  paddleLaneForEmail,
+  rootPaddleEnv,
+  storedPaddleLane,
+  type PaddleLane,
+} from "./paddle-env";
 import { numFrom } from "./metering";
 import {
   buildPaddleCheckoutCustomData,
+  hasLivePaddleSubscriptionInForce,
   paddleCheckoutBindingMatchesCustomData,
   storedPaddleCustomerId,
   storedPaddleSubscriptionId,
@@ -64,7 +72,7 @@ export async function handlePaddleCheckout(
   let account = await loadCheckoutAccount(userId, env);
   let customerId = storedPaddleCustomerId(account.subscription);
 
-  assertCheckoutEligible(body, account.subscription, customerId);
+  assertCheckoutEligible(body, account.subscription, customerId, env);
 
   const checkoutReservationId = crypto.randomUUID();
   const existingTransaction = await reserveCheckout(
@@ -78,7 +86,7 @@ export async function handlePaddleCheckout(
     try {
       account = await loadCheckoutAccount(userId, env);
       customerId = storedPaddleCustomerId(account.subscription);
-      assertCheckoutEligible(body, account.subscription, customerId);
+      assertCheckoutEligible(body, account.subscription, customerId, env);
     } catch (err) {
       if (isCheckoutEligibilityError(err)) {
         await cancelPaddleTransaction(env, existingTransaction.transactionId);
@@ -92,7 +100,7 @@ export async function handlePaddleCheckout(
   try {
     account = await loadCheckoutAccount(userId, env);
     customerId = storedPaddleCustomerId(account.subscription);
-    assertCheckoutEligible(body, account.subscription, customerId);
+    assertCheckoutEligible(body, account.subscription, customerId, env);
   } catch (err) {
     await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
       () => undefined,
@@ -151,8 +159,13 @@ function assertCheckoutEligible(
   body: CheckoutRequestBody,
   rawSubscription: unknown,
   customerId: string | null,
+  env: Env,
 ): void {
-  if (body.kind === "subscription" && hasActivePaddleSubscription(rawSubscription)) {
+  if (
+    body.kind === "subscription" &&
+    (hasActivePaddleSubscription(rawSubscription) ||
+      (laneOfEnv(env) === "sandbox" && hasLivePaddleSubscriptionInForce(rawSubscription)))
+  ) {
     throw new ApiError(
       409,
       "billing_subscription_active",
@@ -550,7 +563,8 @@ function isCheckoutEligibilityError(err: unknown): boolean {
     err instanceof ApiError &&
     (err.type === "billing_subscription_active" ||
       err.type === "billing_subscription_required" ||
-      err.type === "billing_customer_not_bound")
+      err.type === "billing_customer_not_bound" ||
+      err.type === "billing_environment_mismatch")
   );
 }
 
@@ -618,10 +632,9 @@ async function parseCheckoutRequest(request: Request, env: Env): Promise<Checkou
 
 async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscription: unknown }> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  let user;
   try {
-    const user = await clerk.users.getUser(userId);
-    const meta = asRecord(user.privateMetadata) ?? {};
-    return { subscription: subscriptionForCheckoutLane(meta.subscription, laneOfEnv(env)) };
+    user = await clerk.users.getUser(userId);
   } catch (err) {
     if (isClerkNotFoundError(err)) {
       throw new ApiError(404, "account_not_found", "Your account could not be found.");
@@ -632,13 +645,24 @@ async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscrip
       "Could not load your account. Please try again.",
     );
   }
+  // Every account read (including the post-reservation/recovery recheck) must
+  // still agree with the chosen lane before its customer ID can be used.
+  if (paddleLaneForEmail(rootPaddleEnv(env), primaryEmail(user)) !== laneOfEnv(env)) {
+    throw new ApiError(
+      409,
+      "billing_environment_mismatch",
+      "Your billing environment changed. Refresh and try again.",
+    );
+  }
+  const meta = asRecord(user.privateMetadata) ?? {};
+  return { subscription: subscriptionForCheckoutLane(meta.subscription, laneOfEnv(env)) };
 }
 
 /**
  * 123 — the stored subscription as seen by a checkout in `lane`. A record from
  * the same lane is used as-is. A stranded SANDBOX record seen from production is
  * ignored (it is not a paid plan and its customer id doesn't exist live). A LIVE
- * record seen from the sandbox still blocks a second subscription while active,
+ * record seen from the sandbox still blocks a second subscription while active or paused,
  * but its live customer id is never sent to the sandbox API.
  */
 function subscriptionForCheckoutLane(raw: unknown, lane: PaddleLane): unknown {
