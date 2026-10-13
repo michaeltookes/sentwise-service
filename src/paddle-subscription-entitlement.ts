@@ -2,8 +2,11 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { hasPaddleTierPriceConfig, type Env, type PaidPlan } from "./config";
 import {
+  customDataLaneGeneration,
   explicitPaddleLaneLock,
   laneOfEnv,
+  paddleLaneGeneration,
+  retiredPaddleSubscriptionIds,
   lockedPaddleLane,
   PADDLE_LANE_METADATA_KEY,
   storedPaddleLane,
@@ -50,6 +53,7 @@ export type PaddleSubscriptionResult =
   | { stale: true }
   | { ignored: "unknown_price" }
   | { ignored: "lane_locked" }
+  | { ignored: "lane_reset" }
   | { mapped: false };
 
 export function parsePaddleSubscriptionBody(body: unknown): PaddleSubscriptionBody {
@@ -112,6 +116,13 @@ export async function recordPaddleSubscriptionInClerk(
   await syncPaddleOverageLedgerLane(ledgerStore, meta.subscription);
   if (!(await subscriptionEventMatchesAccount(userId, user, meta, body.event, env))) {
     return { mapped: false };
+  }
+
+  // 123 — admin reset: an event for a subscription the reset retired, or from
+  // a checkout made before the account's current reset generation, can never
+  // restore the state the reset cleared (nor re-lock the account's lane).
+  if (isFromBeforePaddleLaneReset(meta, body.event)) {
+    return { ignored: "lane_reset" };
   }
 
   // 123 — lane lock: an account locked to one Paddle environment never takes
@@ -212,6 +223,18 @@ export async function recordPaddleSubscriptionInClerk(
 
   await syncPaddleOverageLedgerLane(ledgerStore, record);
   return { applied: true };
+}
+
+function isFromBeforePaddleLaneReset(meta: Record<string, unknown>, event: PaddleEvent): boolean {
+  const incomingId = subscriptionIdFromEvent(event);
+  if (incomingId && retiredPaddleSubscriptionIds(meta).includes(incomingId)) return true;
+  const generation = paddleLaneGeneration(meta);
+  if (generation === 0) return false;
+  const eventGeneration = customDataLaneGeneration(event.data.custom_data);
+  if (eventGeneration !== null) return eventGeneration < generation;
+  // No generation in the event's custom data: only accept it for the
+  // subscription already established after the reset.
+  return !incomingId || incomingId !== storedPaddleSubscriptionId(asRecord(meta.subscription));
 }
 
 function planMappingForSubscriptionEvent(

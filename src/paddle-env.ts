@@ -306,3 +306,36 @@ export function paddleLaneLockedError(locked: PaddleLane): ApiError {
     `This account's billing is locked to the Paddle ${locked} environment. An admin must reset it (POST ${PADDLE_LANE_RESET_ROUTE}) before it can use the other environment.`,
   );
 }
+
+// ---------------------------------------------------------------------------
+// 123 — admin reset generation. Every reset bumps the account's generation and
+// retires the subscription it cancelled; checkouts stamp the generation into
+// their Paddle custom data, so events from before a reset can never restore
+// the state the reset cleared.
+// ---------------------------------------------------------------------------
+
+export const PADDLE_LANE_GENERATION_METADATA_KEY = "paddleLaneGeneration";
+export const PADDLE_RETIRED_SUBSCRIPTIONS_METADATA_KEY = "paddleRetiredSubscriptionIds";
+export const PADDLE_LANE_GENERATION_CUSTOM_DATA_KEY = "sentwiseLaneGeneration";
+
+/** The account's current reset generation (0 before any reset). */
+export function paddleLaneGeneration(meta: Record<string, unknown>): number {
+  const value = meta[PADDLE_LANE_GENERATION_METADATA_KEY];
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+/** Subscription ids retired (cancelled) by an admin reset. */
+export function retiredPaddleSubscriptionIds(meta: Record<string, unknown>): string[] {
+  const value = meta[PADDLE_RETIRED_SUBSCRIPTIONS_METADATA_KEY];
+  return Array.isArray(value)
+    ? value.filter((id): id is string => typeof id === "string" && id !== "")
+    : [];
+}
+
+/** The reset generation a checkout stamped into its custom data, or null if none. */
+export function customDataLaneGeneration(customData: unknown): number | null {
+  if (typeof customData !== "object" || customData === null) return null;
+  const raw = (customData as Record<string, unknown>)[PADDLE_LANE_GENERATION_CUSTOM_DATA_KEY];
+  const value = typeof raw === "string" ? Number(raw) : typeof raw === "number" ? raw : NaN;
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}

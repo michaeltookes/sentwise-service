@@ -22,14 +22,27 @@ import { invalidateClerkUser } from "./clerk-user-cache";
 import type { Env } from "./config";
 import { ApiError, jsonError } from "./errors";
 import { hasLivePaddleSubscriptionInForce, storedPaddleSubscriptionId } from "./paddle-account";
-import { cancelPaddleSubscriptionImmediately } from "./paddle-api";
+import {
+  cancelPaddleSubscriptionImmediately,
+  cancelPaddleTransaction,
+  fetchPaddleSubscriptionSnapshot,
+  fetchPaddleTransactionSnapshot,
+  findPaddleCheckoutTransactionByReservationId,
+} from "./paddle-api";
 import {
   isQaAccountEmail,
   lockedPaddleLane,
+  PADDLE_LANE_GENERATION_METADATA_KEY,
+  PADDLE_LANE_METADATA_KEY,
+  PADDLE_RETIRED_SUBSCRIPTIONS_METADATA_KEY,
   paddleEnvForStoredLane,
+  paddleLaneGeneration,
+  retiredPaddleSubscriptionIds,
   storedPaddleLane,
   type PaddleLane,
 } from "./paddle-env";
+
+const RETIRED_SUBSCRIPTION_LIMIT = 100;
 import { quotaResetPaddleLane } from "./quota-client";
 
 export async function handleAdminPaddleLaneReset(request: Request, env: Env): Promise<Response> {
@@ -52,13 +65,8 @@ export async function handleAdminPaddleLaneReset(request: Request, env: Env): Pr
       );
     }
     const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
-    if (hasLivePaddleSubscriptionInForce(meta.subscription)) {
-      throw new ApiError(
-        409,
-        "billing_live_subscription_active",
-        "This account has a live Paddle subscription in force. Cancel it in Paddle first.",
-      );
-    }
+    assertNoLiveSubscriptionInForce(meta);
+    await assertLegacyLiveRecordIsClosed(meta, env);
 
     const previousLane = lockedPaddleLane(meta);
     let canceledSubscriptionId: string | null = null;
@@ -71,8 +79,11 @@ export async function handleAdminPaddleLaneReset(request: Request, env: Env): Pr
       canceledSubscriptionId = subscriptionId;
     }
 
+    // The DO re-validates all of this inside its serialized operation and
+    // aborts with 409 if the account changed in between.
     const result = await quotaResetPaddleLane(env, userId, {
       lane: previousLane ?? "sandbox",
+      expectedSubscriptionId: subscriptionId,
     });
     invalidateClerkUser(userId);
     return Response.json({
@@ -136,14 +147,83 @@ export async function loadPaddleResetMetadata(
   }
 }
 
-export async function clearPaddleLaneInClerk(userId: string, env: Env): Promise<void> {
+/** No live subscription in force (paused included) — the reset never touches live Paddle. */
+export function assertNoLiveSubscriptionInForce(meta: Record<string, unknown>): void {
+  if (hasLivePaddleSubscriptionInForce(meta.subscription)) {
+    throw new ApiError(
+      409,
+      "billing_live_subscription_active",
+      "This account has a live Paddle subscription in force. Cancel it in Paddle first.",
+    );
+  }
+}
+
+/**
+ * Records written before Paddle's raw status was kept stored a PAUSED live
+ * subscription as status "canceled" with no paddleStatus. For such a record,
+ * ask Paddle before allowing the reset; fail closed if Paddle can't say.
+ */
+async function assertLegacyLiveRecordIsClosed(
+  meta: Record<string, unknown>,
+  env: Env,
+): Promise<void> {
+  const sub = meta.subscription;
+  const subscriptionId = storedPaddleSubscriptionId(sub);
+  if (!subscriptionId || storedPaddleLane(sub) !== "production") return;
+  const record = sub as Record<string, unknown>;
+  if (typeof record.paddleStatus === "string" && record.paddleStatus !== "") return;
+  let status: string | null;
+  try {
+    const snapshot = await fetchPaddleSubscriptionSnapshot(
+      paddleEnvForStoredLane(env, "production"),
+      subscriptionId,
+    );
+    status = snapshot?.status ?? null;
+  } catch {
+    status = null;
+  }
+  if (status === null) {
+    throw new ApiError(
+      409,
+      "billing_live_status_unknown",
+      "Could not confirm the live Paddle subscription is closed. Try again later.",
+    );
+  }
+  if (["active", "trialing", "past_due", "paused"].includes(status)) {
+    throw new ApiError(
+      409,
+      "billing_live_subscription_active",
+      "This account has a live Paddle subscription in force. Cancel it in Paddle first.",
+    );
+  }
+}
+
+/**
+ * Clear the account's Paddle state and lane lock, bump its reset generation,
+ * and retire the subscription the reset cancelled, so a delayed webhook for it
+ * (or for any checkout made before this reset) can never restore the state.
+ */
+export async function clearPaddleLaneInClerk(
+  userId: string,
+  env: Env,
+  meta: Record<string, unknown>,
+  retiredSubscriptionId: string | null,
+): Promise<void> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  const retired = [
+    ...new Set([
+      ...retiredPaddleSubscriptionIds(meta),
+      ...(retiredSubscriptionId ? [retiredSubscriptionId] : []),
+    ]),
+  ].slice(-RETIRED_SUBSCRIPTION_LIMIT);
   try {
     await clerk.users.updateUserMetadata(userId, {
       privateMetadata: {
         subscription: null,
         paddleLane: null,
         quota: PADDLE_QUOTA_FIELDS_CLEARED,
+        [PADDLE_LANE_GENERATION_METADATA_KEY]: paddleLaneGeneration(meta) + 1,
+        [PADDLE_RETIRED_SUBSCRIPTIONS_METADATA_KEY]: retired,
       },
     });
   } catch (err) {
@@ -156,9 +236,133 @@ export async function clearPaddleLaneInClerk(userId: string, env: Env): Promise<
 
 export interface PaddleLaneResetBody {
   lane: PaddleLane;
+  expectedSubscriptionId: string | null;
 }
 
 export function parsePaddleLaneResetBody(body: unknown): PaddleLaneResetBody {
+  const record = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+  const lane = record.lane;
+  if (lane !== "sandbox" && lane !== "production") {
+    throw new ApiError(400, "invalid_request", "A lane is required.");
+  }
+  const expected = record.expectedSubscriptionId;
+  return {
+    lane,
+    expectedSubscriptionId: typeof expected === "string" && expected !== "" ? expected : null,
+  };
+}
+
+/**
+ * Inside the serialized reset: the account must still be the one the admin
+ * handler validated — no live subscription in force and the same subscription
+ * selected for cancellation — or the reset aborts with nothing cleared.
+ */
+export function assertResetStillValid(
+  meta: Record<string, unknown>,
+  expectedSubscriptionId: string | null,
+): void {
+  assertNoLiveSubscriptionInForce(meta);
+  if ((storedPaddleSubscriptionId(meta.subscription) ?? null) !== expectedSubscriptionId) {
+    throw new ApiError(
+      409,
+      "billing_state_changed",
+      "The account's billing changed during the reset. Nothing was cleared; try again.",
+    );
+  }
+}
+
+const SAFE_TERMINAL_TRANSACTION_STATUSES = new Set(["canceled", "completed", "billed", "paid"]);
+
+/**
+ * Settle one pending checkout for the reset: it may be released only once its
+ * transaction is confirmed cancelled or in a safe terminal state (nothing left
+ * to pay). An unknown outcome throws 502 so nothing is cleared.
+ */
+export async function settleReservationForReset(
+  env: Env,
+  reservation: {
+    reservationId: string;
+    createdAt: number;
+    expiresAt?: number;
+    transactionId?: string;
+    customerId?: string;
+    paddleEnvironment?: string;
+  },
+  now: number,
+): Promise<void> {
+  const laneEnv = paddleEnvForStoredLane(env, storedPaddleLane(reservation));
+  let transactionId = reservation.transactionId;
+  if (!transactionId) {
+    if (reservation.expiresAt === undefined || reservation.expiresAt > now) {
+      throw new ApiError(
+        409,
+        "billing_checkout_pending",
+        "A checkout is being created for this account. Try the reset again shortly.",
+      );
+    }
+    let found;
+    try {
+      found = await findPaddleCheckoutTransactionByReservationId(laneEnv, {
+        reservationId: reservation.reservationId,
+        createdAt: reservation.createdAt,
+        expiresAt: reservation.expiresAt,
+        customerId: reservation.customerId,
+      });
+    } catch {
+      throw resetCancelUnknownError();
+    }
+    if (!found) return; // no transaction was ever created
+    if (found.status && SAFE_TERMINAL_TRANSACTION_STATUSES.has(found.status)) return;
+    transactionId = found.transactionId;
+  }
+  try {
+    await cancelPaddleTransaction(laneEnv, transactionId);
+    return;
+  } catch {
+    // fall through: find out what state the transaction is actually in
+  }
+  let status: string | null | undefined;
+  try {
+    const snapshot = await fetchPaddleTransactionSnapshot(laneEnv, transactionId);
+    status = snapshot === null ? "missing" : snapshot.status;
+  } catch {
+    throw resetCancelUnknownError();
+  }
+  if (status === "missing" || (status && SAFE_TERMINAL_TRANSACTION_STATUSES.has(status))) return;
+  throw resetCancelUnknownError();
+}
+
+function resetCancelUnknownError(): ApiError {
+  return new ApiError(
+    502,
+    "transaction_cancel_failed",
+    "Could not confirm a pending checkout was cancelled. Nothing was cleared; try again.",
+  );
+}
+
+/** Durable Object storage key holding the account's lane lock (the CAS source of truth). */
+export const PADDLE_LANE_LOCK_STORAGE_KEY = "paddle_lane_lock";
+
+/** Mirror the lane lock into Clerk (readers: checkout, plan change, /v1/me). */
+export async function writePaddleLaneLockToClerk(
+  userId: string,
+  env: Env,
+  lane: PaddleLane,
+): Promise<void> {
+  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  try {
+    await clerk.users.updateUserMetadata(userId, {
+      privateMetadata: { [PADDLE_LANE_METADATA_KEY]: lane },
+    });
+  } catch (err) {
+    if (isClerkNotFoundError(err)) {
+      throw new ApiError(404, "account_not_found", "Your account could not be found.");
+    }
+    throw new ApiError(502, "checkout_unavailable", "Could not start checkout.");
+  }
+}
+
+export function parsePaddleLaneLockBody(body: unknown): { lane: PaddleLane } {
   const lane =
     typeof body === "object" && body !== null ? (body as Record<string, unknown>).lane : null;
   if (lane !== "sandbox" && lane !== "production") {

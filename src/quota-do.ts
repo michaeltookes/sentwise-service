@@ -58,10 +58,15 @@ import {
   revokePaddleOverageInClerk,
 } from "./paddle-entitlement";
 import {
+  assertResetStillValid,
   clearPaddleLaneInClerk,
   clerkCreditedTransactionIds,
   loadPaddleResetMetadata,
+  PADDLE_LANE_LOCK_STORAGE_KEY,
+  writePaddleLaneLockToClerk,
+  parsePaddleLaneLockBody,
   parsePaddleLaneResetBody,
+  settleReservationForReset,
 } from "./paddle-lane-reset";
 import {
   type PaddleSubscriptionCheckoutPlan,
@@ -74,6 +79,7 @@ import {
 } from "./paddle-plan-entitlement";
 import { cancelPaddleTransaction } from "./paddle-api";
 import {
+  paddleLaneLockedError,
   PADDLE_LANE_HEADER,
   paddleEnvForStoredLane,
   paddleLaneFromHeader,
@@ -283,6 +289,8 @@ export class AccountQuota {
         return this.handlePaddleOverageCheckoutRelease(await request.json<unknown>());
       case "/paddle-lane-reset":
         return this.handlePaddleLaneReset(await request.json<unknown>());
+      case "/paddle-lane-lock":
+        return this.handlePaddleLaneLock(await request.json<unknown>());
       default:
         return new Response("not found", { status: 404 });
     }
@@ -605,38 +613,65 @@ export class AccountQuota {
    */
   private async handlePaddleLaneReset(body: unknown): Promise<Response> {
     try {
-      const { lane } = parsePaddleLaneResetBody(body);
+      const { lane, expectedSubscriptionId } = parsePaddleLaneResetBody(body);
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(async () => {
         const meta = await loadPaddleResetMetadata(userId, this.env);
-        let releasedReservations = 0;
+        // Re-validate inside the serialized operation: a live checkout that
+        // completed after the admin handler looked aborts the reset (409).
+        assertResetStillValid(meta, expectedSubscriptionId);
+        // Settle every pending checkout BEFORE clearing anything: a reservation
+        // is released only on a confirmed cancellation or safe terminal state;
+        // an unknown outcome throws 502 with nothing cleared.
+        const settled: string[] = [];
         for (const key of [
           PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
           PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
         ] as const) {
           const reservation = parsePaddleCheckoutReservation(await this.storage.get<unknown>(key));
           if (!reservation) continue;
-          if (reservation.transactionId) {
-            // Best-effort: a completed transaction can't be cancelled, and the
-            // reservation must be released either way.
-            await cancelPaddleTransaction(
-              paddleEnvForStoredLane(this.env, storedPaddleLane(reservation)),
-              reservation.transactionId,
-            ).catch(() => undefined);
-          }
-          await this.storage.delete(key);
-          releasedReservations += 1;
+          await settleReservationForReset(this.env, reservation, Date.now());
+          settled.push(key);
         }
+        for (const key of settled) await this.storage.delete(key);
+        const releasedReservations = settled.length;
         const retiredCredits = await retireOverageLedgerWithTombstones(
           this.storage,
           lane,
           clerkCreditedTransactionIds(meta),
         );
         await this.storage.delete(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY);
-        await clearPaddleLaneInClerk(userId, this.env);
+        await this.storage.delete(PADDLE_LANE_LOCK_STORAGE_KEY);
+        await clearPaddleLaneInClerk(userId, this.env, meta, expectedSubscriptionId);
         return { releasedReservations, retiredCredits };
       });
       return Response.json(result);
+    } catch (err) {
+      if (err instanceof ApiError) return err.toResponse();
+      throw err;
+    }
+  }
+
+  /** 123 — compare-and-set the lane lock, serialized with every billing write. */
+  private async handlePaddleLaneLock(body: unknown): Promise<Response> {
+    try {
+      const { lane } = parsePaddleLaneLockBody(body);
+      const userId = this.requireUserId();
+      // Compare-and-set in DO storage: the first checkout to get here wins;
+      // a concurrent checkout for the other lane is refused.
+      const existing = await this.storage.transaction(async (txn) => {
+        const current = await txn.get<unknown>(PADDLE_LANE_LOCK_STORAGE_KEY);
+        if (current === "sandbox" || current === "production") return current;
+        await txn.put(PADDLE_LANE_LOCK_STORAGE_KEY, lane);
+        return null;
+      });
+      if (existing !== null && existing !== lane) {
+        return paddleLaneLockedError(existing).toResponse();
+      }
+      await this.enqueuePrivateMetadataWrite(() =>
+        writePaddleLaneLockToClerk(userId, this.env, lane),
+      );
+      return Response.json({ locked: lane });
     } catch (err) {
       if (err instanceof ApiError) return err.toResponse();
       throw err;

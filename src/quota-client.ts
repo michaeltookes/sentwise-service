@@ -68,6 +68,7 @@ export type PaddleSubscriptionResult =
   | { stale: true }
   | { ignored: "unknown_price" }
   | { ignored: "lane_locked" }
+  | { ignored: "lane_reset" }
   | { mapped: false };
 export type PaddlePlanChangeEntitlementResult =
   { applied: true; status: string | null } | { stale: true; status: string | null };
@@ -448,7 +449,7 @@ export function quotaWipe(env: Env, userId: string): Promise<{ wiped: boolean; d
 export function quotaResetPaddleLane(
   env: Env,
   userId: string,
-  body: { lane: "sandbox" | "production" },
+  body: { lane: "sandbox" | "production"; expectedSubscriptionId: string | null },
 ): Promise<{ releasedReservations: number; retiredCredits: number }> {
   return call<{ releasedReservations: number; retiredCredits: number }>(
     env,
@@ -456,4 +457,13 @@ export function quotaResetPaddleLane(
     "/paddle-lane-reset",
     body,
   );
+}
+
+/** 123 — compare-and-set the account's Paddle lane lock (serialized in its DO). */
+export function quotaLockPaddleLane(
+  env: Env,
+  userId: string,
+  body: { lane: "sandbox" | "production" },
+): Promise<{ locked: "sandbox" | "production" }> {
+  return call<{ locked: "sandbox" | "production" }>(env, userId, "/paddle-lane-lock", body);
 }

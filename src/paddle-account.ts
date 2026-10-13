@@ -1,6 +1,6 @@
 import { type Env } from "./config";
 import { ApiError } from "./errors";
-import { storedPaddleLane } from "./paddle-env";
+import { PADDLE_LANE_GENERATION_CUSTOM_DATA_KEY, storedPaddleLane } from "./paddle-env";
 import {
   clerkUserIdFromCustomData,
   computeHmacSha256Hex,
@@ -29,14 +29,19 @@ export async function buildPaddleCheckoutCustomData(
   userId: string,
   env: Env,
   checkoutReservationId?: string,
+  laneGeneration = 0,
 ): Promise<Record<string, string>> {
-  const customData = {
+  const customData: Record<string, string> = {
     clerkUserId: userId,
     sentwiseCheckoutBinding: await paddleCheckoutBindingToken(userId, env),
   };
-  return checkoutReservationId
-    ? { ...customData, sentwiseCheckoutReservationId: checkoutReservationId }
-    : customData;
+  if (checkoutReservationId) customData.sentwiseCheckoutReservationId = checkoutReservationId;
+  // 123: the account's admin-reset generation, so events from checkouts made
+  // before a reset can never restore the state that reset cleared.
+  if (laneGeneration > 0) {
+    customData[PADDLE_LANE_GENERATION_CUSTOM_DATA_KEY] = String(laneGeneration);
+  }
+  return customData;
 }
 
 export async function paddleCheckoutBindingMatchesEvent(

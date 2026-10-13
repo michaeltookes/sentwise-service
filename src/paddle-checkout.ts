@@ -6,8 +6,8 @@ import { invalidateClerkUser } from "./clerk-user-cache";
 import {
   explicitPaddleLaneLock,
   laneOfEnv,
-  PADDLE_LANE_METADATA_KEY,
   paddleLaneDecision,
+  paddleLaneGeneration,
   paddleLaneLockedError,
   paddleEnvForStoredLane,
   paddleLaneForEmail,
@@ -33,6 +33,7 @@ import {
   PaddleCheckoutCreationOutcomeUnknownError,
 } from "./paddle-api";
 import {
+  quotaLockPaddleLane,
   quotaPeekPaddleOverageCheckout,
   quotaPeekPaddleSubscriptionCheckout,
   quotaRecordPaddleOverageCheckout,
@@ -80,6 +81,7 @@ export async function handlePaddleCheckout(
 
   assertCheckoutEligible(body, account.subscription, customerId, env);
   if (!account.laneLockWritten) await writePaddleLaneLock(userId, env);
+  const laneGeneration = account.laneGeneration;
 
   const checkoutReservationId = crypto.randomUUID();
   const existingTransaction = await reserveCheckout(
@@ -120,7 +122,12 @@ export async function handlePaddleCheckout(
     transaction = await createPaddleCheckoutTransaction(env, {
       priceId: body.priceId,
       quantity: body.quantity,
-      customData: await buildPaddleCheckoutCustomData(userId, env, checkoutReservationId),
+      customData: await buildPaddleCheckoutCustomData(
+        userId,
+        env,
+        checkoutReservationId,
+        laneGeneration,
+      ),
       customerId,
     });
   } catch (err) {
@@ -575,7 +582,9 @@ function isCheckoutEligibilityError(err: unknown): boolean {
     (err.type === "billing_subscription_active" ||
       err.type === "billing_subscription_required" ||
       err.type === "billing_customer_not_bound" ||
-      err.type === "billing_environment_mismatch")
+      err.type === "billing_environment_mismatch" ||
+      // 123: a lane lock persisted while a recovered checkout was pending.
+      err.type === "billing_lane_locked")
   );
 }
 
@@ -644,7 +653,7 @@ async function parseCheckoutRequest(request: Request, env: Env): Promise<Checkou
 async function loadCheckoutAccount(
   userId: string,
   env: Env,
-): Promise<{ subscription: unknown; laneLockWritten: boolean }> {
+): Promise<{ subscription: unknown; laneLockWritten: boolean; laneGeneration: number }> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
   let user;
   try {
@@ -678,25 +687,18 @@ async function loadCheckoutAccount(
   return {
     subscription: subscriptionForCheckoutLane(meta.subscription, laneOfEnv(env)),
     laneLockWritten: explicitPaddleLaneLock(meta) !== null,
+    laneGeneration: paddleLaneGeneration(meta),
   };
 }
 
 /**
- * 123 — the first checkout locks the account's lane. Clerk deep-merges
- * privateMetadata, so writing only this key can't clobber a concurrent write.
+ * 123 — the first checkout locks the account's lane. The fresh lock check and
+ * the conditional write run together inside the account's serialized
+ * AccountQuota operation (compare-and-set), so two first checkouts spanning an
+ * email change can never both see "no lock" and overwrite each other.
  */
 async function writePaddleLaneLock(userId: string, env: Env): Promise<void> {
-  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
-  try {
-    await clerk.users.updateUserMetadata(userId, {
-      privateMetadata: { [PADDLE_LANE_METADATA_KEY]: laneOfEnv(env) },
-    });
-  } catch (err) {
-    if (isClerkNotFoundError(err)) {
-      throw new ApiError(404, "account_not_found", "Your account could not be found.");
-    }
-    throw new ApiError(502, "checkout_unavailable", "Could not start checkout.");
-  }
+  await quotaLockPaddleLane(env, userId, { lane: laneOfEnv(env) });
   invalidateClerkUser(userId);
 }
 
