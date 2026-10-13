@@ -1,10 +1,10 @@
 import { createClerkClient } from "@clerk/backend";
-import { isClerkNotFoundError } from "./auth";
+import { isClerkNotFoundError, primaryEmail } from "./auth";
 import { planForPrice, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import { storedPaddleSubscriptionId } from "./paddle-account";
 import { changePaddleSubscription } from "./paddle-api";
-import { laneOfEnv, storedPaddleLane } from "./paddle-env";
+import { laneOfEnv, paddleLaneForEmail, rootPaddleEnv, storedPaddleLane } from "./paddle-env";
 import {
   quotaRecordPaddlePlanChange,
   type PaddlePlanChangeEntitlementResult,
@@ -47,10 +47,12 @@ export async function handlePaddleChangePlan(
   const account = await loadChangePlanAccount(clerk, userId);
 
   // 123: the subscription id below comes from THIS fresh snapshot, so check the
-  // lane against the same snapshot — a webhook that swapped the subscription
-  // between environments after the lane was resolved must never send one
-  // environment's id to the other's API.
-  if (storedPaddleLane(account.subscription) !== laneOfEnv(env)) {
+  // stored lane and current email against the same snapshot. Neither a webhook
+  // replacement nor an email change may send this mutation to the wrong lane.
+  if (
+    storedPaddleLane(account.subscription) !== laneOfEnv(env) ||
+    paddleLaneForEmail(rootPaddleEnv(env), account.email) !== laneOfEnv(env)
+  ) {
     throw new ApiError(
       409,
       "billing_environment_mismatch",
@@ -132,11 +134,11 @@ async function parseChangePlanRequest(request: Request): Promise<string> {
 async function loadChangePlanAccount(
   clerk: ReturnType<typeof createClerkClient>,
   userId: string,
-): Promise<{ subscription: unknown }> {
+): Promise<{ subscription: unknown; email: string | null }> {
   try {
     const user = await clerk.users.getUser(userId);
     const meta = asRecord(user.privateMetadata) ?? {};
-    return { subscription: meta.subscription };
+    return { subscription: meta.subscription, email: primaryEmail(user) };
   } catch (err) {
     if (isClerkNotFoundError(err)) {
       throw new ApiError(404, "account_not_found", "Your account could not be found.");

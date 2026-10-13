@@ -8,6 +8,7 @@ import {
   windowStartUtc,
 } from "./metering";
 import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
+import { storedPaddleLane } from "./paddle-env";
 import type { OverageAdjustmentAction } from "./paddle";
 
 const PROCESSED_OVERAGE_EVENT_ID_LIMIT = 100;
@@ -19,6 +20,7 @@ export const PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX = "paddle_overage_credit:"
 export const PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY = "paddle_overage_pending_reversals";
 export const PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX =
   "paddle_overage_pending_reversal:";
+export const PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY = "paddle_overage_ledger_lane";
 
 export interface PaddleOverageLedgerStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -224,6 +226,7 @@ export async function recordPaddleOverageInClerk(
   }
 
   const existingQuota = asRecord(meta.quota) ?? {};
+  await syncPaddleOverageLedgerLane(ledgerStore, meta.subscription);
   const processedIds = processedOverageEventIds(existingQuota);
   if (processedIds.includes(body.eventId)) {
     const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
@@ -385,6 +388,7 @@ export async function revokePaddleOverageInClerk(
   }
 
   const existingQuota = asRecord(meta.quota) ?? {};
+  await syncPaddleOverageLedgerLane(ledgerStore, meta.subscription);
   const processedAdjustmentIds = processedOverageAdjustmentIds(existingQuota);
   if (processedAdjustmentIds.includes(body.adjustmentId)) {
     const currentWindowStart = currentExtraDraftsWindowStart(existingQuota);
@@ -1273,6 +1277,25 @@ function overageCreditAdjustmentAmountEntries(
 
 function uniqueIdList(ids: string[]): string[] {
   return [...new Set(ids.filter((id) => id !== ""))];
+}
+
+/** Called within AccountQuota's serialized metadata writes, before using a ledger. */
+export async function syncPaddleOverageLedgerLane(
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+  subscription: unknown,
+): Promise<void> {
+  if (!ledgerStore) return;
+  const lane = storedPaddleLane(subscription);
+  const previousLane = await ledgerStore.get(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY);
+  if (previousLane === lane) return;
+  if (previousLane !== undefined) {
+    await saveOverageCredits(ledgerStore, []);
+    await savePendingOverageReversals(ledgerStore, []);
+  }
+  // Existing, unmarked ledgers belong to the current Clerk subscription. Keep
+  // the old marker until BOTH ledgers are cleared so an interrupted reset is
+  // retried before any purchase or refund can use the previous lane's state.
+  await ledgerStore.put(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY, lane);
 }
 
 async function loadOverageCredits(

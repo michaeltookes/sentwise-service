@@ -11,6 +11,7 @@ import {
   supersededPaddleSubscriptionIds,
 } from "./paddle-account";
 import { fetchPaddleSubscriptionSnapshot } from "./paddle-api";
+import { syncPaddleOverageLedgerLane, type PaddleOverageLedgerStore } from "./paddle-entitlement";
 import {
   buildSubscriptionRecord,
   customerIdFromEvent,
@@ -84,6 +85,7 @@ export async function recordPaddleSubscriptionInClerk(
   userId: string,
   body: PaddleSubscriptionBody,
   env: Env,
+  ledgerStore?: PaddleOverageLedgerStore,
 ): Promise<PaddleSubscriptionResult> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
@@ -96,6 +98,10 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const meta = user.privateMetadata ?? {};
+  // Establish the old lane before updating Clerk. If Clerk succeeds but the
+  // ledger reset fails, the next subscription/purchase/refund repairs it from
+  // the freshly read subscription, including an idempotent webhook retry.
+  await syncPaddleOverageLedgerLane(ledgerStore, meta.subscription);
   if (!(await subscriptionEventMatchesAccount(userId, user, meta, body.event, env))) {
     return { mapped: false };
   }
@@ -180,6 +186,7 @@ export async function recordPaddleSubscriptionInClerk(
     throw new ApiError(502, "entitlement_write_failed", "Could not record the subscription.");
   }
 
+  await syncPaddleOverageLedgerLane(ledgerStore, record);
   return { applied: true };
 }
 

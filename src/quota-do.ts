@@ -559,7 +559,12 @@ export class AccountQuota {
       const userId = this.requireUserId();
       const result = await this.enqueuePrivateMetadataWrite(async () => {
         const checkoutPlan = await this.paddleSubscriptionCheckoutPlanForEvent(parsed.event);
-        return recordPaddleSubscriptionInClerk(userId, { ...parsed, checkoutPlan }, env);
+        return recordPaddleSubscriptionInClerk(
+          userId,
+          { ...parsed, checkoutPlan },
+          env,
+          this.storage,
+        );
       });
       if ("applied" in result || "idempotent" in result) {
         await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
