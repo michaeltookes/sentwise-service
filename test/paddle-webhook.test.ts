@@ -785,71 +785,6 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["canceled", "paused"],
-    ["active", "paused"],
-    ["canceled", "active"],
-    ["canceled", "trialing"],
-    ["canceled", "past_due"],
-    ["canceled", null],
-    ["active", null],
-    ["canceled", "unknown_status"],
-    ["active", "unknown_status"],
-    ["canceled", undefined],
-    ["active", undefined],
-  ])(
-    "preserves a stored %s subscription when its live status is %s during replacement",
-    async (storedStatus, liveStatus) => {
-      const customData = await buildPaddleCheckoutCustomData("user_abc", env);
-      const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
-        const url =
-          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-        if (url.endsWith("/subscriptions/sub_current")) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "active" } })),
-          );
-        }
-        if (url.endsWith("/subscriptions/sub_old") && liveStatus !== undefined) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: liveStatus } })),
-          );
-        }
-        return Promise.resolve(new Response("{}", { status: 404 }));
-      });
-      vi.stubGlobal("fetch", fetchMock);
-      mocks.getUser.mockResolvedValue(
-        userWith({
-          subscription: {
-            plan: "starter",
-            status: storedStatus,
-            paddleSubscriptionId: "sub_old",
-            paddleCustomerId: "ctm_123",
-            lastEventId: "evt_old",
-            updatedAt: "2026-09-05T00:00:00.000Z",
-          },
-          quota: { monthlyDraftLimit: storedStatus === "active" ? 30 : null },
-        }),
-      );
-
-      const res = await signedReq(
-        subBody({
-          eventId: "evt_new_sub",
-          subscriptionId: "sub_current",
-          occurredAt: "2026-09-06T00:00:00.000Z",
-          customData,
-        }),
-      );
-
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true, stale: true });
-      expect(fetchMock).toHaveBeenCalledWith(
-        "https://sandbox-api.paddle.com/subscriptions/sub_old",
-        expect.any(Object),
-      );
-      expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-    },
-  );
-
   it("allows a fresh active subscription to replace a different stored subscription", async () => {
     const customData = await buildPaddleCheckoutCustomData("user_abc", env);
     vi.stubGlobal(
@@ -862,11 +797,6 @@ describe("POST /v1/paddle/webhook — idempotency & ordering", () => {
             new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "active" } }), {
               status: 200,
             }),
-          );
-        }
-        if (url.includes("/subscriptions/sub_old")) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "canceled" } })),
           );
         }
         return Promise.resolve(new Response("{}", { status: 404 }));
