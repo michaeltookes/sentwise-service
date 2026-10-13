@@ -7,7 +7,8 @@
 // DoS).
 //
 // Scope (deliberately narrow): only the pure-READ, hammer-able request paths use
-// the cache — GET /v1/me and GET /v1/paddle/manage-billing (`useCache: true`).
+// the cache — GET /v1/me (`useCache: true`). Billing management reads fresh so
+// portal links target the current subscription.
 // POST /v1/draft is protected by the rate-limit reorder instead and reads fresh;
 // DELETE /v1/me and every read-modify-write entitlement path read fresh so a
 // concurrent write is never lost.
