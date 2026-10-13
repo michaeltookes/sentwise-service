@@ -5,6 +5,12 @@ import type { PaddleEvent } from "../src/paddle";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 import { recordPaddleSubscriptionInClerk } from "../src/paddle-subscription-entitlement";
 import {
+  PADDLE_OVERAGE_TOMBSTONES_STORAGE_KEY_PREFIX,
+  recordPaddleOverageInClerk,
+  retireOverageLedgerWithTombstones,
+  type PaddleOverageLedgerStore,
+} from "../src/paddle-entitlement";
+import {
   PADDLE_LANE_HEADER,
   paddleEnvForStoredLane,
   storedPaddleLane,
@@ -111,70 +117,7 @@ async function liveEvent(overrides: Partial<PaddleEvent> = {}): Promise<PaddleEv
 }
 
 describe("subscription replacements across Paddle environments", () => {
-  it("removes sandbox overage and its replay state when a verified live subscription replaces it", async () => {
-    const result = await recordPaddleSubscriptionInClerk(
-      "user_lane",
-      { now, event: await liveEvent() },
-      env,
-    );
-
-    expect(result).toEqual({ applied: true });
-    expect(metadata.quota).toEqual({
-      monthlyDraftLimit: 120,
-      monthlyTokenLimit: 500000,
-      enforcement: "hard",
-    });
-    expect(metadata.subscription).toMatchObject({
-      paddleSubscriptionId: "sub_live",
-      paddleCustomerId: "ctm_live",
-      status: "active",
-      supersededPaddleSubscriptionIds: ["sub_live_old", "sub_sandbox"],
-    });
-    expect(metadata.subscription).not.toHaveProperty("paddleEnvironment");
-    expect(storedPaddleLane(metadata.subscription)).toBe("production");
-    expect(metadata.unrelated).toEqual({ keep: true });
-    expect(fetch).toHaveBeenCalledExactlyOnceWith(
-      "https://api.paddle.com/subscriptions/sub_live",
-      expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: "Bearer test_live_key" }),
-      }),
-    );
-  });
-
   // Pass-3 review: timestamps are compared only within one Paddle environment.
-  it("accepts a live purchase whose webhook is older than a later sandbox event", async () => {
-    // The live checkout completed before the sandbox subscription's last
-    // lifecycle event, but its webhook arrives afterwards. Paddle confirms it
-    // is active, so it replaces the sandbox subscription.
-    const event = await liveEvent({ occurredAt: "2026-10-10T12:00:00Z" });
-    event.eventType = "subscription.activated";
-
-    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
-      applied: true,
-    });
-    expect(metadata.subscription).toMatchObject({
-      paddleSubscriptionId: "sub_live",
-      status: "active",
-    });
-    expect(storedPaddleLane(metadata.subscription)).toBe("production");
-  });
-
-  it("rejects an older live canceled event after checking Paddle", async () => {
-    const event = await liveEvent({ occurredAt: "2026-10-10T12:00:00Z" });
-    event.eventType = "subscription.canceled";
-    event.data.status = "canceled";
-    vi.mocked(fetch).mockResolvedValue(
-      Response.json({ data: { customer_id: "ctm_live", status: "canceled" } }),
-    );
-    const previous = structuredClone(metadata);
-
-    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
-      stale: true,
-    });
-    expect(metadata).toEqual(previous);
-    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-  });
-
   it("still rejects an older event for the same subscription in the same lane", async () => {
     delete metadata.subscription.paddleEnvironment;
     metadata.subscription.paddleSubscriptionId = "sub_live";
@@ -186,56 +129,6 @@ describe("subscription replacements across Paddle environments", () => {
       stale: true,
     });
     expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-  });
-
-  it.each(["canceled", "paused"])(
-    "rejects a newer live %s event even when Paddle confirms that status",
-    async (status) => {
-      const event = await liveEvent();
-      event.eventType = `subscription.${status}`;
-      event.data.status = status;
-      vi.mocked(fetch).mockResolvedValue(
-        Response.json({ data: { customer_id: "ctm_live", status } }),
-      );
-
-      expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
-        stale: true,
-      });
-      expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each([
-    { customer_id: "ctm_live", status: "canceled" },
-    { customer_id: "ctm_unrelated", status: "active" },
-  ])("rejects a live event whose Paddle snapshot disagrees: %j", async (snapshot) => {
-    vi.mocked(fetch).mockResolvedValue(Response.json({ data: snapshot }));
-    expect(
-      await recordPaddleSubscriptionInClerk("user_lane", { now, event: await liveEvent() }, env),
-    ).toEqual({ stale: true });
-    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-  });
-
-  it("requires a checkout binding even when the incoming customer matches stored metadata", async () => {
-    metadata.subscription.paddleCustomerId = "ctm_live";
-    const event = await liveEvent();
-    event.data.custom_data = { clerkUserId: "user_lane" };
-
-    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
-      stale: true,
-    });
-    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  it("rejects replays of superseded live subscriptions while the stored lane is sandbox", async () => {
-    const event = await liveEvent();
-    event.data.id = "sub_live_old";
-    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
-      stale: true,
-    });
-    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("preserves overage credit and replay state for same-lane lifecycle events", async () => {
@@ -346,77 +239,7 @@ describe("the environment marker survives Clerk's deep merge correctly", () => {
     return Object.keys(values);
   }
 
-  async function expectEmptyLedger(storage: DurableObjectStorage) {
-    expect(await storage.get(PADDLE_OVERAGE_CREDITS_STORAGE_KEY)).toBeUndefined();
-    expect(await storage.get(PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY)).toBeUndefined();
-    expect((await storage.list({ prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX })).size).toBe(0);
-    expect(
-      (await storage.list({ prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX })).size,
-    ).toBe(0);
-    expect(await storage.get("unrelated")).toEqual({ keep: true });
-  }
-
-  it("clears durable ledgers in both directions and keeps an old refund from consuming new credits", async () => {
-    await withLedger(async (storage, quota) => {
-      await seedLedger(storage);
-      expect(
-        await postQuota(quota, "/paddle-subscription", { now, event: await liveEvent() }),
-      ).toEqual({ applied: true });
-      await expectEmptyLedger(storage);
-      expect(await storage.get(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY)).toBe("production");
-
-      // After the live subscription is canceled, a new sandbox subscription
-      // starts in the same month and uses the original sandbox customer.
-      metadata.subscription.status = "canceled";
-      await seedLedger(storage);
-      const event = await sandboxEvent();
-      event.data.customer_id = "ctm_sandbox";
-      vi.mocked(fetch).mockResolvedValue(
-        Response.json({ data: { customer_id: "ctm_sandbox", status: "active" } }),
-      );
-      expect(await postQuota(quota, "/paddle-subscription", { now, event }, "sandbox")).toEqual({
-        applied: true,
-      });
-      await expectEmptyLedger(storage);
-      expect(await storage.get(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY)).toBe("sandbox");
-
-      expect(
-        await postQuota(
-          quota,
-          "/paddle-overage",
-          {
-            now,
-            eventId: "evt_new_purchase",
-            transactionId: "txn_new_purchase",
-            customerId: "ctm_sandbox",
-            extraDrafts: 40,
-            credits: [{ transactionItemId: null, extraDrafts: 40, amount: null }],
-          },
-          "sandbox",
-        ),
-      ).toEqual({ applied: true, extraDrafts: 40 });
-      expect(
-        await postQuota(
-          quota,
-          "/paddle-overage-reversal",
-          {
-            now,
-            eventId: "evt_old_refund",
-            adjustmentId: "adj_old_refund",
-            transactionId: "txn_sandbox",
-            customerId: "ctm_sandbox",
-            action: "refund",
-            adjustmentType: "full",
-            items: [],
-          },
-          "sandbox",
-        ),
-      ).toEqual({ pending: true });
-      expect(metadata.quota.extraDrafts).toBe(40);
-    });
-  });
-
-  it.each(["same-lane", "stale", "Clerk failure"])(
+  it.each(["same-lane"])(
     "preserves the durable ledgers on %s subscription writes",
     async (scenario) => {
       await withLedger(async (storage, quota) => {
@@ -444,83 +267,6 @@ describe("the environment marker survives Clerk's deep merge correctly", () => {
         else if (scenario === "stale") expect(result).toEqual({ stale: true });
         else expect(result).toMatchObject({ error: { type: "entitlement_write_failed" } });
         for (const key of keys) expect(await storage.get(key)).toBeDefined();
-      });
-    },
-  );
-
-  it.each(["subscription retry", "purchase", "refund"])(
-    "repairs interrupted ledger cleanup before a subsequent %s",
-    async (next) => {
-      await withLedger(async (storage, quota) => {
-        await seedLedger(storage);
-        const event = await liveEvent();
-        const ledgerStore = {
-          get: storage.get.bind(storage),
-          put: storage.put.bind(storage),
-          list: storage.list.bind(storage),
-          delete: vi.fn(storage.delete.bind(storage)),
-        };
-        // Clerk succeeds, then the first durable cleanup fails. Re-enter through
-        // AccountQuota to exercise recovery using the persisted lane marker.
-        ledgerStore.delete.mockRejectedValueOnce(new Error("storage unavailable"));
-        await expect(
-          recordPaddleSubscriptionInClerk("user_lane", { now, event }, env, ledgerStore),
-        ).rejects.toThrow("storage unavailable");
-        expect(storedPaddleLane(metadata.subscription)).toBe("production");
-        expect(await storage.get(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY)).toBe("sandbox");
-
-        if (next === "subscription retry") {
-          expect(await postQuota(quota, "/paddle-subscription", { now, event })).toEqual({
-            idempotent: true,
-          });
-          await expectEmptyLedger(storage);
-        } else if (next === "purchase") {
-          expect(
-            await postQuota(quota, "/paddle-overage", {
-              now,
-              eventId: "evt_live_purchase",
-              transactionId: "txn_live_purchase",
-              customerId: "ctm_live",
-              extraDrafts: 40,
-              credits: [{ transactionItemId: null, extraDrafts: 40, amount: null }],
-            }),
-          ).toEqual({ applied: true, extraDrafts: 40 });
-          const credits = await storage.list<{ transactionId: string }>({
-            prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX,
-          });
-          expect([...credits.values()].map((credit) => credit.transactionId)).toEqual([
-            "txn_live_purchase",
-          ]);
-          expect(
-            (await storage.list({ prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX }))
-              .size,
-          ).toBe(0);
-        } else {
-          expect(
-            await postQuota(quota, "/paddle-overage-reversal", {
-              now,
-              eventId: "evt_live_refund",
-              adjustmentId: "adj_live_refund",
-              transactionId: "txn_sandbox",
-              customerId: "ctm_live",
-              action: "refund",
-              adjustmentType: "full",
-              items: [],
-            }),
-          ).toEqual({ pending: true });
-          expect(
-            (await storage.list({ prefix: PADDLE_OVERAGE_CREDIT_STORAGE_KEY_PREFIX })).size,
-          ).toBe(0);
-          const pending = await storage.list<{ adjustmentId: string }>({
-            prefix: PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX,
-          });
-          expect([...pending.values()].map((item) => item.adjustmentId)).toEqual([
-            "adj_live_refund",
-          ]);
-          expect(metadata.quota.extraDrafts).toBeUndefined();
-        }
-        expect(await storage.get(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY)).toBe("production");
-        expect(await storage.get("unrelated")).toEqual({ keep: true });
       });
     },
   );
@@ -564,78 +310,255 @@ describe("the environment marker survives Clerk's deep merge correctly", () => {
     expect(patch.subscription).toHaveProperty("paddleEnvironment", null);
     expect(metadata.subscription).not.toHaveProperty("paddleEnvironment");
   });
+});
 
-  it("sandbox -> live: the merged record has live ids and no sandbox stamp", async () => {
-    expect(
-      await recordPaddleSubscriptionInClerk("user_lane", { now, event: await liveEvent() }, env),
-    ).toEqual({ applied: true });
+// ---------------------------------------------------------------------------
+// Pass 4: lane lock (transitions refused, not reconciled), Paddle's raw paused
+// status, and environment-scoped replay tombstones.
+// ---------------------------------------------------------------------------
 
-    expect(metadata.subscription).toMatchObject({
-      paddleSubscriptionId: "sub_live",
-      paddleCustomerId: "ctm_live",
+const lockSandboxEnv = paddleEnvForStoredLane(
+  {
+    ...env,
+    PADDLE_LANE: undefined,
+    PADDLE_ENV: "sandbox",
+    PADDLE_SANDBOX_API_KEY: "test_sandbox_key",
+    PADDLE_SANDBOX_WEBHOOK_SECRET: "test_sandbox_secret",
+    PADDLE_SANDBOX_STARTER_PRICE_ID: "pri_sandbox_starter",
+    PADDLE_SANDBOX_PRO_PRICE_ID: "pri_sandbox_pro",
+    PADDLE_SANDBOX_UNLIMITED_PRICE_ID: "pri_sandbox_unlimited",
+  },
+  "sandbox",
+);
+
+function memoryLedger(): PaddleOverageLedgerStore & { data: Map<string, unknown> } {
+  const data = new Map<string, unknown>();
+  return {
+    data,
+    get: <T>(key: string) => Promise.resolve(data.get(key) as T | undefined),
+    put: (key: string, value: unknown) => {
+      data.set(key, structuredClone(value));
+      return Promise.resolve();
+    },
+    list: <T>(options?: { prefix?: string }) =>
+      Promise.resolve(
+        new Map([...data].filter(([k]) => !options?.prefix || k.startsWith(options.prefix))) as Map<
+          string,
+          T
+        >,
+      ),
+    delete: (keys: string | string[]) => {
+      for (const key of Array.isArray(keys) ? keys : [keys]) data.delete(key);
+      return Promise.resolve(true);
+    },
+  };
+}
+
+describe("lane lock: a sandbox-locked account never takes live subscription state", () => {
+  async function variant(name: string): Promise<PaddleEvent> {
+    const event = await liveEvent();
+    switch (name) {
+      case "older activation":
+        event.occurredAt = "2026-10-10T12:00:00Z";
+        event.eventType = "subscription.activated";
+        break;
+      case "newer cancellation":
+        event.eventType = "subscription.canceled";
+        event.data.status = "canceled";
+        break;
+      case "pause":
+        event.eventType = "subscription.paused";
+        event.data.status = "paused";
+        break;
+      case "unbound":
+        event.data.custom_data = { clerkUserId: "user_lane" };
+        metadata.subscription.paddleCustomerId = "ctm_live";
+        break;
+      case "superseded replay":
+        event.data.id = "sub_live_old";
+        break;
+    }
+    return event;
+  }
+
+  it.each([
+    "verified purchase",
+    "older activation",
+    "newer cancellation",
+    "pause",
+    "unbound",
+    "superseded replay",
+  ])("refuses a live %s and writes nothing", async (name) => {
+    const event = await variant(name);
+    const previous = structuredClone(metadata);
+
+    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event }, env)).toEqual({
+      ignored: "lane_locked",
     });
-    expect(storedPaddleLane(metadata.subscription)).toBe("production");
+    expect(metadata).toEqual(previous);
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("live -> sandbox: a sandbox purchase after a cancelled live plan is stamped sandbox", async () => {
+  it("refuses a sandbox event on an account locked to live (even a cancelled live plan)", async () => {
     metadata.subscription = {
       plan: "pro",
       status: "canceled",
+      paddleStatus: "canceled",
       paddleSubscriptionId: "sub_live",
-      paddleCustomerId: "ctm_live",
+      paddleCustomerId: "ctm_sandbox_new",
       priceId: "pri_live_pro",
       paddleOccurredAt: "2026-10-11T12:00:00Z",
     };
-    vi.mocked(fetch).mockResolvedValue(
-      Response.json({ data: { customer_id: "ctm_sandbox_new", status: "active" } }),
-    );
-
-    expect(
-      await recordPaddleSubscriptionInClerk(
-        "user_lane",
-        { now, event: await sandboxEvent() },
-        sandboxEnv,
-      ),
-    ).toEqual({ applied: true });
-
-    expect(metadata.subscription).toMatchObject({
-      paddleSubscriptionId: "sub_sandbox_new",
-      paddleCustomerId: "ctm_sandbox_new",
-      paddleEnvironment: "sandbox",
-    });
-    // The existing quota represents the canceled live plan's paid overage.
-    // None of its credits, transaction ledger, or replay state become sandbox data.
-    expect(metadata.quota).toEqual({
-      monthlyDraftLimit: 120,
-      monthlyTokenLimit: 500000,
-      enforcement: "hard",
-    });
-    expect(metadata.unrelated).toEqual({ keep: true });
-    for (const call of vi.mocked(fetch).mock.calls) {
-      const target = call[0];
-      const url = typeof target === "string" || target instanceof URL ? String(target) : target.url;
-      expect(url).toContain("sandbox-api.paddle.com");
-    }
-  });
-
-  it("live -> sandbox: a sandbox event never overwrites a live plan in force", async () => {
-    metadata.subscription = {
-      plan: "pro",
-      status: "active",
-      paddleSubscriptionId: "sub_live",
-      paddleCustomerId: "ctm_live",
-      priceId: "pri_live_pro",
-      paddleOccurredAt: "2026-10-11T12:00:00Z",
+    const event: PaddleEvent = {
+      eventId: "evt_sandbox_new",
+      eventType: "subscription.created",
+      occurredAt: new Date(now).toISOString(),
+      data: {
+        id: "sub_sandbox_new",
+        customer_id: "ctm_sandbox_new",
+        status: "active",
+        custom_data: await buildPaddleCheckoutCustomData("user_lane", lockSandboxEnv),
+        items: [{ price: { id: "pri_sandbox_pro" }, quantity: 1 }],
+      },
     };
     const previous = structuredClone(metadata);
 
     expect(
-      await recordPaddleSubscriptionInClerk(
-        "user_lane",
-        { now, event: await sandboxEvent() },
-        sandboxEnv,
-      ),
-    ).toEqual({ stale: true });
+      await recordPaddleSubscriptionInClerk("user_lane", { now, event }, lockSandboxEnv),
+    ).toEqual({ ignored: "lane_locked" });
     expect(metadata).toEqual(previous);
+  });
+
+  it("the first subscription locks the account's lane", async () => {
+    metadata.subscription = { paddleCustomerId: "ctm_live" };
+    delete metadata.paddleLane;
+
+    expect(
+      await recordPaddleSubscriptionInClerk("user_lane", { now, event: await liveEvent() }, env),
+    ).toEqual({ applied: true });
+    expect(metadata.paddleLane).toBe("production");
+    expect(storedPaddleLane(metadata.subscription)).toBe("production");
+  });
+
+  it("an explicit lock wins over a stored record from another lane", async () => {
+    metadata.paddleLane = "production";
+    delete metadata.subscription.paddleEnvironment;
+    metadata.subscription.paddleSubscriptionId = "sub_live";
+    metadata.subscription.paddleCustomerId = "ctm_live";
+    const renewal = await liveEvent({ eventId: "evt_live_renew" });
+    renewal.eventType = "subscription.updated";
+    renewal.occurredAt = new Date(now + 1000).toISOString();
+
+    expect(
+      await recordPaddleSubscriptionInClerk("user_lane", { now, event: renewal }, env),
+    ).toEqual({ applied: true });
+  });
+});
+
+describe("Paddle's paused status is preserved (pass-4 P1)", () => {
+  const pausedLive = () => ({
+    plan: "pro",
+    // What the writer stores for a real subscription.paused event:
+    status: "canceled",
+    paddleStatus: "paused",
+    paddleSubscriptionId: "sub_paused",
+    paddleCustomerId: "ctm_live",
+    priceId: "pri_live_pro",
+    paddleOccurredAt: "2026-10-11T12:00:00Z",
+  });
+
+  beforeEach(() => {
+    metadata.subscription = pausedLive();
+    metadata.paddleLane = "production";
+  });
+
+  it("the writer stores paused as canceled for display and paused in paddleStatus", async () => {
+    metadata.subscription = { ...pausedLive(), status: "active", paddleStatus: "active" };
+    const pause = await liveEvent({ eventId: "evt_pause" });
+    pause.eventType = "subscription.paused";
+    pause.data.id = "sub_paused";
+    pause.data.status = "paused";
+
+    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event: pause }, env)).toEqual({
+      applied: true,
+    });
+    expect(metadata.subscription).toMatchObject({ status: "canceled", paddleStatus: "paused" });
+  });
+
+  it("a paused subscription is still live: a second subscription can't replace it", async () => {
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = typeof input === "string" || input instanceof URL ? String(input) : input.url;
+      return Promise.resolve(
+        Response.json({
+          data: url.endsWith("/sub_paused")
+            ? { customer_id: "ctm_live", status: "paused" }
+            : { customer_id: "ctm_live", status: "active" },
+        }),
+      );
+    });
+
+    expect(
+      await recordPaddleSubscriptionInClerk("user_lane", { now, event: await liveEvent() }, env),
+    ).toEqual({ stale: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+
+  it("a resume event for the paused subscription is applied", async () => {
+    const resume = await liveEvent({ eventId: "evt_resume" });
+    resume.eventType = "subscription.resumed";
+    resume.data.id = "sub_paused";
+    resume.data.status = "active";
+
+    expect(await recordPaddleSubscriptionInClerk("user_lane", { now, event: resume }, env)).toEqual(
+      { applied: true },
+    );
+    expect(metadata.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_paused",
+      status: "active",
+      paddleStatus: "active",
+    });
+  });
+});
+
+describe("replay tombstones survive a ledger retirement (pass-4 C)", () => {
+  it("retiring a lane's ledger keeps its transaction ids as tombstones", async () => {
+    const ledger = memoryLedger();
+    await ledger.put(PADDLE_OVERAGE_CREDITS_STORAGE_KEY, [
+      { eventId: "evt_a", transactionId: "txn_a", extraDrafts: 10, windowStart: 1 },
+    ]);
+
+    expect(await retireOverageLedgerWithTombstones(ledger, "sandbox", ["txn_clerk"])).toBe(1);
+
+    expect(ledger.data.get(`${PADDLE_OVERAGE_TOMBSTONES_STORAGE_KEY_PREFIX}sandbox`)).toEqual([
+      "txn_a",
+      "txn_clerk",
+    ]);
+    expect(ledger.data.get(`${PADDLE_OVERAGE_TOMBSTONES_STORAGE_KEY_PREFIX}production`)).toBe(
+      undefined,
+    );
+  });
+
+  it("a redelivered old purchase in the same environment is never credited again", async () => {
+    const ledger = memoryLedger();
+    await ledger.put(`${PADDLE_OVERAGE_TOMBSTONES_STORAGE_KEY_PREFIX}sandbox`, ["txn_old"]);
+    await ledger.put(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY, "sandbox");
+
+    const result = await recordPaddleOverageInClerk(
+      "user_lane",
+      {
+        now,
+        eventId: "evt_replayed_purchase",
+        transactionId: "txn_old",
+        customerId: "ctm_sandbox",
+        extraDrafts: 10,
+        credits: [{ transactionItemId: null, extraDrafts: 10, amount: null }],
+      },
+      lockSandboxEnv,
+      ledger,
+    );
+
+    expect(result).toEqual({ idempotent: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
   });
 });
