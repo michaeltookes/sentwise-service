@@ -1873,6 +1873,10 @@ describe("POST /v1/paddle/checkout", () => {
       fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const path = requestUrl(input).replace("https://account-quota.internal", "");
         const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+        // 123 pass 5: the first checkout's lane-lock compare-and-set.
+        if (path === "/paddle-lane-lock") {
+          return Promise.resolve(Response.json({ locked: body.lane }));
+        }
         if (path === "/paddle-subscription-checkout-reserve") {
           if (pendingReservation) {
             return Promise.resolve(Response.json({ pending: true, ...pendingReservation }));
@@ -2055,6 +2059,10 @@ describe("POST /v1/paddle/checkout", () => {
       fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const path = requestUrl(input).replace("https://account-quota.internal", "");
         const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+        // 123 pass 5: the first checkout's lane-lock compare-and-set.
+        if (path === "/paddle-lane-lock") {
+          return Promise.resolve(Response.json({ locked: body.lane }));
+        }
         if (path === "/paddle-subscription-checkout-reserve") {
           if (pendingReservation) {
             return Promise.resolve(
@@ -2165,6 +2173,10 @@ describe("POST /v1/paddle/checkout", () => {
       fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const path = requestUrl(input).replace("https://account-quota.internal", "");
         const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+        // 123 pass 5: the first checkout's lane-lock compare-and-set.
+        if (path === "/paddle-lane-lock") {
+          return Promise.resolve(Response.json({ locked: body.lane }));
+        }
         if (path === "/paddle-subscription-checkout-reserve") {
           if (pendingReservation) {
             return Promise.resolve(
