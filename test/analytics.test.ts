@@ -24,6 +24,7 @@ describe("hashUserId (S-I2)", () => {
     expect(a).toMatch(HEX64);
     expect(a).toBe(b);
     expect(await hashUserId("user_2")).not.toBe(a);
+    expect(await hashUserId("user_1", "")).toBe(a);
   });
 
   it("uses keyed HMAC-SHA256 when a key is provided", async () => {

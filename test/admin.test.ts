@@ -59,8 +59,8 @@ describe("constantTimeEqual", () => {
 });
 
 describe("GET /admin/margin auth gating", () => {
-  it("404s when ADMIN_TOKEN is unset (endpoint invisible)", async () => {
-    const env = baseEnv({ ADMIN_TOKEN: undefined });
+  it.each([undefined, ""])("404s when ADMIN_TOKEN is %j (endpoint invisible)", async (token) => {
+    const env = baseEnv({ ADMIN_TOKEN: token });
     const res = await handleMargin(marginReq("anything"), env);
     expect(res.status).toBe(404);
   });
@@ -71,8 +71,8 @@ describe("GET /admin/margin auth gating", () => {
     expect((await handleMargin(marginReq("wrong"), env)).status).toBe(401);
   });
 
-  it("503s when the analytics API token is unset", async () => {
-    const env = baseEnv({ ADMIN_TOKEN: "correct-token", CF_ANALYTICS_API_TOKEN: undefined });
+  it.each([undefined, ""])("503s when the analytics API token is %j", async (token) => {
+    const env = baseEnv({ ADMIN_TOKEN: "correct-token", CF_ANALYTICS_API_TOKEN: token });
     const res = await handleMargin(marginReq("correct-token"), env);
     expect(res.status).toBe(503);
     expect(((await res.json()) as any).error.type).toBe("analytics_unavailable");

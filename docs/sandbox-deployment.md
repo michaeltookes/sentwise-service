@@ -51,6 +51,11 @@ production secret names, refuses a live Clerk or Paddle key, uploads the secrets
 (`wrangler deploy --env sandbox --secrets-file`), and smoke-checks `/healthz`. The production
 `deploy.yml` is untouched by this workflow.
 
+Clearing an optional `SANDBOX_` repository secret overwrites its deployed value with an empty string
+on the next successful workflow deployment. Clearing `SANDBOX_ADMIN_TOKEN` disables `/admin/*`;
+clearing `SANDBOX_CF_ANALYTICS_API_TOKEN` makes the margin dashboard unavailable, and clearing
+`SANDBOX_ANALYTICS_HASH_KEY` restores unkeyed user ID hashing. Required secrets must remain nonempty.
+
 ### From a terminal
 
 ```bash
