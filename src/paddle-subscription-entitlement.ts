@@ -136,7 +136,10 @@ export async function recordPaddleSubscriptionInClerk(
     !!existingSubscriptionId &&
     (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
   const incomingOrder = subscriptionEventOrderKey(body.event.occurredAt, body.now);
-  if ((!isDifferentSubscription || crossLane) && existingSub) {
+  // 123: event timestamps are only comparable within one Paddle environment. A
+  // live replacement is validated against Paddle itself (below), never rejected
+  // because an unrelated sandbox subscription has a later lifecycle event.
+  if (!isDifferentSubscription && !crossLane && existingSub) {
     const existingOrder = storedSubscriptionOrderKey(existingSub);
     if (existingOrder !== null && incomingOrder !== null && existingOrder > incomingOrder) {
       return { stale: true };
