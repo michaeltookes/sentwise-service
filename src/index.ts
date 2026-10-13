@@ -35,6 +35,7 @@ import { recordUsage } from "./analytics";
 import { invalidateClerkUser } from "./clerk-user-cache";
 import { handleMargin } from "./admin";
 import { handleAdminComp } from "./admin-comp";
+import { handleAdminPaddleLaneReset } from "./paddle-lane-reset";
 import { recordInterest } from "./interest";
 import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
 import { handlePaddleManageBilling } from "./paddle-management";
@@ -42,7 +43,8 @@ import { handlePaddleChangePlan } from "./paddle-plan";
 import { handlePaddleWebhook } from "./paddle-webhook";
 import { isCallbackPath, renderCallbackPage } from "./callback";
 import {
-  paddleClientConfig,
+  PADDLE_LANE_RESET_ROUTE,
+  paddleClientConfigForAccount,
   paddleEnvForLane,
   paddleEnvForStoredLane,
   paddleLaneForEmail,
@@ -72,6 +74,8 @@ export { AccountQuota } from "./quota-do";
  *          destination; verified with the sandbox secret only, QA accounts only,
  *          404 unless PADDLE_ENV=sandbox (123)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
+ *   POST   /admin/paddle-lane-reset -> reset a QA account's locked Paddle lane (123;
+ *          ADMIN_TOKEN; @prowlqa.dev only; 404 when unset)
  *   GET/POST/DELETE /admin/comp -> inspect/grant/revoke a comp entitlement for a
  *          named account (item 111; ADMIN_TOKEN; 404 when unset)
  *
@@ -111,6 +115,12 @@ export default {
         (request.method === "GET" || request.method === "POST" || request.method === "DELETE")
       ) {
         return await handleAdminComp(request, env);
+      }
+
+      // 123 — QA-only Paddle lane reset (the only way a QA account leaves its
+      // locked Paddle lane). Same ADMIN_TOKEN gate as /admin/comp.
+      if (pathname === PADDLE_LANE_RESET_ROUTE) {
+        return await handleAdminPaddleLaneReset(request, env);
       }
 
       // 56c — Paddle checkout/licensing webhook. Authenticated by the Paddle
@@ -178,7 +188,7 @@ export default {
           quota: buildQuota(window, limits),
           // 123 — which Paddle checkout this account must open. Production
           // accounts only ever get { environment: "production" }.
-          billing: paddleClientConfig(env, paddleLaneForEmail(env, account.email)),
+          billing: paddleClientConfigForAccount(env, account.email, account.paddleLaneLock),
         });
       }
 

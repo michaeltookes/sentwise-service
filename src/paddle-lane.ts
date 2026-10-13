@@ -16,6 +16,8 @@ import {
   paddleEnvForLane,
   paddleEnvForStoredLane,
   paddleLaneForEmail,
+  paddleLaneDecision,
+  paddleLaneLockedError,
   sandboxInPlay,
   sandboxLaneComplete,
   storedPaddleLane,
@@ -25,6 +27,7 @@ import {
 interface LaneUser {
   email: string | null;
   storedSubscription: unknown;
+  meta: Record<string, unknown>;
 }
 
 // Every caller here decides where a STATE-CHANGING Paddle call goes (checkout,
@@ -33,7 +36,7 @@ interface LaneUser {
 // to a live, chargeable checkout (or a customer to the sandbox).
 async function loadLaneUser(userId: string, env: Env): Promise<LaneUser | null> {
   // Production-only deployments (the default) never pay for a lookup.
-  if (!sandboxInPlay(env)) return { email: null, storedSubscription: null };
+  if (!sandboxInPlay(env)) return { email: null, storedSubscription: null, meta: {} };
   let user;
   try {
     user = await getCachedClerkUser(env, userId, { useCache: false });
@@ -42,7 +45,7 @@ async function loadLaneUser(userId: string, env: Env): Promise<LaneUser | null> 
     throw new ApiError(502, "account_lookup_failed", "Could not load the account.");
   }
   const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
-  return { email: primaryEmail(user), storedSubscription: meta.subscription };
+  return { email: primaryEmail(user), storedSubscription: meta.subscription, meta };
 }
 
 function sandboxUnavailableError(): ApiError {
@@ -65,7 +68,12 @@ export async function paddleLaneForUser(userId: string, env: Env): Promise<Paddl
  * /v1/me reports `checkoutAvailable: false` for the same account.
  */
 export async function paddleEnvForCheckout(userId: string, env: Env): Promise<Env> {
-  const lane = await paddleLaneForUser(userId, env);
+  const user = await loadLaneUser(userId, env);
+  // 123 — lane lock: refused before any Paddle call (the handler re-checks on
+  // its own fresh read too).
+  const decision = paddleLaneDecision(env, user?.email ?? null, user?.meta ?? {});
+  if (decision.conflict && decision.locked) throw paddleLaneLockedError(decision.locked);
+  const lane = decision.lane;
   if (lane === "sandbox" && !sandboxLaneComplete(env)) throw sandboxUnavailableError();
   return paddleEnvForLane(env, lane);
 }
@@ -78,6 +86,8 @@ export async function paddleEnvForCheckout(userId: string, env: Env): Promise<En
  */
 export async function paddleEnvForPlanChange(userId: string, env: Env): Promise<Env> {
   const user = await loadLaneUser(userId, env);
+  const decision = paddleLaneDecision(env, user?.email ?? null, user?.meta ?? {});
+  if (decision.conflict && decision.locked) throw paddleLaneLockedError(decision.locked);
   const stored = storedPaddleLane(user?.storedSubscription);
   const current = paddleLaneForEmail(env, user?.email ?? null);
   if (stored !== current) {

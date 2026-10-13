@@ -547,3 +547,38 @@ function parseTransactionItems(value: unknown): PaddleTransactionItemSnapshot[] 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
 }
+
+/**
+ * 123 — cancel a subscription immediately (used only by the QA-only admin lane
+ * reset, always with a sandbox-lane env). Succeeds when Paddle confirms the
+ * subscription is (now or already) canceled; anything else fails closed.
+ */
+export async function cancelPaddleSubscriptionImmediately(
+  env: Env,
+  subscriptionId: string,
+): Promise<void> {
+  const apiKey = requirePaddleApiKey(
+    "subscription_cancel_failed",
+    "Could not cancel the subscription.",
+    env,
+  );
+  try {
+    const res = await fetch(
+      `${paddleApiBase(env)}/subscriptions/${encodeURIComponent(subscriptionId)}/cancel`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ effective_from: "immediately" }),
+      },
+    );
+    if (res.ok) return;
+    const snapshot = await fetchPaddleSubscriptionSnapshot(env, subscriptionId);
+    if (snapshot?.status === "canceled") return;
+  } catch {
+    // fall through to the fail-closed error below
+  }
+  throw new ApiError(502, "subscription_cancel_failed", "Could not cancel the subscription.");
+}

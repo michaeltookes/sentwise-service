@@ -2,8 +2,13 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError, primaryEmail } from "./auth";
 import { DEFAULT_EXTRA_DRAFTS_PER_UNIT, planForPrice, type Env } from "./config";
 import { ApiError } from "./errors";
+import { invalidateClerkUser } from "./clerk-user-cache";
 import {
+  explicitPaddleLaneLock,
   laneOfEnv,
+  PADDLE_LANE_METADATA_KEY,
+  paddleLaneDecision,
+  paddleLaneLockedError,
   paddleEnvForStoredLane,
   paddleLaneForEmail,
   rootPaddleEnv,
@@ -14,6 +19,7 @@ import { numFrom } from "./metering";
 import {
   buildPaddleCheckoutCustomData,
   hasLivePaddleSubscriptionInForce,
+  storedPaddleRawStatus,
   paddleCheckoutBindingMatchesCustomData,
   storedPaddleCustomerId,
   storedPaddleSubscriptionId,
@@ -73,6 +79,7 @@ export async function handlePaddleCheckout(
   let customerId = storedPaddleCustomerId(account.subscription);
 
   assertCheckoutEligible(body, account.subscription, customerId, env);
+  if (!account.laneLockWritten) await writePaddleLaneLock(userId, env);
 
   const checkoutReservationId = crypto.randomUUID();
   const existingTransaction = await reserveCheckout(
@@ -164,6 +171,10 @@ function assertCheckoutEligible(
   if (
     body.kind === "subscription" &&
     (hasActivePaddleSubscription(rawSubscription) ||
+      // 123: a PAUSED subscription still exists at Paddle — resume it, don't
+      // start a second one.
+      (storedPaddleSubscriptionId(rawSubscription) !== null &&
+        storedPaddleRawStatus(rawSubscription) === "paused") ||
       (laneOfEnv(env) === "sandbox" && hasLivePaddleSubscriptionInForce(rawSubscription)))
   ) {
     throw new ApiError(
@@ -630,7 +641,10 @@ async function parseCheckoutRequest(request: Request, env: Env): Promise<Checkou
   return { kind, priceId, quantity };
 }
 
-async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscription: unknown }> {
+async function loadCheckoutAccount(
+  userId: string,
+  env: Env,
+): Promise<{ subscription: unknown; laneLockWritten: boolean }> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
   let user;
   try {
@@ -645,6 +659,13 @@ async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscrip
       "Could not load your account. Please try again.",
     );
   }
+  const meta = asRecord(user.privateMetadata) ?? {};
+  // 123 — lane lock: an account locked to the other environment is refused
+  // outright (only the admin reset moves it), whatever its email says now.
+  const decision = paddleLaneDecision(rootPaddleEnv(env), primaryEmail(user), meta);
+  if (decision.locked !== null && (decision.conflict || decision.locked !== laneOfEnv(env))) {
+    throw paddleLaneLockedError(decision.locked);
+  }
   // Every account read (including the post-reservation/recovery recheck) must
   // still agree with the chosen lane before its customer ID can be used.
   if (paddleLaneForEmail(rootPaddleEnv(env), primaryEmail(user)) !== laneOfEnv(env)) {
@@ -654,8 +675,29 @@ async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscrip
       "Your billing environment changed. Refresh and try again.",
     );
   }
-  const meta = asRecord(user.privateMetadata) ?? {};
-  return { subscription: subscriptionForCheckoutLane(meta.subscription, laneOfEnv(env)) };
+  return {
+    subscription: subscriptionForCheckoutLane(meta.subscription, laneOfEnv(env)),
+    laneLockWritten: explicitPaddleLaneLock(meta) !== null,
+  };
+}
+
+/**
+ * 123 — the first checkout locks the account's lane. Clerk deep-merges
+ * privateMetadata, so writing only this key can't clobber a concurrent write.
+ */
+async function writePaddleLaneLock(userId: string, env: Env): Promise<void> {
+  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  try {
+    await clerk.users.updateUserMetadata(userId, {
+      privateMetadata: { [PADDLE_LANE_METADATA_KEY]: laneOfEnv(env) },
+    });
+  } catch (err) {
+    if (isClerkNotFoundError(err)) {
+      throw new ApiError(404, "account_not_found", "Your account could not be found.");
+    }
+    throw new ApiError(502, "checkout_unavailable", "Could not start checkout.");
+  }
+  invalidateClerkUser(userId);
 }
 
 /**

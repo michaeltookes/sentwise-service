@@ -67,6 +67,7 @@ export type PaddleSubscriptionResult =
   | { idempotent: true }
   | { stale: true }
   | { ignored: "unknown_price" }
+  | { ignored: "lane_locked" }
   | { mapped: false };
 export type PaddlePlanChangeEntitlementResult =
   { applied: true; status: string | null } | { stale: true; status: string | null };
@@ -441,4 +442,18 @@ export function quotaFinishAccountDeletion(
  */
 export function quotaWipe(env: Env, userId: string): Promise<{ wiped: boolean; deleted: boolean }> {
   return call<{ wiped: boolean; deleted: boolean }>(env, userId, "/wipe", {});
+}
+
+/** 123 — QA-only admin lane reset (serialized in the account's DO). */
+export function quotaResetPaddleLane(
+  env: Env,
+  userId: string,
+  body: { lane: "sandbox" | "production" },
+): Promise<{ releasedReservations: number; retiredCredits: number }> {
+  return call<{ releasedReservations: number; retiredCredits: number }>(
+    env,
+    userId,
+    "/paddle-lane-reset",
+    body,
+  );
 }

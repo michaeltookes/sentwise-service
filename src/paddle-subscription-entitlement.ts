@@ -1,10 +1,17 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { hasPaddleTierPriceConfig, type Env, type PaidPlan } from "./config";
-import { laneOfEnv, storedPaddleLane } from "./paddle-env";
+import {
+  explicitPaddleLaneLock,
+  laneOfEnv,
+  lockedPaddleLane,
+  PADDLE_LANE_METADATA_KEY,
+  storedPaddleLane,
+} from "./paddle-env";
 import { ApiError } from "./errors";
 import {
   hasLivePaddleSubscriptionInForce,
+  isPaddleSubscriptionInForce,
   paddleCheckoutBindingMatchesEvent,
   paddleCustomerMatchesAccount,
   storedPaddleSubscriptionId,
@@ -42,6 +49,7 @@ export type PaddleSubscriptionResult =
   | { idempotent: true }
   | { stale: true }
   | { ignored: "unknown_price" }
+  | { ignored: "lane_locked" }
   | { mapped: false };
 
 export function parsePaddleSubscriptionBody(body: unknown): PaddleSubscriptionBody {
@@ -104,6 +112,14 @@ export async function recordPaddleSubscriptionInClerk(
   await syncPaddleOverageLedgerLane(ledgerStore, meta.subscription);
   if (!(await subscriptionEventMatchesAccount(userId, user, meta, body.event, env))) {
     return { mapped: false };
+  }
+
+  // 123 — lane lock: an account locked to one Paddle environment never takes
+  // subscription state from the other. Nothing is written; the DO releases a
+  // matching checkout reservation so it can't be stranded.
+  const lock = lockedPaddleLane(meta);
+  if (lock !== null && lock !== laneOfEnv(env)) {
+    return { ignored: "lane_locked" };
   }
 
   const existingSub = asRecord(meta.subscription);
@@ -182,7 +198,12 @@ export async function recordPaddleSubscriptionInClerk(
 
   try {
     await clerk.users.updateUserMetadata(userId, {
-      privateMetadata: { subscription: record, quota },
+      privateMetadata: {
+        subscription: record,
+        quota,
+        // 123: the first subscription locks the account's lane.
+        ...(explicitPaddleLaneLock(meta) ? {} : { [PADDLE_LANE_METADATA_KEY]: incomingLane }),
+      },
     });
   } catch (err) {
     if (isClerkNotFoundError(err)) return { mapped: false };
@@ -287,10 +308,16 @@ async function isCurrentSubscriptionReplacement(
   if (
     existingSubscriptionId &&
     existingSubscriptionId !== incomingSubscriptionId &&
-    isActiveStoredSubscription(existingSub)
+    isPaddleSubscriptionInForce(existingSub)
   ) {
+    // 123: a paused subscription is still live at Paddle (it can resume), so
+    // it blocks a replacement exactly like an active one.
     const existingSnapshot = await fetchPaddleSubscriptionSnapshot(env, existingSubscriptionId);
-    if (!existingSnapshot || isActivePaddleSubscriptionStatus(existingSnapshot.status)) {
+    if (
+      !existingSnapshot ||
+      isActivePaddleSubscriptionStatus(existingSnapshot.status) ||
+      existingSnapshot.status === "paused"
+    ) {
       return false;
     }
     if (incomingCustomerId && existingSnapshot.customerId !== incomingCustomerId) {
@@ -299,11 +326,6 @@ async function isCurrentSubscriptionReplacement(
   }
 
   return true;
-}
-
-function isActiveStoredSubscription(existingSub: Record<string, unknown> | null): boolean {
-  const status = existingSub?.status;
-  return isActivePaddleSubscriptionStatus(status);
 }
 
 function isActivePaddleSubscriptionStatus(status: unknown): boolean {

@@ -82,7 +82,28 @@ export function hasLivePaddleSubscriptionInForce(rawSubscription: unknown): bool
   return (
     storedPaddleLane(subscription) === "production" &&
     storedPaddleSubscriptionId(subscription) !== null &&
-    ["active", "trialing", "past_due", "paused"].includes(String(subscription?.status))
+    isPaddleSubscriptionInForce(subscription)
+  );
+}
+
+/**
+ * Paddle's own status for a stored subscription record. The record's `status`
+ * is the canonical display status (a paused subscription shows as "canceled");
+ * `paddleStatus` keeps Paddle's raw value so a paused subscription is never
+ * mistaken for a closed one.
+ */
+export function storedPaddleRawStatus(rawSubscription: unknown): string | null {
+  const subscription = asRecord(rawSubscription);
+  const raw = subscription?.paddleStatus;
+  if (typeof raw === "string" && raw !== "") return raw;
+  const status = subscription?.status;
+  return typeof status === "string" && status !== "" ? status : null;
+}
+
+/** Active, trialing, past due, or PAUSED: the subscription still exists at Paddle. */
+export function isPaddleSubscriptionInForce(rawSubscription: unknown): boolean {
+  return ["active", "trialing", "past_due", "paused"].includes(
+    String(storedPaddleRawStatus(rawSubscription)),
   );
 }
 

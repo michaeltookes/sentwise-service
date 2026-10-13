@@ -52,9 +52,17 @@ import { parseInterestTopic, recordInterestInClerk } from "./interest";
 import {
   parsePaddleOverageBody,
   parsePaddleOverageReversalBody,
+  PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY,
   recordPaddleOverageInClerk,
+  retireOverageLedgerWithTombstones,
   revokePaddleOverageInClerk,
 } from "./paddle-entitlement";
+import {
+  clearPaddleLaneInClerk,
+  clerkCreditedTransactionIds,
+  loadPaddleResetMetadata,
+  parsePaddleLaneResetBody,
+} from "./paddle-lane-reset";
 import {
   type PaddleSubscriptionCheckoutPlan,
   parsePaddleSubscriptionBody,
@@ -273,6 +281,8 @@ export class AccountQuota {
         return this.handlePaddleOverageCheckoutPeek(await request.json<unknown>());
       case "/paddle-overage-checkout-release":
         return this.handlePaddleOverageCheckoutRelease(await request.json<unknown>());
+      case "/paddle-lane-reset":
+        return this.handlePaddleLaneReset(await request.json<unknown>());
       default:
         return new Response("not found", { status: 404 });
     }
@@ -571,7 +581,61 @@ export class AccountQuota {
         if (!subscriptionEventAllowsOverageCheckout(parsed.event)) {
           await this.cancelPaddleOverageCheckoutReservation();
         }
+      } else if (
+        ("ignored" in result && result.ignored === "lane_locked") ||
+        ("stale" in result && !subscriptionEventAllowsOverageCheckout(parsed.event))
+      ) {
+        // 123: the event's checkout is finished at Paddle even though its
+        // entitlement was intentionally ignored (lane lock, or a terminal
+        // event that lost ordering). Release its reservation so later
+        // checkouts and account deletion are never blocked by it.
+        await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
       }
+      return Response.json(result);
+    } catch (err) {
+      if (err instanceof ApiError) return err.toResponse();
+      throw err;
+    }
+  }
+
+  /**
+   * 123 — QA-only admin lane reset (the Clerk + durable half; the admin route
+   * has already cancelled the sandbox subscription at Paddle). Serialized with
+   * every other billing write for this account.
+   */
+  private async handlePaddleLaneReset(body: unknown): Promise<Response> {
+    try {
+      const { lane } = parsePaddleLaneResetBody(body);
+      const userId = this.requireUserId();
+      const result = await this.enqueuePrivateMetadataWrite(async () => {
+        const meta = await loadPaddleResetMetadata(userId, this.env);
+        let releasedReservations = 0;
+        for (const key of [
+          PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
+          PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
+        ] as const) {
+          const reservation = parsePaddleCheckoutReservation(await this.storage.get<unknown>(key));
+          if (!reservation) continue;
+          if (reservation.transactionId) {
+            // Best-effort: a completed transaction can't be cancelled, and the
+            // reservation must be released either way.
+            await cancelPaddleTransaction(
+              paddleEnvForStoredLane(this.env, storedPaddleLane(reservation)),
+              reservation.transactionId,
+            ).catch(() => undefined);
+          }
+          await this.storage.delete(key);
+          releasedReservations += 1;
+        }
+        const retiredCredits = await retireOverageLedgerWithTombstones(
+          this.storage,
+          lane,
+          clerkCreditedTransactionIds(meta),
+        );
+        await this.storage.delete(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY);
+        await clearPaddleLaneInClerk(userId, this.env);
+        return { releasedReservations, retiredCredits };
+      });
       return Response.json(result);
     } catch (err) {
       if (err instanceof ApiError) return err.toResponse();

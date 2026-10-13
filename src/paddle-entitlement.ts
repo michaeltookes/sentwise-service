@@ -8,7 +8,7 @@ import {
   windowStartUtc,
 } from "./metering";
 import { paddleCustomerMatchesAccount, storedPaddleSubscriptionId } from "./paddle-account";
-import { storedPaddleLane } from "./paddle-env";
+import { laneOfEnv, lockedPaddleLane, storedPaddleLane, type PaddleLane } from "./paddle-env";
 import type { OverageAdjustmentAction } from "./paddle";
 
 const PROCESSED_OVERAGE_EVENT_ID_LIMIT = 100;
@@ -21,6 +21,11 @@ export const PADDLE_OVERAGE_PENDING_REVERSALS_STORAGE_KEY = "paddle_overage_pend
 export const PADDLE_OVERAGE_PENDING_REVERSAL_STORAGE_KEY_PREFIX =
   "paddle_overage_pending_reversal:";
 export const PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY = "paddle_overage_ledger_lane";
+// 123 — environment-scoped replay tombstones: transaction ids whose overage
+// credit was retired (lane switch or admin lane reset). A redelivered old
+// `transaction.completed` for one of these is never credited again.
+export const PADDLE_OVERAGE_TOMBSTONES_STORAGE_KEY_PREFIX = "paddle_overage_tombstones:";
+const OVERAGE_TOMBSTONE_LIMIT = 1000;
 
 export interface PaddleOverageLedgerStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -224,9 +229,15 @@ export async function recordPaddleOverageInClerk(
   if (!paddleCustomerMatchesAccount(user, meta, body.customerId, env)) {
     return { mapped: false };
   }
+  // 123 — lane lock: never credit an account from the other environment.
+  const lock = lockedPaddleLane(meta);
+  if (lock !== null && lock !== laneOfEnv(env)) return { mapped: false };
 
   const existingQuota = asRecord(meta.quota) ?? {};
   await syncPaddleOverageLedgerLane(ledgerStore, meta.subscription);
+  if (await isTombstonedOverageTransaction(ledgerStore, laneOfEnv(env), body.transactionId)) {
+    return { idempotent: true };
+  }
   const processedIds = processedOverageEventIds(existingQuota);
   if (processedIds.includes(body.eventId)) {
     const existingCredits = await loadOverageCredits(existingQuota, ledgerStore);
@@ -383,6 +394,9 @@ export async function revokePaddleOverageInClerk(
   if (!paddleCustomerMatchesAccount(user, meta, body.customerId, env)) {
     return { mapped: false };
   }
+  // 123 — lane lock: never revoke from an account in the other environment.
+  const lock = lockedPaddleLane(meta);
+  if (lock !== null && lock !== laneOfEnv(env)) return { mapped: false };
   if (body.hasAdjustmentItems && body.items.length === 0) {
     return { ignored: "not_overage_reversal" };
   }
@@ -1288,7 +1302,9 @@ export async function syncPaddleOverageLedgerLane(
   const lane = storedPaddleLane(subscription);
   const previousLane = await ledgerStore.get(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY);
   if (previousLane === lane) return;
-  if (previousLane !== undefined) {
+  if (previousLane === "sandbox" || previousLane === "production") {
+    await retireOverageLedgerWithTombstones(ledgerStore, previousLane);
+  } else if (previousLane !== undefined) {
     await saveOverageCredits(ledgerStore, []);
     await savePendingOverageReversals(ledgerStore, []);
   }
@@ -1296,6 +1312,50 @@ export async function syncPaddleOverageLedgerLane(
   // the old marker until BOTH ledgers are cleared so an interrupted reset is
   // retried before any purchase or refund can use the previous lane's state.
   await ledgerStore.put(PADDLE_OVERAGE_LEDGER_LANE_STORAGE_KEY, lane);
+}
+
+/**
+ * 123 — clear the overage ledger of `lane` (credits + pending reversals) while
+ * keeping environment-scoped replay tombstones for every retired transaction
+ * id (plus any `extraTransactionIds`, e.g. Clerk's processed purchases), so a
+ * redelivered old purchase is never credited again.
+ */
+export async function retireOverageLedgerWithTombstones(
+  ledgerStore: PaddleOverageLedgerStore,
+  lane: PaddleLane,
+  extraTransactionIds: string[] = [],
+): Promise<number> {
+  const credits = await loadOverageCredits({}, ledgerStore);
+  const key = `${PADDLE_OVERAGE_TOMBSTONES_STORAGE_KEY_PREFIX}${lane}`;
+  const existing = await ledgerStore.get<unknown>(key);
+  const previous = Array.isArray(existing)
+    ? existing.filter((id): id is string => typeof id === "string")
+    : [];
+  const ids = [
+    ...new Set([
+      ...previous,
+      ...credits.map((credit) => credit.transactionId),
+      ...extraTransactionIds,
+    ]),
+  ].filter((id) => id !== "");
+  // Tombstones first: an interrupted retirement never leaves a credit
+  // replayable.
+  await ledgerStore.put(key, ids.slice(-OVERAGE_TOMBSTONE_LIMIT));
+  await saveOverageCredits(ledgerStore, []);
+  await savePendingOverageReversals(ledgerStore, []);
+  return credits.length;
+}
+
+async function isTombstonedOverageTransaction(
+  ledgerStore: PaddleOverageLedgerStore | undefined,
+  lane: PaddleLane,
+  transactionId: string,
+): Promise<boolean> {
+  if (!ledgerStore) return false;
+  const stored = await ledgerStore.get<unknown>(
+    `${PADDLE_OVERAGE_TOMBSTONES_STORAGE_KEY_PREFIX}${lane}`,
+  );
+  return Array.isArray(stored) && stored.includes(transactionId);
 }
 
 async function loadOverageCredits(

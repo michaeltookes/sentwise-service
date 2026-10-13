@@ -15,6 +15,7 @@
 // paddleLaneForEmail() is the single gate and it requires both conditions.
 
 import { PADDLE_LIVE_API_BASE, PADDLE_SANDBOX_API_BASE, type Env } from "./config";
+import { ApiError } from "./errors";
 
 export type PaddleLane = "sandbox" | "production";
 
@@ -219,8 +220,89 @@ export function paddleClientConfig(env: Env, lane: PaddleLane): PaddleClientConf
   };
 }
 
+/**
+ * 123 — the `/v1/me` billing block for an account, lane lock included. A lock
+ * that disagrees with the lane the account would get today reports the locked
+ * environment with `checkoutAvailable: false` (the server refuses that
+ * account's checkout with 409 billing_lane_locked until an admin reset).
+ */
+export function paddleClientConfigForAccount(
+  env: Env,
+  email: string | null | undefined,
+  locked: PaddleLane | null | undefined,
+): PaddleClientConfig {
+  const emailLane = paddleLaneForEmail(rootPaddleEnv(env), email);
+  if (locked && locked !== emailLane) return { environment: locked, checkoutAvailable: false };
+  return paddleClientConfig(env, emailLane);
+}
+
 function nonEmpty(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
+}
+
+// ---------------------------------------------------------------------------
+// 123 — lane lock. An account's Paddle lane is decided by the first billing
+// state it acquires and never changes afterwards except through the QA-only
+// admin reset (POST /admin/paddle-lane-reset). Transitions are refused, not
+// reconciled.
+// ---------------------------------------------------------------------------
+
+/** Clerk privateMetadata key holding the account's locked lane. */
+export const PADDLE_LANE_METADATA_KEY = "paddleLane";
+
+export const PADDLE_LANE_RESET_ROUTE = "/admin/paddle-lane-reset";
+
+/** The explicit lock written to Clerk, if any. */
+export function explicitPaddleLaneLock(meta: Record<string, unknown>): PaddleLane | null {
+  const value = meta[PADDLE_LANE_METADATA_KEY];
+  return value === "sandbox" || value === "production" ? value : null;
+}
+
+/**
+ * The account's locked lane: the explicit lock, or (for accounts that acquired
+ * billing state before the lock existed) the lane of a stored Paddle
+ * subscription record that carries a Paddle subscription id.
+ */
+export function lockedPaddleLane(meta: Record<string, unknown>): PaddleLane | null {
+  const explicit = explicitPaddleLaneLock(meta);
+  if (explicit) return explicit;
+  const sub = meta.subscription;
+  if (typeof sub !== "object" || sub === null) return null;
+  const record = sub as Record<string, unknown>;
+  const hasSubscription =
+    typeof record.paddleSubscriptionId === "string" && record.paddleSubscriptionId !== "";
+  return hasSubscription ? storedPaddleLane(record) : null;
+}
+
+export interface PaddleLaneDecision {
+  /** The lane new billing activity would use for this account. */
+  lane: PaddleLane;
+  /** The account's lock, if it has one. */
+  locked: PaddleLane | null;
+  /** True when the lock disagrees with the lane the account would get today. */
+  conflict: boolean;
+}
+
+/**
+ * Decide the lane for an account: its email and PADDLE_ENV pick a lane, and a
+ * lock that disagrees is a conflict (the account must be reset by an admin).
+ */
+export function paddleLaneDecision(
+  env: PaddleEnvSource,
+  email: string | null | undefined,
+  meta: Record<string, unknown>,
+): PaddleLaneDecision {
+  const emailLane = paddleLaneForEmail(env, email);
+  const locked = lockedPaddleLane(meta);
+  return { lane: locked ?? emailLane, locked, conflict: locked !== null && locked !== emailLane };
+}
+
+export function paddleLaneLockedError(locked: PaddleLane): ApiError {
+  return new ApiError(
+    409,
+    "billing_lane_locked",
+    `This account's billing is locked to the Paddle ${locked} environment. An admin must reset it (POST ${PADDLE_LANE_RESET_ROUTE}) before it can use the other environment.`,
+  );
 }
