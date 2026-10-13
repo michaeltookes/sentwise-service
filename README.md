@@ -70,7 +70,7 @@ access past the 14-day trial.
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, /admin/margin, /admin/comp
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, POST /v1/paddle/webhook/sandbox, /admin/margin, /admin/comp
   -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
   -> src/comp.ts            layer an admin-granted comp entitlement over the natural state (111) — pure
@@ -83,6 +83,7 @@ src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/inter
   -> src/paddle-management.ts  fresh Paddle billing-management redirects — no URL persistence
   -> src/paddle-plan.ts     in-app plan change: PATCH the Paddle subscription + write the new tier limit (90)
   -> src/paddle-webhook.ts  dispatch signed events to serialized entitlement writes (56c) — no body logging
+  -> src/paddle-env.ts      PADDLE_ENV + @prowlqa.dev -> production or sandbox Paddle lane (123) — pure
 ```
 
 ## API
@@ -116,7 +117,8 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
     "tokenLimit": 8000000,
     "enforcement": "soft",
     "extraPurchased": 0
-  }
+  },
+  "billing": { "environment": "production" }
 }
 ```
 
@@ -126,6 +128,15 @@ This read is served from a short-TTL (30s) in-memory per-user cache in front of 
 (S-M1) so it can't be used to hammer Clerk's Backend API. Drafting access is always re-checked fresh
 on `/v1/draft`, so a cached view can only lag account state by at most the TTL — it can never grant
 access. `DELETE /v1/me` always bypasses the cache, and starting the trial invalidates it.
+
+#### `billing` (item 123)
+
+Which Paddle checkout the app must open for this account. Production accounts always get
+`{ "environment": "production" }` and the app uses its embedded live token and price ids. Only when
+`PADDLE_ENV=sandbox` **and** the account's primary email is `@prowlqa.dev` (and the sandbox client
+token and all three sandbox price vars are set) does it return
+`{ "environment": "sandbox", "clientSideToken": "test_…", "prices": { "starter", "pro", "unlimited" } }`.
+See [Paddle sandbox lane](#paddle-sandbox-lane-123).
 
 #### `subscription` (item 73)
 
@@ -670,6 +681,28 @@ Paddle secrets (below); (2) in the Paddle dashboard creates a **notification des
 `PADDLE_UNLIMITED_PRICE_ID` to the live subscription price ids. End-to-end verification (a real
 Paddle test event → a real entitlement write) happens then.
 
+### Paddle sandbox lane (123)
+
+One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddle-env.ts`):
+
+| `PADDLE_ENV`                     | Who uses the sandbox                                      | Live destination     | Sandbox destination          |
+| -------------------------------- | --------------------------------------------------------- | -------------------- | ---------------------------- |
+| `production` (committed default) | nobody; `PADDLE_API_BASE` is forced to the live base      | `/v1/paddle/webhook` | 404                          |
+| `sandbox`                        | accounts whose primary email is exactly `@prowlqa.dev`    | `/v1/paddle/webhook` | `/v1/paddle/webhook/sandbox` |
+| unset                            | nobody; legacy behavior (`PADDLE_API_BASE` as configured) | `/v1/paddle/webhook` | 404                          |
+
+- A sandbox-lane request **replaces** every Paddle value: sandbox API base, `PADDLE_SANDBOX_API_KEY`,
+  `PADDLE_SANDBOX_WEBHOOK_SECRET`, the `PADDLE_SANDBOX_*_PRICE_ID` vars, and a checkout-binding
+  secret of its own. It never falls back to a live key, secret, or price id, and a live-lane request
+  never sees a sandbox one.
+- Each webhook destination verifies with **its own lane's secret only**. A sandbox event that maps
+  to a non-QA account is acknowledged and dropped, so a sandbox purchase can never touch a real
+  customer's entitlement.
+- The Worker tells the AccountQuota Durable Object the lane with an internal header; the DO rebuilds
+  the lane from its own env, so the header alone can never enable the sandbox.
+- Setup on Paddle's side (sandbox account, catalog, notification destination, test cards) is in the
+  app repo's `docs/billing-qa.md`.
+
 ## Development
 
 Requires Node ≥ 22 (`.nvmrc`) and a Cloudflare account (Wrangler 4).
@@ -721,6 +754,15 @@ Secrets live in `~/.config/sentwise-service/.env` and are **never** committed:
   vars.** Required when `PADDLE_API_BASE` points at the live API. Sandbox/local mode defaults to the
   sandbox ids committed in `src/config.ts`; live mode fails closed instead of accepting sandbox ids,
   and the three tier ids are treated as an all-or-nothing set.
+- `PADDLE_ENV` — **123, public var.** `production` (committed) or `sandbox`; see
+  [Paddle sandbox lane](#paddle-sandbox-lane-123).
+- `PADDLE_SANDBOX_API_KEY` / `PADDLE_SANDBOX_WEBHOOK_SECRET` — **123, secrets.** The Paddle
+  **sandbox** API key and the sandbox notification-destination secret for
+  `/v1/paddle/webhook/sandbox`. Used only for `@prowlqa.dev` accounts while `PADDLE_ENV=sandbox`.
+  `PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET` is optional (defaults to the sandbox webhook secret).
+- `PADDLE_SANDBOX_CLIENT_TOKEN` / `PADDLE_SANDBOX_STARTER_PRICE_ID` / `PADDLE_SANDBOX_PRO_PRICE_ID` /
+  `PADDLE_SANDBOX_UNLIMITED_PRICE_ID` (optional `PADDLE_SANDBOX_EXTRA_DRAFTS_PRICE_ID`) — **123,
+  public vars.** The sandbox Paddle.js token and catalog, returned to QA accounts on `/v1/me`.
 
 Push them to the Worker with (values are read from the file, never printed):
 
@@ -733,6 +775,9 @@ grep '^CF_ANALYTICS_API_TOKEN=' ~/.config/sentwise-service/.env | cut -d= -f2- |
 # 56c checkout + licensing:
 grep '^PADDLE_WEBHOOK_SECRET=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_WEBHOOK_SECRET
 grep '^PADDLE_API_KEY='        ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_API_KEY
+# 123 sandbox QA lane (sandbox credentials only):
+grep '^PADDLE_SANDBOX_API_KEY='        ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_SANDBOX_API_KEY
+grep '^PADDLE_SANDBOX_WEBHOOK_SECRET=' ~/.config/sentwise-service/.env | cut -d= -f2- | npx wrangler secret put PADDLE_SANDBOX_WEBHOOK_SECRET
 ```
 
 > ⚠️ **Empty-secret gotcha.** `wrangler secret put` reads the value from stdin. The piped form above
