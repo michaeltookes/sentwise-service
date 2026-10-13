@@ -75,6 +75,36 @@ export function storedPaddleSubscriptionId(rawSubscription: unknown): string | n
   return typeof id === "string" && id !== "" ? id : null;
 }
 
+/**
+ * Paddle's own status for a stored subscription record. The record's `status`
+ * is the canonical display status (a paused subscription shows as "canceled");
+ * `paddleStatus` keeps Paddle's raw value so a paused subscription is never
+ * mistaken for a closed one. Records written before `paddleStatus` existed fall
+ * back to `status`.
+ */
+export function storedPaddleRawStatus(rawSubscription: unknown): string | null {
+  const subscription = asRecord(rawSubscription);
+  const raw = subscription?.paddleStatus;
+  if (typeof raw === "string" && raw !== "") return raw;
+  const status = subscription?.status;
+  return typeof status === "string" && status !== "" ? status : null;
+}
+
+/** A stored Paddle subscription that is paused: it still exists at Paddle and can resume. */
+export function isPausedPaddleSubscription(rawSubscription: unknown): boolean {
+  return (
+    storedPaddleSubscriptionId(rawSubscription) !== null &&
+    storedPaddleRawStatus(rawSubscription) === "paused"
+  );
+}
+
+/** Active, trialing, past due, or PAUSED: the subscription is still in force at Paddle. */
+export function isPaddleSubscriptionInForce(rawSubscription: unknown): boolean {
+  return ["active", "trialing", "past_due", "paused"].includes(
+    String(storedPaddleRawStatus(rawSubscription)),
+  );
+}
+
 export function supersededPaddleSubscriptionIds(rawSubscription: unknown): string[] {
   const subscription = asRecord(rawSubscription);
   const ids = Array.isArray(subscription?.supersededPaddleSubscriptionIds)

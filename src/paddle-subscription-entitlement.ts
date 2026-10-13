@@ -3,6 +3,7 @@ import { isClerkNotFoundError } from "./auth";
 import { hasPaddleTierPriceConfig, type Env, type PaidPlan } from "./config";
 import { ApiError } from "./errors";
 import {
+  isPaddleSubscriptionInForce,
   paddleCheckoutBindingMatchesEvent,
   paddleCustomerMatchesAccount,
   storedPaddleSubscriptionId,
@@ -253,10 +254,16 @@ async function isCurrentSubscriptionReplacement(
   if (
     existingSubscriptionId &&
     existingSubscriptionId !== incomingSubscriptionId &&
-    isActiveStoredSubscription(existingSub)
+    isPaddleSubscriptionInForce(existingSub)
   ) {
+    // 124: a paused subscription is still in force at Paddle (it can resume), so
+    // it blocks a replacement exactly like an active one.
     const existingSnapshot = await fetchPaddleSubscriptionSnapshot(env, existingSubscriptionId);
-    if (!existingSnapshot || isActivePaddleSubscriptionStatus(existingSnapshot.status)) {
+    if (
+      !existingSnapshot ||
+      isActivePaddleSubscriptionStatus(existingSnapshot.status) ||
+      existingSnapshot.status === "paused"
+    ) {
       return false;
     }
     if (incomingCustomerId && existingSnapshot.customerId !== incomingCustomerId) {
@@ -265,11 +272,6 @@ async function isCurrentSubscriptionReplacement(
   }
 
   return true;
-}
-
-function isActiveStoredSubscription(existingSub: Record<string, unknown> | null): boolean {
-  const status = existingSub?.status;
-  return isActivePaddleSubscriptionStatus(status);
 }
 
 function isActivePaddleSubscriptionStatus(status: unknown): boolean {
