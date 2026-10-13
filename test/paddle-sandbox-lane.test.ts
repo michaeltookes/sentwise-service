@@ -1049,6 +1049,69 @@ describe("incomplete sandbox lane fails closed (P3)", () => {
 });
 
 describe("mutation lanes come from a fresh Clerk read (PR #36 review)", () => {
+  it.each([
+    {
+      cached: SANDBOX_SUBSCRIPTION,
+      current: LIVE_SUBSCRIPTION,
+      base: PADDLE_LIVE_API_BASE,
+      key: LIVE_KEY,
+    },
+    {
+      cached: LIVE_SUBSCRIPTION,
+      current: SANDBOX_SUBSCRIPTION,
+      base: PADDLE_SANDBOX_API_BASE,
+      key: SANDBOX_KEY,
+    },
+  ])(
+    "uses one fresh billing record after a switch to $base",
+    async ({ cached, current, base, key }) => {
+      const env = laneEnv("sandbox");
+      mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+      mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: cached }));
+      await getMe(env);
+      mocks.getUser.mockClear();
+      // Any second lookup would see another lane: IDs and lane must come from
+      // this one record, regardless of the display cache or concurrent changes.
+      mocks.getUser.mockResolvedValueOnce(userWithEmail(QA_EMAIL, { subscription: current }));
+      const managementUrl = "https://portal.paddle.com/update/current";
+      const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+        Promise.resolve(
+          Response.json({
+            data: {
+              urls: {
+                subscriptions: [
+                  {
+                    id: current.paddleSubscriptionId,
+                    update_subscription_payment_method: managementUrl,
+                  },
+                ],
+              },
+            },
+          }),
+        ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const res = await worker.fetch(
+        new Request("https://sentwise-inference.test/v1/paddle/manage-billing", {
+          headers: bearer(),
+        }),
+        env,
+      );
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ managementUrl });
+      expect(mocks.getUser).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+        `${base}/customers/${current.paddleCustomerId}/portal-sessions`,
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: `Bearer ${key}` }),
+          body: JSON.stringify({ subscription_ids: [current.paddleSubscriptionId] }),
+        }),
+      );
+    },
+  );
+
   async function warmDisplayCache(email: string, env: Env): Promise<void> {
     mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
     mocks.getUser.mockResolvedValue(userWithEmail(email, { subscription: null }));

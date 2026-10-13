@@ -113,7 +113,7 @@ export async function recordPaddleSubscriptionInClerk(
 
   // 123: never let a sandbox event overwrite a live subscription that is still
   // in force (a QA account that also bought live, e.g. via the fallback test
-  // methods). A live event replacing a sandbox record is always allowed.
+  // methods). Live replacements still need the checks below.
   const incomingLane = laneOfEnv(env);
   const existingLane = storedPaddleLane(existingSub);
   const crossLane = !!existingSub && existingLane !== incomingLane;
@@ -135,20 +135,18 @@ export async function recordPaddleSubscriptionInClerk(
   const isDifferentSubscription =
     !!existingSubscriptionId &&
     (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
-  if (
-    isDifferentSubscription &&
-    !crossLane &&
-    !(await isCurrentSubscriptionReplacement(body.event, userId, env, existingSub))
-  ) {
-    return { stale: true };
-  }
-
   const incomingOrder = subscriptionEventOrderKey(body.event.occurredAt, body.now);
-  if (!isDifferentSubscription && existingSub) {
+  if ((!isDifferentSubscription || crossLane) && existingSub) {
     const existingOrder = storedSubscriptionOrderKey(existingSub);
     if (existingOrder !== null && incomingOrder !== null && existingOrder > incomingOrder) {
       return { stale: true };
     }
+  }
+  if (
+    isDifferentSubscription &&
+    !(await isCurrentSubscriptionReplacement(body.event, userId, env, existingSub))
+  ) {
+    return { stale: true };
   }
 
   const record = {
@@ -162,14 +160,21 @@ export async function recordPaddleSubscriptionInClerk(
       storedSubscriptionStatus(existingSub),
     ),
     ...supersededSubscriptionHistory(
-      crossLane ? [] : supersededSubscriptionIds,
-      isDifferentSubscription && !crossLane ? existingSubscriptionId : null,
+      supersededSubscriptionIds,
+      isDifferentSubscription ? existingSubscriptionId : null,
     ),
-    // 123: remember which Paddle environment this subscription lives in.
-    ...(incomingLane === "sandbox" ? { paddleEnvironment: "sandbox" as const } : {}),
+    // Clerk deep-merges metadata: explicitly remove a prior sandbox stamp.
+    ...(incomingLane === "sandbox"
+      ? { paddleEnvironment: "sandbox" as const }
+      : crossLane
+        ? { paddleEnvironment: null }
+        : {}),
   };
+  const existingQuota = asRecord(meta.quota) ?? {};
   const quota = quotaForSubscriptionStatus(
-    asRecord(meta.quota) ?? {},
+    crossLane && existingLane === "sandbox"
+      ? quotaWithoutSandboxOverage(existingQuota)
+      : existingQuota,
     record.status,
     mapped.quotaPlan,
     env,
@@ -270,6 +275,13 @@ async function isCurrentSubscriptionReplacement(
     return false;
   }
 
+  if (storedPaddleLane(existingSub) !== laneOfEnv(env)) {
+    // A closed/paused subscription from the other environment cannot take over.
+    // A verified live subscription may replace an active sandbox subscription;
+    // its sandbox ID must never be looked up using live credentials.
+    return isActivePaddleSubscriptionStatus(snapshot.status);
+  }
+
   const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
   if (
     existingSubscriptionId &&
@@ -324,6 +336,22 @@ function isPaddleSubscriptionStatus(value: unknown): value is string {
     value === "paused" ||
     value === "canceled"
   );
+}
+
+function quotaWithoutSandboxOverage(quota: Record<string, unknown>): Record<string, unknown> {
+  // Null removes keys under Clerk's deep merge. Omitting them would retain the
+  // test purchases and their replay state as live entitlement.
+  return {
+    ...quota,
+    extraDrafts: null,
+    extraDraftsWindowStart: null,
+    lastOverageEventId: null,
+    processedOverageEventIds: null,
+    processedOverageAdjustmentIds: null,
+    overageCreditTransactions: null,
+    overageCredits: null,
+    pendingOverageReversals: null,
+  };
 }
 
 function quotaForSubscriptionStatus(

@@ -48,11 +48,7 @@ import {
   paddleLaneForEmail,
   sandboxWebhookEnabled,
 } from "./paddle-env";
-import {
-  paddleEnvForCheckout,
-  paddleEnvForPlanChange,
-  paddleEnvForStoredSubscription,
-} from "./paddle-lane";
+import { paddleEnvForCheckout, paddleEnvForPlanChange } from "./paddle-lane";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -139,11 +135,7 @@ export default {
 
       if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
-        return await handlePaddleManageBilling(
-          userId,
-          request,
-          await paddleEnvForStoredSubscription(userId, env),
-        );
+        return await handlePaddleManageBilling(userId, request, env);
       }
 
       if (pathname === "/v1/paddle/checkout" && request.method === "POST") {

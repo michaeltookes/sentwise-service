@@ -70,12 +70,6 @@ export async function paddleEnvForCheckout(userId: string, env: Env): Promise<En
   return paddleEnvForLane(env, lane);
 }
 
-/** Env for the account's EXISTING subscription: the lane it was created in. */
-export async function paddleEnvForStoredSubscription(userId: string, env: Env): Promise<Env> {
-  const user = await loadLaneUser(userId, env);
-  return paddleEnvForStoredLane(env, storedPaddleLane(user?.storedSubscription));
-}
-
 /**
  * Env for changing the plan of the EXISTING subscription. Routed by the stored
  * lane, and only allowed while that lane is still the account's current lane: a
