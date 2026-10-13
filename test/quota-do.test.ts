@@ -33,6 +33,13 @@ const MON = Date.parse("2024-01-01T00:00:00.000Z"); // the 1st of the month (als
 const FEB = Date.parse("2024-02-01T00:00:00.000Z"); // the next monthly reset boundary
 const OLD_BOUNDED_ARRAY_SIZE = 128;
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
+// The Worker has no compiled-in price map; tests that resolve a tier supply the
+// three price-id vars the way every deployment does.
+const TIER_PRICE_ENV = {
+  PADDLE_STARTER_PRICE_ID: "pri_01m1syd7nfarp8pggpcnvjbgyy",
+  PADDLE_PRO_PRICE_ID: PRO_PRICE,
+  PADDLE_UNLIMITED_PRICE_ID: "pri_01m1syrdg05f49kz705gbzn6tz",
+};
 const OVERAGE_PRICE = "pri_overage";
 
 interface CheckResult {
@@ -560,7 +567,7 @@ describe("AccountQuota Durable Object", () => {
     const storage = fakeStorage(new Map<string, unknown>());
     const quota = new AccountQuota(
       { id: { name: uid }, storage } as unknown as DurableObjectState,
-      {} as Env,
+      TIER_PRICE_ENV as Env,
     );
     const writeStarted = deferred<void>();
     const releaseWrite = deferred<void>();
@@ -700,7 +707,7 @@ describe("AccountQuota Durable Object", () => {
     const storage = fakeStorage(new Map<string, unknown>());
     const quota = new AccountQuota(
       { id: { name: uid }, storage } as unknown as DurableObjectState,
-      {} as Env,
+      TIER_PRICE_ENV as Env,
     );
     const writeStarted = deferred<void>();
     const releaseWrite = deferred<void>();

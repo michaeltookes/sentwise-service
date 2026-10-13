@@ -32,6 +32,10 @@ export interface Env {
   // set, and native-app session tokens may lack `azp`. Confirm the app's tokens
   // carry a matching `azp` before enabling it. See src/auth.ts.
   CLERK_AUTHORIZED_PARTIES?: string;
+  // Custom URL scheme the OAuth landing pages (src/callback.ts) forward to.
+  // Defaults to "sentwise"; a deployment serving a differently identified app
+  // build sets that build's scheme.
+  APP_CALLBACK_SCHEME?: string;
 
   // 56b — metering. Durable Object namespace holding per-account usage counters.
   ACCOUNT_QUOTA: DurableObjectNamespace;
@@ -56,6 +60,11 @@ export interface Env {
   // 56b — margin dashboard config. CF_ACCOUNT_ID is a public var; the two tokens
   // are secrets set via `wrangler secret put` and are optional (endpoint degrades).
   CF_ACCOUNT_ID?: string;
+  // Analytics Engine dataset /admin/margin queries. Must match the
+  // analytics_engine_datasets binding of the same deployment; defaults to
+  // USAGE_DATASET. A second deployment writes to its own dataset so its usage
+  // never appears on another deployment's dashboard.
+  USAGE_DATASET_NAME?: string;
   ADMIN_TOKEN?: string; // guards GET /admin/margin; endpoint 404s when unset
   CF_ANALYTICS_API_TOKEN?: string; // Cloudflare API token for the Analytics Engine SQL API
 
@@ -63,14 +72,14 @@ export interface Env {
   // (set via `wrangler secret put`, never committed); the rest are public vars.
   PADDLE_WEBHOOK_SECRET?: string; // Paddle notification-destination secret (pdl_ntfset_…); verifies webhooks + signs checkout binding
   PADDLE_API_KEY?: string; // Paddle API key (pdl_…); creates checkouts, verifies mapping, reads management/current subscription state
-  PADDLE_API_BASE?: string; // Paddle REST base; defaults to the SANDBOX base (PADDLE_SANDBOX_API_BASE)
+  PADDLE_API_BASE?: string; // Paddle REST base; defaults to the live base (PADDLE_LIVE_API_BASE)
   PADDLE_WEBHOOK_TOLERANCE_SEC?: string | number; // signature freshness window (seconds); default DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC
   PADDLE_WEBHOOK_MAX_BODY_BYTES?: string | number; // max signed webhook payload bytes; default DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES
   PADDLE_CHECKOUT_BINDING_SECRET?: string; // stable HMAC secret for server-minted checkout binding; defaults to PADDLE_WEBHOOK_SECRET
   PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // previous checkout-binding secret accepted during rotations
-  PADDLE_STARTER_PRICE_ID?: string; // live/sandbox subscription price id for starter
-  PADDLE_PRO_PRICE_ID?: string; // live/sandbox subscription price id for pro
-  PADDLE_UNLIMITED_PRICE_ID?: string; // live/sandbox subscription price id for unlimited
+  PADDLE_STARTER_PRICE_ID?: string; // subscription price id for starter (required for checkout)
+  PADDLE_PRO_PRICE_ID?: string; // subscription price id for pro (required for checkout)
+  PADDLE_UNLIMITED_PRICE_ID?: string; // subscription price id for unlimited (required for checkout)
 
   // 56c — per-tier monthly draft limits (the marketed caps; owner decision
   // 2026-09-16). Tunable per-deploy without shipping a new binary, and written
@@ -144,8 +153,16 @@ export const DEFAULT_ENFORCEMENT_MODE: EnforcementMode = "soft";
 // 56b — margin dashboard.
 // ---------------------------------------------------------------------------
 
-// Workers Analytics Engine dataset name (must match the binding in wrangler.jsonc).
+// Default Workers Analytics Engine dataset name (must match the binding in
+// wrangler.jsonc). Overridable per deployment with the USAGE_DATASET_NAME var.
 export const USAGE_DATASET = "sentwise_usage";
+
+// The dataset name is interpolated into Analytics Engine SQL, so only plain
+// identifiers are accepted; anything else falls back to the default.
+export function usageDatasetName(env: Pick<Env, "USAGE_DATASET_NAME">): string {
+  const configured = env.USAGE_DATASET_NAME?.trim() ?? "";
+  return /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(configured) ? configured : USAGE_DATASET;
+}
 
 // Assumed per-active-account monthly revenue, for margin math on /admin/margin.
 export const ASSUMED_MONTHLY_REVENUE_USD = 19;
@@ -168,9 +185,10 @@ export const DEFAULT_MODEL_COST: ModelCost = MODEL_COSTS[DEFAULT_MODEL] ?? {
 // 56c — checkout + licensing (Paddle).
 // ---------------------------------------------------------------------------
 
-// Paddle REST bases. We default to SANDBOX everywhere until the owner flips
-// PADDLE_API_BASE to the live base and wires live secrets.
-export const PADDLE_SANDBOX_API_BASE = "https://sandbox-api.paddle.com";
+// Paddle REST base used when PADDLE_API_BASE is unset. Every deployment of this
+// Worker runs the same code; a deployment that talks to a different Paddle
+// environment sets PADDLE_API_BASE (and its own price ids and secrets) in its
+// wrangler environment (second deployments are documented under docs/).
 export const PADDLE_LIVE_API_BASE = "https://api.paddle.com";
 
 // Webhook signature freshness window. Paddle's own SDK helpers default to a very
@@ -186,30 +204,19 @@ export const DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES = 128 * 1024;
 // The three paid launch tiers. "team" is reserved (no price mapped yet).
 export type PaidPlan = "starter" | "pro" | "unlimited";
 
-// Paddle price id -> paid tier. These are the SANDBOX defaults used for local
-// development and tests. Live deployments must provide the three
-// PADDLE_*_PRICE_ID vars; live mode does not fall back to these sandbox ids.
+// Paddle price id -> paid tier comes only from the three PADDLE_*_PRICE_ID vars
+// of the deployment. There is no compiled-in fallback map: a deployment without
+// all three distinct ids has no subscription prices, and checkout is unavailable.
 // The *plan* is stable; the tier's monthly draft limit is resolved from a var
 // at runtime (see PLAN_DRAFT_LIMIT_VAR / resolvePlanDraftLimit in
 // src/paddle.ts) so it stays tunable without a release.
-export const PRICE_TO_PLAN: Record<string, PaidPlan> = {
-  pri_01m1syd7nfarp8pggpcnvjbgyy: "starter",
-  pri_01m1symsxarc4c3jdea0ntb09w: "pro",
-  pri_01m1syrdg05f49kz705gbzn6tz: "unlimited",
-};
-
 export type PaddlePriceConfigEnv = Pick<
   Env,
-  | "PADDLE_API_BASE"
-  | "PADDLE_STARTER_PRICE_ID"
-  | "PADDLE_PRO_PRICE_ID"
-  | "PADDLE_UNLIMITED_PRICE_ID"
+  "PADDLE_STARTER_PRICE_ID" | "PADDLE_PRO_PRICE_ID" | "PADDLE_UNLIMITED_PRICE_ID"
 >;
 
 export function priceToPlanForEnv(env?: PaddlePriceConfigEnv): Record<string, PaidPlan> {
-  const configured = configuredPriceToPlan(env);
-  if (Object.keys(configured).length > 0) return configured;
-  return usesSandboxPaddleBase(env) ? PRICE_TO_PLAN : {};
+  return configuredPriceToPlan(env);
 }
 
 export function planForPrice(priceId: string, env?: PaddlePriceConfigEnv): PaidPlan | undefined {
@@ -232,12 +239,6 @@ function configuredPriceToPlan(env?: PaddlePriceConfigEnv): Record<string, PaidP
     [pro]: "pro",
     [unlimited]: "unlimited",
   };
-}
-
-function usesSandboxPaddleBase(env?: PaddlePriceConfigEnv): boolean {
-  const base =
-    typeof env?.PADDLE_API_BASE === "string" ? env.PADDLE_API_BASE.trim().replace(/\/+$/, "") : "";
-  return base === "" || base === PADDLE_SANDBOX_API_BASE;
 }
 
 function normalizedPriceId(value: unknown): string | null {

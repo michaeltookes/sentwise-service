@@ -120,6 +120,22 @@ describe("createPaddlePortalSession", () => {
     );
   });
 
+  it("uses the live Paddle API base when PADDLE_API_BASE is unset or empty", async () => {
+    for (const base of [undefined, ""]) {
+      const fetchMock = vi.fn(() =>
+        Promise.resolve(portalSessionResponse({ data: { urls: urls() } })),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      await createPaddlePortalSession({ ...env, PADDLE_API_BASE: base }, "ctm_123", SUB, "cancel");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://api.paddle.com/customers/ctm_123/portal-sessions",
+        expect.anything(),
+      );
+    }
+  });
+
   it("returns null (for fallback) when Paddle responds non-2xx", async () => {
     vi.stubGlobal(
       "fetch",

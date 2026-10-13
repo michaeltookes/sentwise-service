@@ -40,7 +40,7 @@ import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
 import { handlePaddleManageBilling } from "./paddle-management";
 import { handlePaddleChangePlan } from "./paddle-plan";
 import { handlePaddleWebhook } from "./paddle-webhook";
-import { isCallbackPath, renderCallbackPage } from "./callback";
+import { appCallbackScheme, isCallbackPath, renderCallbackPage } from "./callback";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -86,7 +86,7 @@ export default {
       // allow-listed params to the Mac app's sentwise:// scheme. Nothing stored,
       // nothing logged.
       if (isCallbackPath(pathname) && request.method === "GET") {
-        return renderCallbackPage(pathname);
+        return renderCallbackPage(pathname, appCallbackScheme(env));
       }
 
       if (pathname === "/admin/margin" && request.method === "GET") {

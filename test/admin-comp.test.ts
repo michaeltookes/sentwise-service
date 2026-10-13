@@ -99,13 +99,16 @@ beforeEach(() => {
 });
 
 describe("/admin/comp auth gating (parity with /admin/margin)", () => {
-  it("404s on every method when ADMIN_TOKEN is unset (endpoint invisible)", async () => {
-    for (const method of ["GET", "POST", "DELETE"]) {
-      const res = await worker.fetch(adminReq(method, {}, "anything"), env);
-      expect(res.status).toBe(404);
-    }
-    expect(mocks.getUser).not.toHaveBeenCalled();
-  });
+  it.each([undefined, ""])(
+    "404s on every method when ADMIN_TOKEN is %j (endpoint invisible)",
+    async (token) => {
+      for (const method of ["GET", "POST", "DELETE"]) {
+        const res = await worker.fetch(adminReq(method, {}, ADMIN), { ...env, ADMIN_TOKEN: token });
+        expect(res.status).toBe(404);
+      }
+      expect(mocks.getUser).not.toHaveBeenCalled();
+    },
+  );
 
   it("401s a missing, empty, or garbage bearer exactly like /admin/margin", async () => {
     for (const token of [null, "", "   ", "garbage-token"]) {

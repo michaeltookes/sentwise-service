@@ -1,4 +1,4 @@
-import { PADDLE_SANDBOX_API_BASE, type Env } from "./config";
+import { PADDLE_LIVE_API_BASE, type Env } from "./config";
 import { ApiError } from "./errors";
 
 export interface PaddleCheckoutTransactionInput {
@@ -448,7 +448,7 @@ export async function fetchPaddleSubscriptionSnapshot(
 function paddleApiBase(env: Env): string {
   return env.PADDLE_API_BASE && env.PADDLE_API_BASE !== ""
     ? env.PADDLE_API_BASE
-    : PADDLE_SANDBOX_API_BASE;
+    : PADDLE_LIVE_API_BASE;
 }
 
 function requirePaddleApiKey(type: string, message: string, env: Env): string {

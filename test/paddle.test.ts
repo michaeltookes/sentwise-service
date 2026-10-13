@@ -32,13 +32,17 @@ import {
   DEFAULT_PRO_DRAFT_LIMIT,
   DEFAULT_STARTER_DRAFT_LIMIT,
   DEFAULT_UNLIMITED_DRAFT_LIMIT,
-  PADDLE_LIVE_API_BASE,
 } from "../src/config";
 
 const SECRET = "pdl_ntfset_testsecret";
 const STARTER_PRICE = "pri_01m1syd7nfarp8pggpcnvjbgyy";
 const PRO_PRICE = "pri_01m1symsxarc4c3jdea0ntb09w";
 const UNLIMITED_PRICE = "pri_01m1syrdg05f49kz705gbzn6tz";
+const TIER_PRICE_ENV = {
+  PADDLE_STARTER_PRICE_ID: STARTER_PRICE,
+  PADDLE_PRO_PRICE_ID: PRO_PRICE,
+  PADDLE_UNLIMITED_PRICE_ID: UNLIMITED_PRICE,
+};
 
 /** Build a signed Paddle-Signature header for `rawBody` at `tsSeconds`. */
 async function signHeader(rawBody: string, tsSeconds: number, secret = SECRET): Promise<string> {
@@ -260,7 +264,7 @@ describe("handled event types", () => {
 });
 
 describe("planFromEvent (price -> tier map)", () => {
-  it("maps each sandbox price id to its tier", () => {
+  it("maps each configured price id to its tier", () => {
     for (const [price, plan] of [
       [STARTER_PRICE, "starter"],
       [PRO_PRICE, "pro"],
@@ -269,7 +273,7 @@ describe("planFromEvent (price -> tier map)", () => {
       const event = parsePaddleEvent(
         subscriptionEventBody({ items: [{ price: { id: price }, quantity: 1 }] }),
       )!;
-      expect(planFromEvent(event)).toEqual({ plan, priceId: price });
+      expect(planFromEvent(event, TIER_PRICE_ENV)).toEqual({ plan, priceId: price });
     }
   });
 
@@ -277,21 +281,25 @@ describe("planFromEvent (price -> tier map)", () => {
     const event = parsePaddleEvent(
       subscriptionEventBody({ items: [{ price: { id: "pri_unknown" }, quantity: 1 }] }),
     )!;
-    expect(planFromEvent(event)).toBeNull();
+    expect(planFromEvent(event, TIER_PRICE_ENV)).toBeNull();
   });
 
-  it("requires configured tier prices when the Paddle API base is live", () => {
-    const sandboxEvent = parsePaddleEvent(
+  it("has no compiled-in price map: unconfigured or partial tier prices resolve nothing", () => {
+    const event = parsePaddleEvent(
       subscriptionEventBody({ items: [{ price: { id: PRO_PRICE }, quantity: 1 }] }),
     )!;
-    expect(planFromEvent(sandboxEvent, { PADDLE_API_BASE: PADDLE_LIVE_API_BASE })).toBeNull();
+    expect(planFromEvent(event)).toBeNull();
+    expect(planFromEvent(event, {})).toBeNull();
+    expect(planFromEvent(event, { ...TIER_PRICE_ENV, PADDLE_UNLIMITED_PRICE_ID: "" })).toBeNull();
+    expect(
+      planFromEvent(event, { ...TIER_PRICE_ENV, PADDLE_UNLIMITED_PRICE_ID: PRO_PRICE }),
+    ).toBeNull();
 
     const liveEvent = parsePaddleEvent(
       subscriptionEventBody({ items: [{ price: { id: "pri_live_pro" }, quantity: 1 }] }),
     )!;
     expect(
       planFromEvent(liveEvent, {
-        PADDLE_API_BASE: PADDLE_LIVE_API_BASE,
         PADDLE_STARTER_PRICE_ID: "pri_live_starter",
         PADDLE_PRO_PRICE_ID: "pri_live_pro",
         PADDLE_UNLIMITED_PRICE_ID: "pri_live_unlimited",
@@ -308,7 +316,10 @@ describe("planFromEvent (price -> tier map)", () => {
         ],
       }),
     )!;
-    expect(planFromEvent(event)).toEqual({ plan: "starter", priceId: STARTER_PRICE });
+    expect(planFromEvent(event, TIER_PRICE_ENV)).toEqual({
+      plan: "starter",
+      priceId: STARTER_PRICE,
+    });
   });
 });
 

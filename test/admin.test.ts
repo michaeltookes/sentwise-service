@@ -8,7 +8,7 @@ import {
   isoForSql,
   topAccountsSql,
 } from "../src/admin";
-import { USAGE_DATASET } from "../src/config";
+import { USAGE_DATASET, usageDatasetName } from "../src/config";
 
 function baseEnv(overrides: Partial<Env>): Env {
   return {
@@ -59,8 +59,8 @@ describe("constantTimeEqual", () => {
 });
 
 describe("GET /admin/margin auth gating", () => {
-  it("404s when ADMIN_TOKEN is unset (endpoint invisible)", async () => {
-    const env = baseEnv({ ADMIN_TOKEN: undefined });
+  it.each([undefined, ""])("404s when ADMIN_TOKEN is %j (endpoint invisible)", async (token) => {
+    const env = baseEnv({ ADMIN_TOKEN: token });
     const res = await handleMargin(marginReq("anything"), env);
     expect(res.status).toBe(404);
   });
@@ -71,8 +71,8 @@ describe("GET /admin/margin auth gating", () => {
     expect((await handleMargin(marginReq("wrong"), env)).status).toBe(401);
   });
 
-  it("503s when the analytics API token is unset", async () => {
-    const env = baseEnv({ ADMIN_TOKEN: "correct-token", CF_ANALYTICS_API_TOKEN: undefined });
+  it.each([undefined, ""])("503s when the analytics API token is %j", async (token) => {
+    const env = baseEnv({ ADMIN_TOKEN: "correct-token", CF_ANALYTICS_API_TOKEN: token });
     const res = await handleMargin(marginReq("correct-token"), env);
     expect(res.status).toBe(503);
     expect(((await res.json()) as any).error.type).toBe("analytics_unavailable");
@@ -143,5 +143,19 @@ describe("GET /admin/margin success", () => {
     const res = await handleMargin(marginReq("correct-token"), env, fetchMock);
     expect(res.status).toBe(503);
     expect(((await res.json()) as any).error.type).toBe("analytics_unavailable");
+  });
+});
+
+describe("usageDatasetName", () => {
+  it("defaults to the production dataset and accepts a configured identifier", () => {
+    expect(usageDatasetName({})).toBe(USAGE_DATASET);
+    expect(usageDatasetName({ USAGE_DATASET_NAME: "" })).toBe(USAGE_DATASET);
+    expect(usageDatasetName({ USAGE_DATASET_NAME: " other_usage " })).toBe("other_usage");
+  });
+
+  it("rejects anything that is not a plain identifier", () => {
+    for (const bad of ["x; DROP", "a-b", "1abc", "a b", "x".repeat(65)]) {
+      expect(usageDatasetName({ USAGE_DATASET_NAME: bad })).toBe(USAGE_DATASET);
+    }
   });
 });
