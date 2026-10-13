@@ -1,14 +1,27 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { hasPaddleTierPriceConfig, type Env, type PaidPlan } from "./config";
+import {
+  customDataLaneGeneration,
+  explicitPaddleLaneLock,
+  laneOfEnv,
+  paddleLaneGeneration,
+  retiredPaddleSubscriptionIds,
+  lockedPaddleLane,
+  PADDLE_LANE_METADATA_KEY,
+  storedPaddleLane,
+} from "./paddle-env";
 import { ApiError } from "./errors";
 import {
+  hasLivePaddleSubscriptionInForce,
+  isPaddleSubscriptionInForce,
   paddleCheckoutBindingMatchesEvent,
   paddleCustomerMatchesAccount,
   storedPaddleSubscriptionId,
   supersededPaddleSubscriptionIds,
 } from "./paddle-account";
 import { fetchPaddleSubscriptionSnapshot } from "./paddle-api";
+import { syncPaddleOverageLedgerLane, type PaddleOverageLedgerStore } from "./paddle-entitlement";
 import {
   buildSubscriptionRecord,
   customerIdFromEvent,
@@ -39,6 +52,8 @@ export type PaddleSubscriptionResult =
   | { idempotent: true }
   | { stale: true }
   | { ignored: "unknown_price" }
+  | { ignored: "lane_locked" }
+  | { ignored: "lane_reset" }
   | { mapped: false };
 
 export function parsePaddleSubscriptionBody(body: unknown): PaddleSubscriptionBody {
@@ -82,6 +97,7 @@ export async function recordPaddleSubscriptionInClerk(
   userId: string,
   body: PaddleSubscriptionBody,
   env: Env,
+  ledgerStore?: PaddleOverageLedgerStore,
 ): Promise<PaddleSubscriptionResult> {
   const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
 
@@ -94,8 +110,27 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   const meta = user.privateMetadata ?? {};
+  // Establish the old lane before updating Clerk. If Clerk succeeds but the
+  // ledger reset fails, the next subscription/purchase/refund repairs it from
+  // the freshly read subscription, including an idempotent webhook retry.
+  await syncPaddleOverageLedgerLane(ledgerStore, meta.subscription);
   if (!(await subscriptionEventMatchesAccount(userId, user, meta, body.event, env))) {
     return { mapped: false };
+  }
+
+  // 123 — admin reset: an event for a subscription the reset retired, or from
+  // a checkout made before the account's current reset generation, can never
+  // restore the state the reset cleared (nor re-lock the account's lane).
+  if (isFromBeforePaddleLaneReset(meta, body.event)) {
+    return { ignored: "lane_reset" };
+  }
+
+  // 123 — lane lock: an account locked to one Paddle environment never takes
+  // subscription state from the other. Nothing is written; the DO releases a
+  // matching checkout reservation so it can't be stranded.
+  const lock = lockedPaddleLane(meta);
+  if (lock !== null && lock !== laneOfEnv(env)) {
+    return { ignored: "lane_locked" };
   }
 
   const existingSub = asRecord(meta.subscription);
@@ -108,6 +143,16 @@ export async function recordPaddleSubscriptionInClerk(
     return { idempotent: true };
   }
 
+  // 123: never let a sandbox event overwrite a live subscription that is still
+  // in force (a QA account that also bought live, e.g. via the fallback test
+  // methods). Live replacements still need the checks below.
+  const incomingLane = laneOfEnv(env);
+  const existingLane = storedPaddleLane(existingSub);
+  const crossLane = !!existingSub && existingLane !== incomingLane;
+  if (crossLane && incomingLane === "sandbox" && hasLivePaddleSubscriptionInForce(existingSub)) {
+    return { stale: true };
+  }
+
   const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
   const supersededSubscriptionIds = supersededPaddleSubscriptionIds(existingSub);
   const incomingSubscriptionId = subscriptionIdFromEvent(body.event);
@@ -117,19 +162,21 @@ export async function recordPaddleSubscriptionInClerk(
   const isDifferentSubscription =
     !!existingSubscriptionId &&
     (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
+  const incomingOrder = subscriptionEventOrderKey(body.event.occurredAt, body.now);
+  // 123: event timestamps are only comparable within one Paddle environment. A
+  // live replacement is validated against Paddle itself (below), never rejected
+  // because an unrelated sandbox subscription has a later lifecycle event.
+  if (!isDifferentSubscription && !crossLane && existingSub) {
+    const existingOrder = storedSubscriptionOrderKey(existingSub);
+    if (existingOrder !== null && incomingOrder !== null && existingOrder > incomingOrder) {
+      return { stale: true };
+    }
+  }
   if (
     isDifferentSubscription &&
     !(await isCurrentSubscriptionReplacement(body.event, userId, env, existingSub))
   ) {
     return { stale: true };
-  }
-
-  const incomingOrder = subscriptionEventOrderKey(body.event.occurredAt, body.now);
-  if (!isDifferentSubscription && existingSub) {
-    const existingOrder = storedSubscriptionOrderKey(existingSub);
-    if (existingOrder !== null && incomingOrder !== null && existingOrder > incomingOrder) {
-      return { stale: true };
-    }
   }
 
   const record = {
@@ -146,9 +193,15 @@ export async function recordPaddleSubscriptionInClerk(
       supersededSubscriptionIds,
       isDifferentSubscription ? existingSubscriptionId : null,
     ),
+    // 123: Clerk deep-merges metadata, so the environment is written explicitly
+    // on EVERY subscription write: "sandbox" for sandbox events, null (which
+    // Clerk treats as "remove the key") for live ones. A live write can never
+    // leave an older sandbox stamp next to live ids.
+    paddleEnvironment: incomingLane === "sandbox" ? ("sandbox" as const) : null,
   };
+  const existingQuota = asRecord(meta.quota) ?? {};
   const quota = quotaForSubscriptionStatus(
-    asRecord(meta.quota) ?? {},
+    crossLane ? quotaWithoutPaddleOverage(existingQuota) : existingQuota,
     record.status,
     mapped.quotaPlan,
     env,
@@ -156,14 +209,32 @@ export async function recordPaddleSubscriptionInClerk(
 
   try {
     await clerk.users.updateUserMetadata(userId, {
-      privateMetadata: { subscription: record, quota },
+      privateMetadata: {
+        subscription: record,
+        quota,
+        // 123: the first subscription locks the account's lane.
+        ...(explicitPaddleLaneLock(meta) ? {} : { [PADDLE_LANE_METADATA_KEY]: incomingLane }),
+      },
     });
   } catch (err) {
     if (isClerkNotFoundError(err)) return { mapped: false };
     throw new ApiError(502, "entitlement_write_failed", "Could not record the subscription.");
   }
 
+  await syncPaddleOverageLedgerLane(ledgerStore, record);
   return { applied: true };
+}
+
+function isFromBeforePaddleLaneReset(meta: Record<string, unknown>, event: PaddleEvent): boolean {
+  const incomingId = subscriptionIdFromEvent(event);
+  if (incomingId && retiredPaddleSubscriptionIds(meta).includes(incomingId)) return true;
+  const generation = paddleLaneGeneration(meta);
+  if (generation === 0) return false;
+  const eventGeneration = customDataLaneGeneration(event.data.custom_data);
+  if (eventGeneration !== null) return eventGeneration < generation;
+  // No generation in the event's custom data: only accept it for the
+  // subscription already established after the reset.
+  return !incomingId || incomingId !== storedPaddleSubscriptionId(asRecord(meta.subscription));
 }
 
 function planMappingForSubscriptionEvent(
@@ -249,14 +320,27 @@ async function isCurrentSubscriptionReplacement(
     return false;
   }
 
+  if (storedPaddleLane(existingSub) !== laneOfEnv(env)) {
+    // A closed/paused subscription from the other environment cannot take over.
+    // A verified live subscription may replace an active sandbox subscription;
+    // its sandbox ID must never be looked up using live credentials.
+    return isActivePaddleSubscriptionStatus(snapshot.status);
+  }
+
   const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
   if (
     existingSubscriptionId &&
     existingSubscriptionId !== incomingSubscriptionId &&
-    isActiveStoredSubscription(existingSub)
+    isPaddleSubscriptionInForce(existingSub)
   ) {
+    // 123: a paused subscription is still live at Paddle (it can resume), so
+    // it blocks a replacement exactly like an active one.
     const existingSnapshot = await fetchPaddleSubscriptionSnapshot(env, existingSubscriptionId);
-    if (!existingSnapshot || isActivePaddleSubscriptionStatus(existingSnapshot.status)) {
+    if (
+      !existingSnapshot ||
+      isActivePaddleSubscriptionStatus(existingSnapshot.status) ||
+      existingSnapshot.status === "paused"
+    ) {
       return false;
     }
     if (incomingCustomerId && existingSnapshot.customerId !== incomingCustomerId) {
@@ -265,11 +349,6 @@ async function isCurrentSubscriptionReplacement(
   }
 
   return true;
-}
-
-function isActiveStoredSubscription(existingSub: Record<string, unknown> | null): boolean {
-  const status = existingSub?.status;
-  return isActivePaddleSubscriptionStatus(status);
 }
 
 function isActivePaddleSubscriptionStatus(status: unknown): boolean {
@@ -303,6 +382,22 @@ function isPaddleSubscriptionStatus(value: unknown): value is string {
     value === "paused" ||
     value === "canceled"
   );
+}
+
+function quotaWithoutPaddleOverage(quota: Record<string, unknown>): Record<string, unknown> {
+  // Null removes keys under Clerk's deep merge. Omitting them would retain the
+  // other environment's purchases and replay state as current entitlement.
+  return {
+    ...quota,
+    extraDrafts: null,
+    extraDraftsWindowStart: null,
+    lastOverageEventId: null,
+    processedOverageEventIds: null,
+    processedOverageAdjustmentIds: null,
+    overageCreditTransactions: null,
+    overageCredits: null,
+    pendingOverageReversals: null,
+  };
 }
 
 function quotaForSubscriptionStatus(

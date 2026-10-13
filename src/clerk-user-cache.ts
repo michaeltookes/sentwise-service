@@ -6,8 +6,9 @@
 // (which would surface as account_lookup_failed for every user - a whole-service
 // DoS).
 //
-// Scope (deliberately narrow): only the pure-READ, hammer-able request paths use
-// the cache — GET /v1/me and GET /v1/paddle/manage-billing (`useCache: true`).
+// Scope (deliberately narrow): only GET /v1/me uses the cache (`useCache: true`).
+// GET /v1/paddle/manage-billing reads fresh to resolve the Paddle environment and
+// subscription identifiers together before creating a portal session.
 // POST /v1/draft is protected by the rate-limit reorder instead and reads fresh;
 // DELETE /v1/me and every read-modify-write entitlement path read fresh so a
 // concurrent write is never lost.

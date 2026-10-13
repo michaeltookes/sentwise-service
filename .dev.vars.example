@@ -11,3 +11,17 @@ ANTHROPIC_API_KEY="sk-ant-..."
 # `wrangler secret put` (see README), not committed.
 # ADMIN_TOKEN="dev-admin-token"
 # CF_ANALYTICS_API_TOKEN="cf-api-token"
+
+# 123 Paddle sandbox lane (optional locally). PADDLE_ENV="sandbox" routes
+# @prowlqa.dev accounts to the Paddle sandbox; everyone else stays on the
+# production values. Use SANDBOX credentials only — never paste live keys here.
+# PADDLE_ENV="sandbox"
+# PADDLE_SANDBOX_API_KEY="pdl_sdbx_apikey_..."
+# PADDLE_SANDBOX_WEBHOOK_SECRET="pdl_ntfset_..."
+# Optional stable sandbox checkout binding and its previous value during rotation:
+# PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET="replace-with-sandbox-binding-secret"
+# PADDLE_SANDBOX_CHECKOUT_BINDING_PREVIOUS_SECRET="replace-with-previous-sandbox-binding-secret"
+# PADDLE_SANDBOX_CLIENT_TOKEN="test_..."
+# PADDLE_SANDBOX_STARTER_PRICE_ID="pri_..."
+# PADDLE_SANDBOX_PRO_PRICE_ID="pri_..."
+# PADDLE_SANDBOX_UNLIMITED_PRICE_ID="pri_..."
