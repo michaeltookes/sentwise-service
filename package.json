@@ -11,10 +11,12 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "deploy:sandbox": "bash scripts/deploy-sandbox.sh",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "predeploy": "npm run lint && npm run typecheck && npm run test",
+    "predeploy:sandbox": "npm run lint && npm run typecheck && npm run test",
     "gen-dev-vars": "bash scripts/gen-dev-vars.sh",
     "check-no-body-logging": "bash scripts/check-no-body-logging.sh",
     "lint": "eslint . && prettier --check .",
