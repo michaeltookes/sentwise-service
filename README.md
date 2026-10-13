@@ -118,7 +118,7 @@ Requires `Authorization: Bearer <clerk-session-token>`. Returns the account for 
     "enforcement": "soft",
     "extraPurchased": 0
   },
-  "billing": { "environment": "production" }
+  "billing": { "environment": "production", "checkoutAvailable": true }
 }
 ```
 
@@ -132,10 +132,13 @@ access. `DELETE /v1/me` always bypasses the cache, and starting the trial invali
 #### `billing` (item 123)
 
 Which Paddle checkout the app must open for this account. Production accounts always get
-`{ "environment": "production" }` and the app uses its embedded live token and price ids. Only when
-`PADDLE_ENV=sandbox` **and** the account's primary email is `@prowlqa.dev` (and the sandbox client
-token and all three sandbox price vars are set) does it return
-`{ "environment": "sandbox", "clientSideToken": "test_…", "prices": { "starter", "pro", "unlimited" } }`.
+`{ "environment": "production", "checkoutAvailable": true }` and the app uses its embedded live
+token and price ids. When `PADDLE_ENV=sandbox` **and** the account's primary email is
+`@prowlqa.dev` it returns
+`{ "environment": "sandbox", "checkoutAvailable": true, "clientSideToken": "test_…", "prices": { "starter", "pro", "unlimited" } }`,
+or `{ "environment": "sandbox", "checkoutAvailable": false }` if any sandbox value (API key,
+webhook secret, client token, three distinct price ids) is missing; that account's
+`POST /v1/paddle/checkout` then returns `503 sandbox_checkout_unavailable`.
 See [Paddle sandbox lane](#paddle-sandbox-lane-123).
 
 #### `subscription` (item 73)
@@ -685,21 +688,34 @@ Paddle test event → a real entitlement write) happens then.
 
 One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddle-env.ts`):
 
-| `PADDLE_ENV`                     | Who uses the sandbox                                      | Live destination     | Sandbox destination          |
-| -------------------------------- | --------------------------------------------------------- | -------------------- | ---------------------------- |
-| `production` (committed default) | nobody; `PADDLE_API_BASE` is forced to the live base      | `/v1/paddle/webhook` | 404                          |
-| `sandbox`                        | accounts whose primary email is exactly `@prowlqa.dev`    | `/v1/paddle/webhook` | `/v1/paddle/webhook/sandbox` |
-| unset                            | nobody; legacy behavior (`PADDLE_API_BASE` as configured) | `/v1/paddle/webhook` | 404                          |
+| `PADDLE_ENV`                     | Who starts sandbox checkouts                              | Live destination     | Sandbox destination                                              |
+| -------------------------------- | --------------------------------------------------------- | -------------------- | ---------------------------------------------------------------- |
+| `production` (committed default) | nobody; `PADDLE_API_BASE` is forced to the live base      | `/v1/paddle/webhook` | open only while `PADDLE_SANDBOX_WEBHOOK_SECRET` is set, else 404 |
+| `sandbox`                        | accounts whose primary email is exactly `@prowlqa.dev`    | `/v1/paddle/webhook` | `/v1/paddle/webhook/sandbox`                                     |
+| unset                            | nobody; legacy behavior (`PADDLE_API_BASE` as configured) | `/v1/paddle/webhook` | as for `production`                                              |
 
 - A sandbox-lane request **replaces** every Paddle value: sandbox API base, `PADDLE_SANDBOX_API_KEY`,
   `PADDLE_SANDBOX_WEBHOOK_SECRET`, the `PADDLE_SANDBOX_*_PRICE_ID` vars, and a checkout-binding
   secret of its own. It never falls back to a live key, secret, or price id, and a live-lane request
   never sees a sandbox one.
-- Each webhook destination verifies with **its own lane's secret only**. A sandbox event that maps
-  to a non-QA account is acknowledged and dropped, so a sandbox purchase can never touch a real
-  customer's entitlement.
-- The Worker tells the AccountQuota Durable Object the lane with an internal header; the DO rebuilds
-  the lane from its own env, so the header alone can never enable the sandbox.
+- Each webhook destination verifies with **its own lane's secret only**. A sandbox event is applied
+  only to a QA account or to an account whose stored subscription was itself created in the
+  sandbox, and never overwrites a live subscription that is still in force.
+- **Objects remember their lane.** A checkout reservation made in the sandbox lane and a
+  subscription written by a sandbox webhook carry `paddleEnvironment: "sandbox"`. Work on an
+  existing object (checking or cancelling a pending transaction, manage billing) goes to the lane it
+  was created in, whatever `PADDLE_ENV` says now, so a live transaction is never looked up in the
+  sandbox (and mistaken for gone) or vice versa. A pending checkout from the other lane is cancelled
+  where it lives before a new one is minted.
+- **Stranded sandbox subscriptions.** Once the lane closes or the email leaves `@prowlqa.dev`, a
+  sandbox subscription is not a paid plan: `/v1/me` falls back to the trial/none state, its
+  webhook-written tier caps and extras are ignored, a live checkout isn't blocked by it (and never
+  receives its sandbox customer id), and plan changes return `409 billing_environment_mismatch`.
+  Manage billing still opens the sandbox portal so it can be cancelled. A live subscription in force
+  still blocks a sandbox checkout.
+- The Worker tells the AccountQuota Durable Object the lane with an internal header (the DO is not
+  reachable from outside the Worker); the Worker is the gate for who enters the sandbox.
+- Production-only deployments (lane off, no sandbox credentials) make no extra Clerk lookups.
 - Setup on Paddle's side (sandbox account, catalog, notification destination, test cards) is in the
   app repo's `docs/billing-qa.md`.
 
