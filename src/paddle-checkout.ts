@@ -12,7 +12,6 @@ import {
 import {
   cancelPaddleTransaction,
   createPaddleCheckoutTransaction,
-  fetchPaddleSubscriptionSnapshot,
   fetchPaddleTransactionSnapshot,
   findPaddleCheckoutTransactionByReservationId,
   type PaddleCheckoutReservationTransactionSnapshot,
@@ -63,7 +62,7 @@ export async function handlePaddleCheckout(
   let account = await loadCheckoutAccount(userId, env);
   let customerId = storedPaddleCustomerId(account.subscription);
 
-  await assertCheckoutEligible(body, account.subscription, customerId, env);
+  assertCheckoutEligible(body, account.subscription, customerId);
 
   const checkoutReservationId = crypto.randomUUID();
   const existingTransaction = await reserveCheckout(
@@ -77,7 +76,7 @@ export async function handlePaddleCheckout(
     try {
       account = await loadCheckoutAccount(userId, env);
       customerId = storedPaddleCustomerId(account.subscription);
-      await assertCheckoutEligible(body, account.subscription, customerId, env);
+      assertCheckoutEligible(body, account.subscription, customerId);
     } catch (err) {
       if (isCheckoutEligibilityError(err)) {
         await cancelPaddleTransaction(env, existingTransaction.transactionId);
@@ -91,7 +90,7 @@ export async function handlePaddleCheckout(
   try {
     account = await loadCheckoutAccount(userId, env);
     customerId = storedPaddleCustomerId(account.subscription);
-    await assertCheckoutEligible(body, account.subscription, customerId, env);
+    assertCheckoutEligible(body, account.subscription, customerId);
   } catch (err) {
     await releaseCheckoutReservation(env, userId, body.kind, checkoutReservationId).catch(
       () => undefined,
@@ -146,13 +145,12 @@ export async function handlePaddleCheckout(
   return checkoutResponse(transaction);
 }
 
-async function assertCheckoutEligible(
+function assertCheckoutEligible(
   body: CheckoutRequestBody,
   rawSubscription: unknown,
   customerId: string | null,
-  env: Env,
-): Promise<void> {
-  if (body.kind === "subscription" && (await hasPaddleSubscriptionInForce(rawSubscription, env))) {
+): void {
+  if (body.kind === "subscription" && hasActivePaddleSubscription(rawSubscription)) {
     throw new ApiError(
       409,
       "billing_subscription_active",
@@ -617,24 +615,6 @@ function hasActivePaddleSubscription(rawSubscription: unknown): boolean {
     return false;
   }
   return isPaidPlan(subscription.plan) || storedPaddleSubscriptionId(rawSubscription) !== null;
-}
-
-async function hasPaddleSubscriptionInForce(rawSubscription: unknown, env: Env): Promise<boolean> {
-  if (hasActivePaddleSubscription(rawSubscription)) return true;
-  const subscriptionId = storedPaddleSubscriptionId(rawSubscription);
-  if (!subscriptionId) return false;
-
-  // The public status maps paused to canceled. Confirm the live billing status
-  // before replacing any stored subscription, including older normalized records.
-  const snapshot = await fetchPaddleSubscriptionSnapshot(env, subscriptionId);
-  if (snapshot?.status === "canceled") return false;
-  if (
-    snapshot?.status === "paused" ||
-    (snapshot?.status && ACTIVE_SUBSCRIPTION_STATUSES.has(snapshot.status))
-  ) {
-    return true;
-  }
-  throw new ApiError(502, "subscription_lookup_failed", "Could not confirm the subscription.");
 }
 
 function isPaidPlan(value: unknown): boolean {

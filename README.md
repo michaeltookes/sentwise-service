@@ -169,8 +169,7 @@ applying on the next read (lazy expiry — no cron).
 ### `GET /v1/paddle/manage-billing`
 
 Requires `Authorization: Bearer <clerk-session-token>`. Reads the account's stored
-`paddleSubscriptionId` from Clerk without using the `/v1/me` display cache, mints a **fresh**
-authenticated link **on demand**, and returns
+`paddleSubscriptionId`, mints a **fresh** authenticated link **on demand**, and returns
 **`200`** with `{ "managementUrl": "<fresh Paddle URL>" }` and `Cache-Control: no-store`. The app
 should navigate the browser to the returned URL.
 
@@ -490,13 +489,10 @@ webhook, which turns billing events into the account's entitlement — the `subs
 `priceId` must be one of the configured subscription tier prices or `EXTRA_DRAFTS_PRICE_ID`.
 Subscription quantities must be `1`; omitted quantities default to `1`, explicitly supplied
 quantities must be positive integers, and overage quantities are capped. Subscription checkout is
-rejected while the account already has an active/trialing/past-due or paused Paddle subscription, so tier
+rejected while the account already has an active/trialing/past-due Paddle subscription, so tier
 changes must go through [`POST /v1/paddle/change-plan`](#post-v1paddlechange-plan) (an in-place
-Paddle subscription update) instead of creating a second recurring subscription. Because paused
-subscriptions have a public status of `canceled`, checkout verifies the live Paddle status before
-replacing a stored subscription. Only a confirmed cancellation allows replacement; an unavailable
-or unrecognized status returns **`502 subscription_lookup_failed`**. Subscription checkout creation
-is also serialized per account with a short-lived
+Paddle subscription update) instead of creating a second recurring subscription. Subscription
+checkout creation is also serialized per account with a short-lived
 Durable Object reservation id included in Paddle `custom_data`; a concurrent request that races the
 in-flight mint is rejected while a checkout transaction is pending, and a retry for the _same_
 price/quantity resumes the existing recoverable transaction rather than minting a second one. A
