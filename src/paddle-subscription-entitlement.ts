@@ -250,13 +250,11 @@ async function isCurrentSubscriptionReplacement(
   }
 
   const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
-  if (
-    existingSubscriptionId &&
-    existingSubscriptionId !== incomingSubscriptionId &&
-    isActiveStoredSubscription(existingSub)
-  ) {
+  if (existingSubscriptionId && existingSubscriptionId !== incomingSubscriptionId) {
+    // Paused subscriptions have public status "canceled" but can still resume.
+    // Only replace a stored subscription after Paddle confirms it is canceled.
     const existingSnapshot = await fetchPaddleSubscriptionSnapshot(env, existingSubscriptionId);
-    if (!existingSnapshot || isActivePaddleSubscriptionStatus(existingSnapshot.status)) {
+    if (existingSnapshot?.status !== "canceled") {
       return false;
     }
     if (incomingCustomerId && existingSnapshot.customerId !== incomingCustomerId) {
@@ -265,15 +263,6 @@ async function isCurrentSubscriptionReplacement(
   }
 
   return true;
-}
-
-function isActiveStoredSubscription(existingSub: Record<string, unknown> | null): boolean {
-  const status = existingSub?.status;
-  return isActivePaddleSubscriptionStatus(status);
-}
-
-function isActivePaddleSubscriptionStatus(status: unknown): boolean {
-  return status === "active" || status === "trialing" || status === "past_due";
 }
 
 function paddleSubscriptionStatusFromEvent(event: PaddleEvent): string | null {
