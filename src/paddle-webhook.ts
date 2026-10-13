@@ -11,7 +11,7 @@
 // webhook body.
 
 import { createClerkClient } from "@clerk/backend";
-import { isClerkNotFoundError } from "./auth";
+import { isClerkNotFoundError, primaryEmail } from "./auth";
 import {
   DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES,
   DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC,
@@ -25,6 +25,7 @@ import {
   paddleCustomerMatchesStoredAccount,
 } from "./paddle-account";
 import { fetchPaddleCustomerEmail, fetchPaddleTransactionSnapshot } from "./paddle-api";
+import { isQaAccountEmail } from "./paddle-env";
 import {
   adjustedTransactionIdFromEvent,
   adjustmentIdFromEvent,
@@ -103,6 +104,13 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
     return ack({ mapped: false });
   }
 
+  // 123 — a sandbox event may only ever touch a QA account. Even a correctly
+  // signed sandbox event that maps to a production account is dropped, so a
+  // sandbox purchase can never grant (or revoke) a real customer's entitlement.
+  if (env.PADDLE_LANE === "sandbox" && !(await isQaAccount(clerk, userId))) {
+    return ack({ mapped: false });
+  }
+
   if (isSubscriptionEvent(event.eventType)) {
     return await applySubscriptionEvent(event, env, userId);
   }
@@ -116,6 +124,18 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 // ---------------------------------------------------------------------------
 // Subscription lifecycle → subscription record + per-tier quota limit.
 // ---------------------------------------------------------------------------
+
+async function isQaAccount(
+  clerk: ReturnType<typeof createClerkClient>,
+  userId: string,
+): Promise<boolean> {
+  try {
+    return isQaAccountEmail(primaryEmail(await clerk.users.getUser(userId)));
+  } catch (err) {
+    if (isClerkNotFoundError(err)) return false;
+    throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");
+  }
+}
 
 async function applySubscriptionEvent(
   event: PaddleEvent,

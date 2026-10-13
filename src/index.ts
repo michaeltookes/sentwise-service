@@ -41,6 +41,13 @@ import { handlePaddleManageBilling } from "./paddle-management";
 import { handlePaddleChangePlan } from "./paddle-plan";
 import { handlePaddleWebhook } from "./paddle-webhook";
 import { isCallbackPath, renderCallbackPage } from "./callback";
+import {
+  paddleClientConfig,
+  paddleEnvForLane,
+  paddleLaneForEmail,
+  sandboxLaneEnabled,
+} from "./paddle-env";
+import { paddleEnvForUser } from "./paddle-lane";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -60,6 +67,9 @@ export { AccountQuota } from "./quota-do";
  *   POST   /v1/paddle/change-plan -> change an active subscription's tier with proration (90)
  *   GET    /v1/paddle/manage-billing -> JSON fresh Paddle billing-management URL
  *   POST   /v1/paddle/webhook -> Paddle checkout/licensing events -> entitlement writes (56c; signature-auth, no bearer)
+ *   POST   /v1/paddle/webhook/sandbox -> the same, for the Paddle SANDBOX notification
+ *          destination; verified with the sandbox secret only, QA accounts only,
+ *          404 unless PADDLE_ENV=sandbox (123)
  *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
  *   GET/POST/DELETE /admin/comp -> inspect/grant/revoke a comp entitlement for a
  *          named account (item 111; ADMIN_TOKEN; 404 when unset)
@@ -105,23 +115,37 @@ export default {
       // 56c — Paddle checkout/licensing webhook. Authenticated by the Paddle
       // signature (HMAC over ts:rawBody), NOT a Clerk bearer, so it runs before
       // authenticate(). It writes entitlements into Clerk privateMetadata.
+      // 123 — each webhook destination is verified with ITS lane's secret only:
+      // the live destination never accepts a sandbox signature and vice versa.
       if (pathname === "/v1/paddle/webhook" && request.method === "POST") {
-        return await handlePaddleWebhook(request, env);
+        return await handlePaddleWebhook(request, paddleEnvForLane(env, "production"));
+      }
+
+      if (
+        pathname === "/v1/paddle/webhook/sandbox" &&
+        request.method === "POST" &&
+        sandboxLaneEnabled(env)
+      ) {
+        return await handlePaddleWebhook(request, paddleEnvForLane(env, "sandbox"));
       }
 
       if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
-        return await handlePaddleManageBilling(userId, request, env);
+        return await handlePaddleManageBilling(
+          userId,
+          request,
+          await paddleEnvForUser(userId, env),
+        );
       }
 
       if (pathname === "/v1/paddle/checkout" && request.method === "POST") {
         const { userId } = await authenticate(request, env);
-        return await handlePaddleCheckout(userId, request, env);
+        return await handlePaddleCheckout(userId, request, await paddleEnvForUser(userId, env));
       }
 
       if (pathname === "/v1/paddle/change-plan" && request.method === "POST") {
         const { userId } = await authenticate(request, env);
-        return await handlePaddleChangePlan(userId, request, env);
+        return await handlePaddleChangePlan(userId, request, await paddleEnvForUser(userId, env));
       }
 
       if (pathname === "/v1/me" && request.method === "GET") {
@@ -148,6 +172,9 @@ export default {
           trial: account.trial,
           subscription: account.subscription,
           quota: buildQuota(window, limits),
+          // 123 — which Paddle checkout this account must open. Production
+          // accounts only ever get { environment: "production" }.
+          billing: paddleClientConfig(env, paddleLaneForEmail(env, account.email)),
         });
       }
 
@@ -163,7 +190,13 @@ export default {
         if (account && !account.compApplied && hasPaidAccess(account.subscription)) {
           throw activeSubscriptionDeletionError();
         }
-        if (account && (await hasOpenPaddleCheckout(userId, env))) {
+        if (
+          account &&
+          (await hasOpenPaddleCheckout(
+            userId,
+            paddleEnvForLane(env, paddleLaneForEmail(env, account.email)),
+          ))
+        ) {
           throw new ApiError(
             409,
             "billing_checkout_pending",
@@ -341,6 +374,7 @@ export default {
         pathname === "/v1/paddle/change-plan" ||
         pathname === "/v1/paddle/manage-billing" ||
         pathname === "/v1/paddle/webhook" ||
+        (pathname === "/v1/paddle/webhook/sandbox" && sandboxLaneEnabled(env)) ||
         pathname === "/healthz" ||
         isCallbackPath(pathname) ||
         (pathname === "/admin/margin" && !!env.ADMIN_TOKEN) ||

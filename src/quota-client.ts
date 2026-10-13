@@ -2,6 +2,7 @@
 // Object (56b). Keeps the DO-plumbing out of src/index.ts.
 
 import type { Env, PaidPlan } from "./config";
+import { PADDLE_LANE_HEADER } from "./paddle-env";
 import { ApiError, type ErrorExtra } from "./errors";
 import type { ResolvedLimits, WindowState } from "./metering";
 import type { InterestTopic } from "./interest";
@@ -98,7 +99,12 @@ async function call<T>(env: Env, userId: string, op: string, body: unknown): Pro
   const stub = env.ACCOUNT_QUOTA.get(id);
   const res = await stub.fetch(`https://account-quota.internal${op}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      // 123 — the DO rebuilds the same lane env from this; it re-checks
+      // PADDLE_ENV itself, so the header alone can never enable the sandbox.
+      ...(env.PADDLE_LANE === "sandbox" ? { [PADDLE_LANE_HEADER]: "sandbox" } : {}),
+    },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
