@@ -136,6 +136,28 @@ describe("parseSubscriptionOverride", () => {
     expect(parseSubscriptionOverride({ plan: "individual", status: "active" })).toBeNull();
   });
 
+  it("reports paddleStatus only for a paused Paddle subscription (sentwise#124)", () => {
+    expect(
+      parseSubscriptionOverride({ plan: "pro", status: "canceled", paddleStatus: "paused" }),
+    ).toEqual({
+      plan: "pro",
+      status: "canceled",
+      renewsAt: null,
+      manageBillingUrl: null,
+      paddleStatus: "paused",
+    });
+    expect(
+      parseSubscriptionOverride({ plan: "pro", status: "canceled", paddleStatus: "canceled" }),
+    ).toEqual({ plan: "pro", status: "canceled", renewsAt: null, manageBillingUrl: null });
+    expect(
+      parseSubscriptionOverride({ plan: "pro", status: "active", paddleStatus: "active" }),
+    ).toEqual({ plan: "pro", status: "active", renewsAt: null, manageBillingUrl: null });
+    // A display status that disagrees with paused is never reported as paused.
+    expect(
+      parseSubscriptionOverride({ plan: "pro", status: "active", paddleStatus: "paused" }),
+    ).not.toHaveProperty("paddleStatus");
+  });
+
   it("drops a malformed renewsAt to null but keeps a valid record", () => {
     expect(
       parseSubscriptionOverride({ plan: "pro", status: "active", renewsAt: "not-a-date" }),

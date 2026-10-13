@@ -584,6 +584,43 @@ describe("POST /v1/draft trial handling", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("GET /v1/me reports a paused subscription as canceled with paddleStatus paused, and drafting stays denied (sentwise#124)", async () => {
+    const started = new Date(Date.now() - TRIAL_MS - 1000).toISOString();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_paused_me" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: started,
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleStatus: "paused",
+          paddleSubscriptionId: "sub_paused",
+        },
+      }),
+    );
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(200);
+    expect(((await me.json()) as any).subscription).toEqual({
+      plan: "pro",
+      status: "canceled",
+      renewsAt: null,
+      manageBillingUrl: null,
+      paddleStatus: "paused",
+    });
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk()));
+    const draft = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
+      env,
+    );
+    expect(draft.status).toBe(402);
+  });
+
   it("still 402s an expired trial whose subscription is canceled (56c)", async () => {
     const started = new Date(Date.now() - TRIAL_MS - 1000).toISOString();
     mocks.verifyToken.mockResolvedValue({ sub: "user_123" });

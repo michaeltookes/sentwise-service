@@ -587,7 +587,9 @@ as `paddleStatus` (`"paused"`). A paused subscription still exists at Paddle and
 treated as in force: `POST /v1/paddle/checkout` refuses a new subscription checkout with
 `409 billing_subscription_active`, and a different subscription's webhook cannot replace it, which
 keeps a later `subscription.resumed` applicable. Records written before `paddleStatus` existed fall
-back to `status`.
+back to `status`. `GET /v1/me` adds `"paddleStatus": "paused"` to the `subscription` block only for a
+paused subscription (the field is absent otherwise), so the app can show "Paused" instead of
+"Canceled"; drafting stays denied while paused.
 
 **Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
 is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or
