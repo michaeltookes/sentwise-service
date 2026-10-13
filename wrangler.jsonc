@@ -23,6 +23,7 @@
   // silently (a known 56b gotcha), which then fails webhook verification with 401.
   "vars": {
     "CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsuc2VudHdpc2UuYWkk", // production instance (clerk.sentwise.ai)
+    "APP_URL_SCHEME": "sentwise", // scheme the /auth/callback page forwards to (app Info.plist)
 
     // --- 56b metering limits (placeholder defaults; final numbers land with 56c) ---
     "MONTHLY_DRAFT_LIMIT": "400", // base drafts per account per calendar month (1st 00:00 UTC reset); governs trials + fallback
@@ -97,6 +98,9 @@
       "workers_dev": true,
       "vars": {
         "CLERK_PUBLISHABLE_KEY": "<clerk-development-publishable-key>", // pk_test_… of the Clerk development instance
+        // The QA app build registers its own scheme (SENTWISE_URL_SCHEME in the
+        // app's QA.xcconfig) so production sign-in callbacks never reach it.
+        "APP_URL_SCHEME": "sentwise-qa",
 
         // Metering: same limits as production.
         "MONTHLY_DRAFT_LIMIT": "400",

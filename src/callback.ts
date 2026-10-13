@@ -15,8 +15,18 @@
 // URL-encoded (never interpolated into HTML/JS) so they cannot inject.
 
 import { ApiError } from "./errors";
+import type { Env } from "./config";
 
-const APP_SCHEME = "sentwise";
+// The Mac app's custom URL scheme. A deployment that serves a differently
+// identified app build (its own scheme registered in that build's Info.plist)
+// sets APP_URL_SCHEME; anything that is not a plain RFC 3986 scheme falls back
+// to the default so the page can never navigate to an injected value.
+export const DEFAULT_APP_URL_SCHEME = "sentwise";
+
+export function appUrlScheme(env: Pick<Env, "APP_URL_SCHEME">): string {
+  const configured = env.APP_URL_SCHEME?.trim().toLowerCase() ?? "";
+  return /^[a-z][a-z0-9+.-]{0,31}$/.test(configured) ? configured : DEFAULT_APP_URL_SCHEME;
+}
 
 interface CallbackRoute {
   /** Host of the `sentwise://<host>` deep link the page forwards to. */
@@ -51,10 +61,13 @@ export function isCallbackPath(pathname: string): boolean {
   return Object.hasOwn(ROUTES, pathname);
 }
 
-export function renderCallbackPage(pathname: string): Response {
+export function renderCallbackPage(
+  pathname: string,
+  scheme: string = DEFAULT_APP_URL_SCHEME,
+): Response {
   const route = ROUTES[pathname];
   if (!route) throw new ApiError(404, "not_found", "Not found.");
-  return new Response(page(route), {
+  return new Response(page(route, scheme), {
     status: 200,
     headers: {
       "content-type": "text/html; charset=utf-8",
@@ -81,13 +94,14 @@ export function normalizeCallbackFragment(hash: string): string {
   return queryStart === -1 ? fragment : fragment.slice(queryStart + 1);
 }
 
-// route.host / route.params are compile-time constants (never user input), and
+// route.host / route.params are compile-time constants and the scheme is a
+// validated deployment var (appUrlScheme; never request input), and
 // they are embedded via JSON.stringify so they are valid JS literals. The
 // runtime values from the URL are NEVER interpolated into the page — they are
 // read in the browser and only ever placed into a URLSearchParams (which
 // percent-encodes them) or assigned via textContent, so they cannot inject into
 // the HTML or the script.
-function page(route: CallbackRoute): string {
+function page(route: CallbackRoute, scheme: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -152,7 +166,7 @@ function page(route: CallbackRoute): string {
       var v = pick(PARAMS[i]);
       if (v !== null) out.set(PARAMS[i], v);
     }
-    var deep = "${APP_SCHEME}://" + HOST + "?" + out.toString();
+    var deep = "${scheme}://" + HOST + "?" + out.toString();
     var btn = document.getElementById("btn");
     btn.href = deep; btn.style.display = "inline-block";
     location.replace(deep);

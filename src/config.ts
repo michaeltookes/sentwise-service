@@ -32,6 +32,10 @@ export interface Env {
   // set, and native-app session tokens may lack `azp`. Confirm the app's tokens
   // carry a matching `azp` before enabling it. See src/auth.ts.
   CLERK_AUTHORIZED_PARTIES?: string;
+  // Custom URL scheme the OAuth landing pages (src/callback.ts) forward to.
+  // Defaults to "sentwise"; a deployment serving a differently identified app
+  // build sets that build's scheme.
+  APP_URL_SCHEME?: string;
 
   // 56b — metering. Durable Object namespace holding per-account usage counters.
   ACCOUNT_QUOTA: DurableObjectNamespace;

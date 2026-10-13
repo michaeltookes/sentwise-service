@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env as testEnv } from "cloudflare:test";
 import type { Env } from "../src/config";
 import worker from "../src/index";
-import { isCallbackPath, normalizeCallbackFragment } from "../src/callback";
+import { appUrlScheme, isCallbackPath, normalizeCallbackFragment } from "../src/callback";
 
 // The callback routes are static, unauthenticated landing pages: worker.fetch
 // returns before it touches Clerk/Anthropic/the quota DO, so the base test env
@@ -124,5 +124,29 @@ describe("OAuth callback landing pages (item 89)", () => {
     expect(unknown.status).toBe(404);
     const body = await unknown.json();
     expect(body).toMatchObject({ error: { type: "not_found" } });
+  });
+});
+
+describe("APP_URL_SCHEME", () => {
+  it("defaults to sentwise and accepts a configured scheme", () => {
+    expect(appUrlScheme({})).toBe("sentwise");
+    expect(appUrlScheme({ APP_URL_SCHEME: "" })).toBe("sentwise");
+    expect(appUrlScheme({ APP_URL_SCHEME: " Other-App " })).toBe("other-app");
+  });
+
+  it("rejects anything that is not a plain URL scheme", () => {
+    for (const bad of ['x"; alert(1)//', "1abc", "a b", "javascript:", "x".repeat(33)]) {
+      expect(appUrlScheme({ APP_URL_SCHEME: bad })).toBe("sentwise");
+    }
+  });
+
+  it("forwards the callback page to the configured scheme", async () => {
+    const res = await worker.fetch(
+      new Request("https://sentwise-inference.example/auth/callback"),
+      { ...env, APP_URL_SCHEME: "other-app" },
+    );
+    const html = await res.text();
+    expect(html).toContain('"other-app://"');
+    expect(html).not.toContain('"sentwise://"');
   });
 });
