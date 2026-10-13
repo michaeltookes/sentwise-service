@@ -91,6 +91,9 @@ export interface Env {
   // Internal, never configured: the lane a request was resolved to. Set only by
   // paddleEnvForLane() and forwarded to the AccountQuota DO as a header.
   PADDLE_LANE?: "sandbox" | "production";
+  // Internal, never configured: the unresolved Worker env behind a lane env, so
+  // work on a stored object can re-route to the lane it was created in.
+  PADDLE_ROOT_ENV?: Env;
 
   // 56c — per-tier monthly draft limits (the marketed caps; owner decision
   // 2026-09-16). Tunable per-deploy without shipping a new binary, and written

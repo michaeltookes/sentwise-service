@@ -63,37 +63,130 @@ export function paddleLaneFromHeader(value: string | null | undefined): PaddleLa
 
 /**
  * The Env a request in `lane` must use. A sandbox lane request on a Worker whose
- * PADDLE_ENV is not "sandbox" is downgraded to production — the header (or any
- * caller) can never switch the lane on by itself.
+ * PADDLE_ENV is not "sandbox" is downgraded to production: this is the entry
+ * gate for NEW sandbox activity (checkout, /v1/me). Work on objects that already
+ * exist in the sandbox (a reservation or subscription created there) uses
+ * paddleEnvForStoredLane instead, which never downgrades.
  */
 export function paddleEnvForLane(env: Env, lane: PaddleLane): Env {
-  const mode = configuredPaddleEnv(env);
-  if (lane === "sandbox" && mode === "sandbox") {
-    return {
-      ...env,
-      PADDLE_LANE: "sandbox",
-      PADDLE_API_BASE: PADDLE_SANDBOX_API_BASE,
-      PADDLE_API_KEY: env.PADDLE_SANDBOX_API_KEY,
-      PADDLE_WEBHOOK_SECRET: env.PADDLE_SANDBOX_WEBHOOK_SECRET,
-      PADDLE_CHECKOUT_BINDING_SECRET: env.PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET,
-      PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET: undefined,
-      PADDLE_STARTER_PRICE_ID: env.PADDLE_SANDBOX_STARTER_PRICE_ID,
-      PADDLE_PRO_PRICE_ID: env.PADDLE_SANDBOX_PRO_PRICE_ID,
-      PADDLE_UNLIMITED_PRICE_ID: env.PADDLE_SANDBOX_UNLIMITED_PRICE_ID,
-      EXTRA_DRAFTS_PRICE_ID: env.PADDLE_SANDBOX_EXTRA_DRAFTS_PRICE_ID,
-    };
+  const root = rootPaddleEnv(env);
+  if (lane === "sandbox" && configuredPaddleEnv(root) === "sandbox") {
+    return sandboxEnv(root);
   }
-  if (mode === null) {
-    // Legacy deployments (PADDLE_ENV unset) keep their configuration untouched.
-    return { ...env, PADDLE_LANE: "production" };
-  }
-  // Explicit production: always the live API base, whatever PADDLE_API_BASE says.
-  return { ...env, PADDLE_LANE: "production", PADDLE_API_BASE: PADDLE_LIVE_API_BASE };
+  return productionEnv(root);
 }
 
-/** What the app needs to open the right checkout for this account (GET /v1/paddle/config). */
+/**
+ * The Env for an object that was CREATED in `lane` (a pending checkout
+ * reservation, a stored subscription, a signed sandbox webhook). Routes by where
+ * the object lives, whatever PADDLE_ENV says now, so a sandbox transaction is
+ * never looked up on (and mistaken as "gone" by) the live API and vice versa.
+ * Missing sandbox credentials make the sandbox calls fail closed.
+ */
+export function paddleEnvForStoredLane(env: Env, lane: PaddleLane): Env {
+  const root = rootPaddleEnv(env);
+  return lane === "sandbox" ? sandboxEnv(root) : productionEnv(root);
+}
+
+/** The unresolved Worker env behind a lane env (or the env itself). */
+export function rootPaddleEnv(env: Env): Env {
+  return env.PADDLE_ROOT_ENV ?? env;
+}
+
+function sandboxEnv(root: Env): Env {
+  return {
+    ...root,
+    PADDLE_ROOT_ENV: root,
+    PADDLE_LANE: "sandbox",
+    PADDLE_API_BASE: PADDLE_SANDBOX_API_BASE,
+    PADDLE_API_KEY: root.PADDLE_SANDBOX_API_KEY,
+    PADDLE_WEBHOOK_SECRET: root.PADDLE_SANDBOX_WEBHOOK_SECRET,
+    PADDLE_CHECKOUT_BINDING_SECRET: root.PADDLE_SANDBOX_CHECKOUT_BINDING_SECRET,
+    PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET: undefined,
+    PADDLE_STARTER_PRICE_ID: root.PADDLE_SANDBOX_STARTER_PRICE_ID,
+    PADDLE_PRO_PRICE_ID: root.PADDLE_SANDBOX_PRO_PRICE_ID,
+    PADDLE_UNLIMITED_PRICE_ID: root.PADDLE_SANDBOX_UNLIMITED_PRICE_ID,
+    EXTRA_DRAFTS_PRICE_ID: root.PADDLE_SANDBOX_EXTRA_DRAFTS_PRICE_ID,
+  };
+}
+
+function productionEnv(root: Env): Env {
+  if (configuredPaddleEnv(root) === null) {
+    // Legacy deployments (PADDLE_ENV unset) keep their configuration untouched.
+    return { ...root, PADDLE_ROOT_ENV: root, PADDLE_LANE: "production" };
+  }
+  // Explicit production: always the live API base, whatever PADDLE_API_BASE says.
+  return {
+    ...root,
+    PADDLE_ROOT_ENV: root,
+    PADDLE_LANE: "production",
+    PADDLE_API_BASE: PADDLE_LIVE_API_BASE,
+  };
+}
+
+/** The lane an env was resolved to (unresolved envs are production). */
+export function laneOfEnv(env: Partial<Env>): PaddleLane {
+  return env.PADDLE_LANE === "sandbox" ? "sandbox" : "production";
+}
+
+/**
+ * The environment a stored Paddle object (subscription record or checkout
+ * reservation) was created in. Only an explicit "sandbox" stamp is sandbox;
+ * records written before item 123 are production.
+ */
+export function storedPaddleLane(record: unknown): PaddleLane {
+  if (typeof record !== "object" || record === null) return "production";
+  return (record as Record<string, unknown>).paddleEnvironment === "sandbox"
+    ? "sandbox"
+    : "production";
+}
+
+/**
+ * True when every value the sandbox lane needs is configured: API key, webhook
+ * secret, client token, and three distinct tier price ids. An incomplete lane
+ * fails closed (checkout unavailable for QA accounts) instead of quietly
+ * advertising production while the server routes to the sandbox.
+ */
+export function sandboxLaneComplete(env: Env): boolean {
+  const root = rootPaddleEnv(env);
+  const prices = [
+    nonEmpty(root.PADDLE_SANDBOX_STARTER_PRICE_ID),
+    nonEmpty(root.PADDLE_SANDBOX_PRO_PRICE_ID),
+    nonEmpty(root.PADDLE_SANDBOX_UNLIMITED_PRICE_ID),
+  ];
+  return (
+    !!nonEmpty(root.PADDLE_SANDBOX_API_KEY) &&
+    !!nonEmpty(root.PADDLE_SANDBOX_WEBHOOK_SECRET) &&
+    !!nonEmpty(root.PADDLE_SANDBOX_CLIENT_TOKEN) &&
+    prices.every((p) => p !== null) &&
+    new Set(prices).size === 3
+  );
+}
+
+/**
+ * Whether the sandbox can matter for any account: the lane is on, or sandbox
+ * credentials are still configured (so stranded sandbox objects can be
+ * serviced). When false, every account is production and no lookup is needed.
+ */
+export function sandboxInPlay(env: Env): boolean {
+  const root = rootPaddleEnv(env);
+  return (
+    sandboxLaneEnabled(root) ||
+    !!nonEmpty(root.PADDLE_SANDBOX_API_KEY) ||
+    !!nonEmpty(root.PADDLE_SANDBOX_WEBHOOK_SECRET)
+  );
+}
+
+/** Whether the sandbox webhook destination should accept deliveries at all. */
+export function sandboxWebhookEnabled(env: Env): boolean {
+  const root = rootPaddleEnv(env);
+  return sandboxLaneEnabled(root) || !!nonEmpty(root.PADDLE_SANDBOX_WEBHOOK_SECRET);
+}
+
+/** What the app needs to open the right checkout for this account (GET /v1/me `billing`). */
 export interface PaddleClientConfig {
   environment: PaddleLane;
+  checkoutAvailable: boolean;
   clientSideToken?: string;
   prices?: { starter: string; pro: string; unlimited: string };
 }
@@ -101,18 +194,29 @@ export interface PaddleClientConfig {
 /**
  * The client-facing lane description. Production returns only the environment —
  * the app keeps its embedded live token/prices — so a production account's
- * response never contains a sandbox token or price id. Sandbox returns the
- * sandbox token and price ids only when all of them are configured; otherwise
- * it reports production so the app never opens a half-configured sandbox.
+ * response never contains a sandbox token or price id. A sandbox-lane account
+ * gets the sandbox token and prices when the lane is complete; when it is not,
+ * it gets `checkoutAvailable: false` (the server refuses that account's checkout
+ * too), never a production answer the server would contradict.
  */
 export function paddleClientConfig(env: Env, lane: PaddleLane): PaddleClientConfig {
-  if (lane !== "sandbox" || !sandboxLaneEnabled(env)) return { environment: "production" };
-  const token = nonEmpty(env.PADDLE_SANDBOX_CLIENT_TOKEN);
-  const starter = nonEmpty(env.PADDLE_SANDBOX_STARTER_PRICE_ID);
-  const pro = nonEmpty(env.PADDLE_SANDBOX_PRO_PRICE_ID);
-  const unlimited = nonEmpty(env.PADDLE_SANDBOX_UNLIMITED_PRICE_ID);
-  if (!token || !starter || !pro || !unlimited) return { environment: "production" };
-  return { environment: "sandbox", clientSideToken: token, prices: { starter, pro, unlimited } };
+  const root = rootPaddleEnv(env);
+  if (lane !== "sandbox" || !sandboxLaneEnabled(root)) {
+    return { environment: "production", checkoutAvailable: true };
+  }
+  if (!sandboxLaneComplete(root)) {
+    return { environment: "sandbox", checkoutAvailable: false };
+  }
+  return {
+    environment: "sandbox",
+    checkoutAvailable: true,
+    clientSideToken: nonEmpty(root.PADDLE_SANDBOX_CLIENT_TOKEN) ?? "",
+    prices: {
+      starter: nonEmpty(root.PADDLE_SANDBOX_STARTER_PRICE_ID) ?? "",
+      pro: nonEmpty(root.PADDLE_SANDBOX_PRO_PRICE_ID) ?? "",
+      unlimited: nonEmpty(root.PADDLE_SANDBOX_UNLIMITED_PRICE_ID) ?? "",
+    },
+  };
 }
 
 function nonEmpty(value: unknown): string | null {

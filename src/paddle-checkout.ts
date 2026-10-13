@@ -2,6 +2,7 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { DEFAULT_EXTRA_DRAFTS_PER_UNIT, planForPrice, type Env } from "./config";
 import { ApiError } from "./errors";
+import { laneOfEnv, paddleEnvForStoredLane, storedPaddleLane, type PaddleLane } from "./paddle-env";
 import { numFrom } from "./metering";
 import {
   buildPaddleCheckoutCustomData,
@@ -48,6 +49,7 @@ interface PendingCheckoutReservation {
   quantity?: number;
   extraDrafts?: number;
   customerId?: string;
+  paddleEnvironment?: "sandbox";
 }
 
 export async function handlePaddleCheckout(
@@ -191,14 +193,21 @@ async function hasOpenCheckoutReservation(
   if (!reservation.pending) return false;
   const reservationId = reservation.reservationId;
   if (!reservationId) return true;
+  // 123: look the transaction up where it was created, never in the lane the
+  // account happens to be in now (a live transaction is "not found" in the
+  // sandbox and must not be mistaken for gone).
+  const transactionEnv = reservationPaddleEnv(env, reservation);
   if (!reservation.transactionId) {
-    return await hasOpenUnrecordedCheckoutReservation(env, userId, kind, {
+    return await hasOpenUnrecordedCheckoutReservation(transactionEnv, userId, kind, {
       ...reservation,
       reservationId,
     });
   }
 
-  const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
+  const snapshot = await pendingCheckoutTransactionSnapshot(
+    transactionEnv,
+    reservation.transactionId,
+  );
   if (!snapshot || snapshot.status === "canceled") {
     await releaseCheckoutReservation(env, userId, kind, reservationId);
     return false;
@@ -299,16 +308,25 @@ async function recoverOrReleasePendingCheckout(
     );
   }
 
-  const snapshot = await pendingCheckoutTransactionSnapshot(env, reservation.transactionId);
+  const transactionEnv = reservationPaddleEnv(env, reservation);
+  const snapshot = await pendingCheckoutTransactionSnapshot(
+    transactionEnv,
+    reservation.transactionId,
+  );
   if (!snapshot || snapshot.status === "canceled") {
     await releaseCheckoutReservation(env, userId, request.kind, reservationId);
     return null;
   }
   const checkoutUrl = snapshot.checkoutUrl ?? reservation.checkoutUrl ?? null;
   if (isRecoverableCheckoutTransaction(snapshot.status, checkoutUrl)) {
-    if (!checkoutMatchesRequest(reservation, snapshot, request)) {
+    // 123: a checkout from the other lane is never handed back (the app would
+    // open it with the wrong Paddle environment) — cancel it where it lives.
+    if (
+      !checkoutMatchesRequest(reservation, snapshot, request) ||
+      reservationLaneDiffers(env, reservation)
+    ) {
       return await supersedePendingCheckout(
-        env,
+        transactionEnv,
         userId,
         request,
         reservationId,
@@ -363,7 +381,8 @@ async function recoverOrReleaseUnrecordedCheckout(
 ): Promise<PendingCheckoutTransaction | null> {
   if (!reservationExpired(reservation)) throw pendingCheckoutError();
 
-  const snapshot = await unrecordedCheckoutTransactionSnapshot(env, userId, reservation);
+  const transactionEnv = reservationPaddleEnv(env, reservation);
+  const snapshot = await unrecordedCheckoutTransactionSnapshot(transactionEnv, userId, reservation);
   if (!snapshot || snapshot.status === "canceled") {
     await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
     return null;
@@ -373,9 +392,12 @@ async function recoverOrReleaseUnrecordedCheckout(
   if (!isRecoverableCheckoutTransaction(snapshot.status, checkoutUrl)) {
     throw pendingCheckoutError();
   }
-  if (!checkoutMatchesRequest(reservation, snapshot, request)) {
+  if (
+    !checkoutMatchesRequest(reservation, snapshot, request) ||
+    reservationLaneDiffers(env, reservation)
+  ) {
     return await supersedePendingCheckout(
-      env,
+      transactionEnv,
       userId,
       request,
       reservation.reservationId,
@@ -402,11 +424,20 @@ async function recoverOrReleaseUnrecordedCheckout(
     };
   }
   if ("unusable" in recordResult) {
-    await cancelPaddleTransaction(env, snapshot.transactionId);
+    await cancelPaddleTransaction(transactionEnv, snapshot.transactionId);
     await releaseCheckoutReservation(env, userId, request.kind, reservation.reservationId);
     throw subscriptionRequiredError();
   }
   throw pendingCheckoutError();
+}
+
+/** 123 — the Paddle env a reservation's transaction lives in. */
+function reservationPaddleEnv(env: Env, reservation: { paddleEnvironment?: string }): Env {
+  return paddleEnvForStoredLane(env, storedPaddleLane(reservation));
+}
+
+function reservationLaneDiffers(env: Env, reservation: { paddleEnvironment?: string }): boolean {
+  return storedPaddleLane(reservation) !== laneOfEnv(env);
 }
 
 async function hasOpenUnrecordedCheckoutReservation(
@@ -590,7 +621,7 @@ async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscrip
   try {
     const user = await clerk.users.getUser(userId);
     const meta = asRecord(user.privateMetadata) ?? {};
-    return { subscription: meta.subscription };
+    return { subscription: subscriptionForCheckoutLane(meta.subscription, laneOfEnv(env)) };
   } catch (err) {
     if (isClerkNotFoundError(err)) {
       throw new ApiError(404, "account_not_found", "Your account could not be found.");
@@ -601,6 +632,21 @@ async function loadCheckoutAccount(userId: string, env: Env): Promise<{ subscrip
       "Could not load your account. Please try again.",
     );
   }
+}
+
+/**
+ * 123 — the stored subscription as seen by a checkout in `lane`. A record from
+ * the same lane is used as-is. A stranded SANDBOX record seen from production is
+ * ignored (it is not a paid plan and its customer id doesn't exist live). A LIVE
+ * record seen from the sandbox still blocks a second subscription while active,
+ * but its live customer id is never sent to the sandbox API.
+ */
+function subscriptionForCheckoutLane(raw: unknown, lane: PaddleLane): unknown {
+  const stored = storedPaddleLane(raw);
+  if (stored === lane) return raw;
+  if (stored === "sandbox") return null;
+  const record = asRecord(raw);
+  return record ? { ...record, paddleCustomerId: null } : raw;
 }
 
 function checkoutKindForPrice(priceId: string, env: Env): CheckoutRequestBody["kind"] | null {

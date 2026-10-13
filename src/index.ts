@@ -44,10 +44,15 @@ import { isCallbackPath, renderCallbackPage } from "./callback";
 import {
   paddleClientConfig,
   paddleEnvForLane,
+  paddleEnvForStoredLane,
   paddleLaneForEmail,
-  sandboxLaneEnabled,
+  sandboxWebhookEnabled,
 } from "./paddle-env";
-import { paddleEnvForUser } from "./paddle-lane";
+import {
+  paddleEnvForCheckout,
+  paddleEnvForPlanChange,
+  paddleEnvForStoredSubscription,
+} from "./paddle-lane";
 
 // Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
 export { AccountQuota } from "./quota-do";
@@ -124,9 +129,12 @@ export default {
       if (
         pathname === "/v1/paddle/webhook/sandbox" &&
         request.method === "POST" &&
-        sandboxLaneEnabled(env)
+        sandboxWebhookEnabled(env)
       ) {
-        return await handlePaddleWebhook(request, paddleEnvForLane(env, "sandbox"));
+        // Stays open while a sandbox secret is configured, even after the lane
+        // closes, so stranded sandbox subscriptions still receive their
+        // cancellation events.
+        return await handlePaddleWebhook(request, paddleEnvForStoredLane(env, "sandbox"));
       }
 
       if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
@@ -134,18 +142,22 @@ export default {
         return await handlePaddleManageBilling(
           userId,
           request,
-          await paddleEnvForUser(userId, env),
+          await paddleEnvForStoredSubscription(userId, env),
         );
       }
 
       if (pathname === "/v1/paddle/checkout" && request.method === "POST") {
         const { userId } = await authenticate(request, env);
-        return await handlePaddleCheckout(userId, request, await paddleEnvForUser(userId, env));
+        return await handlePaddleCheckout(userId, request, await paddleEnvForCheckout(userId, env));
       }
 
       if (pathname === "/v1/paddle/change-plan" && request.method === "POST") {
         const { userId } = await authenticate(request, env);
-        return await handlePaddleChangePlan(userId, request, await paddleEnvForUser(userId, env));
+        return await handlePaddleChangePlan(
+          userId,
+          request,
+          await paddleEnvForPlanChange(userId, env),
+        );
       }
 
       if (pathname === "/v1/me" && request.method === "GET") {
@@ -374,7 +386,7 @@ export default {
         pathname === "/v1/paddle/change-plan" ||
         pathname === "/v1/paddle/manage-billing" ||
         pathname === "/v1/paddle/webhook" ||
-        (pathname === "/v1/paddle/webhook/sandbox" && sandboxLaneEnabled(env)) ||
+        (pathname === "/v1/paddle/webhook/sandbox" && sandboxWebhookEnabled(env)) ||
         pathname === "/healthz" ||
         isCallbackPath(pathname) ||
         (pathname === "/admin/margin" && !!env.ADMIN_TOKEN) ||

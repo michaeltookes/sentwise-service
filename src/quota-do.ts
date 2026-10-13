@@ -65,7 +65,12 @@ import {
   recordPaddlePlanChangeInClerk,
 } from "./paddle-plan-entitlement";
 import { cancelPaddleTransaction } from "./paddle-api";
-import { PADDLE_LANE_HEADER, paddleEnvForLane, paddleLaneFromHeader } from "./paddle-env";
+import {
+  PADDLE_LANE_HEADER,
+  paddleEnvForStoredLane,
+  paddleLaneFromHeader,
+  storedPaddleLane,
+} from "./paddle-env";
 import {
   activeReservations,
   pruneStamps,
@@ -145,6 +150,9 @@ interface PaddleCheckoutReservation {
   plan?: PaidPlan;
   customerId?: string;
   blocked?: boolean;
+  // 123: set when the reservation was made in the Paddle sandbox lane, so its
+  // transaction is always checked and cancelled in that environment.
+  paddleEnvironment?: "sandbox";
 }
 interface StorageReader {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -217,9 +225,11 @@ export class AccountQuota {
     pathname: string,
     request: Request,
   ): Promise<Response> {
-    // 123 — the Paddle lane the Worker resolved for this account. Rebuilt from
-    // this DO's own env, so the sandbox lane still requires PADDLE_ENV=sandbox.
-    const paddleEnv = paddleEnvForLane(
+    // 123 — the Paddle lane the Worker resolved for this request (internal
+    // header; the DO is not reachable from outside the Worker). The Worker is the
+    // gate for who enters the sandbox; here the lane may also be the stored lane
+    // of an existing sandbox object, so it is not downgraded by PADDLE_ENV.
+    const paddleEnv = paddleEnvForStoredLane(
       this.env,
       paddleLaneFromHeader(request.headers.get(PADDLE_LANE_HEADER)),
     );
@@ -554,7 +564,7 @@ export class AccountQuota {
       if ("applied" in result || "idempotent" in result) {
         await this.clearPaddleSubscriptionCheckoutReservationForEvent(parsed.event);
         if (!subscriptionEventAllowsOverageCheckout(parsed.event)) {
-          await this.cancelPaddleOverageCheckoutReservation(env);
+          await this.cancelPaddleOverageCheckoutReservation();
         }
       }
       return Response.json(result);
@@ -688,6 +698,7 @@ export class AccountQuota {
         priceId,
         quantity,
         ...subscriptionCheckoutPlanForPrice(storageKey, priceId, env),
+        ...(env.PADDLE_LANE === "sandbox" ? { paddleEnvironment: "sandbox" } : {}),
         ...(options.requireCustomerId ? { extraDrafts } : {}),
         ...(customerId ? { customerId } : {}),
       });
@@ -881,7 +892,7 @@ export class AccountQuota {
     });
   }
 
-  private async cancelPaddleOverageCheckoutReservation(env: Env): Promise<void> {
+  private async cancelPaddleOverageCheckoutReservation(): Promise<void> {
     const reservation = await this.storage.transaction(async (txn) => {
       const current = parsePaddleCheckoutReservation(
         await txn.get<unknown>(PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY),
@@ -898,7 +909,11 @@ export class AccountQuota {
     if (!reservation) return;
     if (!reservation.transactionId) return;
 
-    await cancelPaddleTransaction(env, reservation.transactionId);
+    // 123: cancel in the environment the reservation was made in.
+    await cancelPaddleTransaction(
+      paddleEnvForStoredLane(this.env, storedPaddleLane(reservation)),
+      reservation.transactionId,
+    );
     await this.clearPaddleCheckoutReservation(
       PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
       reservation.reservationId,
@@ -1406,6 +1421,7 @@ function parsePaddleCheckoutReservation(v: unknown): PaddleCheckoutReservation |
     ...(plan ? { plan } : {}),
     ...(customerId ? { customerId } : {}),
     ...(reservation.blocked === true ? { blocked: true } : {}),
+    ...(reservation.paddleEnvironment === "sandbox" ? { paddleEnvironment: "sandbox" } : {}),
   };
 }
 
@@ -1420,6 +1436,7 @@ function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation
   quantity?: number;
   extraDrafts?: number;
   customerId?: string;
+  paddleEnvironment?: "sandbox";
 } {
   return {
     pending: true,
@@ -1432,6 +1449,7 @@ function pendingPaddleCheckoutReservation(reservation: PaddleCheckoutReservation
     ...(reservation.quantity ? { quantity: reservation.quantity } : {}),
     ...(reservation.extraDrafts ? { extraDrafts: reservation.extraDrafts } : {}),
     ...(reservation.customerId ? { customerId: reservation.customerId } : {}),
+    ...(reservation.paddleEnvironment ? { paddleEnvironment: reservation.paddleEnvironment } : {}),
   };
 }
 

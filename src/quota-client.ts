@@ -83,6 +83,7 @@ export type PaddleSubscriptionCheckoutReservationResult =
       quantity?: number;
       extraDrafts?: number;
       customerId?: string;
+      paddleEnvironment?: "sandbox";
     };
 export type PaddleOverageCheckoutReservationResult = PaddleSubscriptionCheckoutReservationResult;
 export type PaddleSubscriptionCheckoutPeekResult =

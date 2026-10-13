@@ -25,7 +25,7 @@ import {
   paddleCustomerMatchesStoredAccount,
 } from "./paddle-account";
 import { fetchPaddleCustomerEmail, fetchPaddleTransactionSnapshot } from "./paddle-api";
-import { isQaAccountEmail } from "./paddle-env";
+import { isQaAccountEmail, storedPaddleLane } from "./paddle-env";
 import {
   adjustedTransactionIdFromEvent,
   adjustmentIdFromEvent,
@@ -104,10 +104,12 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
     return ack({ mapped: false });
   }
 
-  // 123 — a sandbox event may only ever touch a QA account. Even a correctly
-  // signed sandbox event that maps to a production account is dropped, so a
+  // 123 — a sandbox event may only touch a QA account, or an account whose
+  // stored subscription was itself created in the sandbox (so a stranded test
+  // subscription still receives its cancellation after the email changes). A
+  // correctly signed sandbox event for any other account is dropped, so a
   // sandbox purchase can never grant (or revoke) a real customer's entitlement.
-  if (env.PADDLE_LANE === "sandbox" && !(await isQaAccount(clerk, userId))) {
+  if (env.PADDLE_LANE === "sandbox" && !(await sandboxEventMayTouch(clerk, userId))) {
     return ack({ mapped: false });
   }
 
@@ -125,12 +127,15 @@ export async function handlePaddleWebhook(request: Request, env: Env): Promise<R
 // Subscription lifecycle → subscription record + per-tier quota limit.
 // ---------------------------------------------------------------------------
 
-async function isQaAccount(
+async function sandboxEventMayTouch(
   clerk: ReturnType<typeof createClerkClient>,
   userId: string,
 ): Promise<boolean> {
   try {
-    return isQaAccountEmail(primaryEmail(await clerk.users.getUser(userId)));
+    const user = await clerk.users.getUser(userId);
+    if (isQaAccountEmail(primaryEmail(user))) return true;
+    const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
+    return storedPaddleLane(meta.subscription) === "sandbox";
   } catch (err) {
     if (isClerkNotFoundError(err)) return false;
     throw new ApiError(502, "account_lookup_failed", "Could not resolve the account.");

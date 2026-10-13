@@ -1,6 +1,9 @@
 import { createClerkClient } from "@clerk/backend";
 import { isClerkNotFoundError } from "./auth";
 import { hasPaddleTierPriceConfig, type Env, type PaidPlan } from "./config";
+import { laneOfEnv, storedPaddleLane } from "./paddle-env";
+
+const LIVE_RECORD_IN_FORCE = new Set(["active", "trialing", "past_due", "paused"]);
 import { ApiError } from "./errors";
 import {
   paddleCheckoutBindingMatchesEvent,
@@ -108,6 +111,21 @@ export async function recordPaddleSubscriptionInClerk(
     return { idempotent: true };
   }
 
+  // 123: never let a sandbox event overwrite a live subscription that is still
+  // in force (a QA account that also bought live, e.g. via the fallback test
+  // methods). A live event replacing a sandbox record is always allowed.
+  const incomingLane = laneOfEnv(env);
+  const existingLane = storedPaddleLane(existingSub);
+  const crossLane = !!existingSub && existingLane !== incomingLane;
+  if (
+    crossLane &&
+    incomingLane === "sandbox" &&
+    storedPaddleSubscriptionId(existingSub) !== null &&
+    LIVE_RECORD_IN_FORCE.has(String(existingSub?.status))
+  ) {
+    return { stale: true };
+  }
+
   const existingSubscriptionId = storedPaddleSubscriptionId(existingSub);
   const supersededSubscriptionIds = supersededPaddleSubscriptionIds(existingSub);
   const incomingSubscriptionId = subscriptionIdFromEvent(body.event);
@@ -119,6 +137,7 @@ export async function recordPaddleSubscriptionInClerk(
     (!incomingSubscriptionId || existingSubscriptionId !== incomingSubscriptionId);
   if (
     isDifferentSubscription &&
+    !crossLane &&
     !(await isCurrentSubscriptionReplacement(body.event, userId, env, existingSub))
   ) {
     return { stale: true };
@@ -143,9 +162,11 @@ export async function recordPaddleSubscriptionInClerk(
       storedSubscriptionStatus(existingSub),
     ),
     ...supersededSubscriptionHistory(
-      supersededSubscriptionIds,
-      isDifferentSubscription ? existingSubscriptionId : null,
+      crossLane ? [] : supersededSubscriptionIds,
+      isDifferentSubscription && !crossLane ? existingSubscriptionId : null,
     ),
+    // 123: remember which Paddle environment this subscription lives in.
+    ...(incomingLane === "sandbox" ? { paddleEnvironment: "sandbox" as const } : {}),
   };
   const quota = quotaForSubscriptionStatus(
     asRecord(meta.quota) ?? {},
