@@ -19,13 +19,13 @@ import type { Env } from "./config";
 
 // The Mac app's custom URL scheme. A deployment that serves a differently
 // identified app build (its own scheme registered in that build's Info.plist)
-// sets APP_URL_SCHEME; anything that is not a plain RFC 3986 scheme falls back
+// sets APP_CALLBACK_SCHEME; anything that is not a plain RFC 3986 scheme falls back
 // to the default so the page can never navigate to an injected value.
-export const DEFAULT_APP_URL_SCHEME = "sentwise";
+export const DEFAULT_APP_CALLBACK_SCHEME = "sentwise";
 
-export function appUrlScheme(env: Pick<Env, "APP_URL_SCHEME">): string {
-  const configured = env.APP_URL_SCHEME?.trim().toLowerCase() ?? "";
-  return /^[a-z][a-z0-9+.-]{0,31}$/.test(configured) ? configured : DEFAULT_APP_URL_SCHEME;
+export function appCallbackScheme(env: Pick<Env, "APP_CALLBACK_SCHEME">): string {
+  const configured = env.APP_CALLBACK_SCHEME?.trim().toLowerCase() ?? "";
+  return /^[a-z][a-z0-9+.-]{0,31}$/.test(configured) ? configured : DEFAULT_APP_CALLBACK_SCHEME;
 }
 
 interface CallbackRoute {
@@ -63,7 +63,7 @@ export function isCallbackPath(pathname: string): boolean {
 
 export function renderCallbackPage(
   pathname: string,
-  scheme: string = DEFAULT_APP_URL_SCHEME,
+  scheme: string = DEFAULT_APP_CALLBACK_SCHEME,
 ): Response {
   const route = ROUTES[pathname];
   if (!route) throw new ApiError(404, "not_found", "Not found.");
@@ -95,7 +95,7 @@ export function normalizeCallbackFragment(hash: string): string {
 }
 
 // route.host / route.params are compile-time constants and the scheme is a
-// validated deployment var (appUrlScheme; never request input), and
+// validated deployment var (appCallbackScheme; never request input), and
 // they are embedded via JSON.stringify so they are valid JS literals. The
 // runtime values from the URL are NEVER interpolated into the page — they are
 // read in the browser and only ever placed into a URLSearchParams (which

@@ -35,7 +35,7 @@ export interface Env {
   // Custom URL scheme the OAuth landing pages (src/callback.ts) forward to.
   // Defaults to "sentwise"; a deployment serving a differently identified app
   // build sets that build's scheme.
-  APP_URL_SCHEME?: string;
+  APP_CALLBACK_SCHEME?: string;
 
   // 56b — metering. Durable Object namespace holding per-account usage counters.
   ACCOUNT_QUOTA: DurableObjectNamespace;

@@ -107,6 +107,11 @@ describe("sandbox wrangler environment", () => {
   it("leaves production on the live Paddle API", () => {
     expect(config.vars?.PADDLE_API_BASE).toBe("https://api.paddle.com");
   });
+
+  it("forwards OAuth callbacks to the QA build's own URL scheme", () => {
+    expect(config.vars?.APP_CALLBACK_SCHEME).toBe("sentwise");
+    expect(sandbox!.vars?.APP_CALLBACK_SCHEME).toBe("sentwise-qa");
+  });
 });
 
 describe("source has no sandbox awareness", () => {
