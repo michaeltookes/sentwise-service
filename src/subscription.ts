@@ -13,7 +13,7 @@
 import type { TrialState } from "./trial";
 
 // Launch tiers (56c). "trial" is the pre-purchase state; the three paid tiers
-// map from Paddle price ids (see PRICE_TO_PLAN in config.ts); "team" is reserved
+// map from Paddle price ids (see priceToPlanForEnv in config.ts); "team" is reserved
 // for a future seat-based plan (unused today); "none" is the no-subscription
 // terminal state. A clean pre-release break replaced the old "individual" tier —
 // no released builds existed, so there is no migration.

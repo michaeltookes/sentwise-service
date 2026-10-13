@@ -16,11 +16,11 @@ export default defineConfig({
           PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET: "old_checkout_binding_secret",
           PADDLE_API_KEY: "pdl_apikey",
           PADDLE_API_BASE: "https://sandbox-api.paddle.com",
-          // Deployed wrangler.jsonc now carries the LIVE tier price ids (item
-          // 74); blank them here so tests exercise the sandbox fallback map.
-          PADDLE_STARTER_PRICE_ID: "",
-          PADDLE_PRO_PRICE_ID: "",
-          PADDLE_UNLIMITED_PRICE_ID: "",
+          // Test tier price ids. The Worker has no compiled-in price map; every
+          // deployment (and the test env) supplies all three ids as vars.
+          PADDLE_STARTER_PRICE_ID: "pri_01m1syd7nfarp8pggpcnvjbgyy",
+          PADDLE_PRO_PRICE_ID: "pri_01m1symsxarc4c3jdea0ntb09w",
+          PADDLE_UNLIMITED_PRICE_ID: "pri_01m1syrdg05f49kz705gbzn6tz",
         },
       },
     }),
