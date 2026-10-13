@@ -5,6 +5,7 @@ import { ApiError } from "./errors";
 import { numFrom } from "./metering";
 import {
   buildPaddleCheckoutCustomData,
+  isPausedPaddleSubscription,
   paddleCheckoutBindingMatchesCustomData,
   storedPaddleCustomerId,
   storedPaddleSubscriptionId,
@@ -150,7 +151,12 @@ function assertCheckoutEligible(
   rawSubscription: unknown,
   customerId: string | null,
 ): void {
-  if (body.kind === "subscription" && hasActivePaddleSubscription(rawSubscription)) {
+  // 124: a PAUSED subscription still exists at Paddle (it can resume), so it
+  // blocks a second subscription checkout exactly like an active one.
+  if (
+    body.kind === "subscription" &&
+    (hasActivePaddleSubscription(rawSubscription) || isPausedPaddleSubscription(rawSubscription))
+  ) {
     throw new ApiError(
       409,
       "billing_subscription_active",

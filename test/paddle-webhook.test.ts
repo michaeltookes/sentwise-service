@@ -389,6 +389,99 @@ describe("POST /v1/paddle/webhook — subscription lifecycle", () => {
     expect(lastWrite()?.quota.monthlyDraftLimit).toBeNull();
   });
 
+  it("keeps Paddle's raw paused status on the record while the display status stays canceled", async () => {
+    mocks.getUser.mockResolvedValue(userWith({}));
+    await signedReq(subBody({ eventType: "subscription.paused", status: "paused" }));
+    expect(lastWrite()?.subscription).toMatchObject({
+      status: "canceled",
+      paddleStatus: "paused",
+    });
+  });
+
+  it("a paused subscription blocks a replacement and its later resume applies (sentwise#124)", async () => {
+    // Drive every step through the real writer so the stored record has the
+    // exact shape production writes.
+    let storedMeta: Record<string, unknown> = {};
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...(update.privateMetadata as Record<string, unknown>) };
+      return Promise.resolve();
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/subscriptions/sub_replacement")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "active" } }), {
+            status: 200,
+          }),
+        );
+      }
+      if (url.includes("/subscriptions/sub_123")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { customer_id: "ctm_123", status: "paused" } }), {
+            status: 200,
+          }),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const created = await signedReq(
+      subBody({ eventId: "evt_created", occurredAt: "2026-09-05T10:00:00.000Z" }),
+    );
+    expect((await created.json()) as any).toEqual({ ok: true, applied: true });
+
+    const paused = await signedReq(
+      subBody({
+        eventType: "subscription.paused",
+        eventId: "evt_paused",
+        status: "paused",
+        occurredAt: "2026-09-06T10:00:00.000Z",
+      }),
+    );
+    expect((await paused.json()) as any).toEqual({ ok: true, applied: true });
+    expect(storedMeta.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_123",
+      status: "canceled",
+      paddleStatus: "paused",
+    });
+
+    const replacement = await signedReq(
+      subBody({
+        eventType: "subscription.created",
+        eventId: "evt_replacement",
+        subscriptionId: "sub_replacement",
+        status: "active",
+        occurredAt: "2026-09-07T10:00:00.000Z",
+        customData: await buildPaddleCheckoutCustomData("user_abc", env),
+      }),
+    );
+    expect((await replacement.json()) as any).toEqual({ ok: true, stale: true });
+    expect(storedMeta.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_123",
+      lastEventId: "evt_paused",
+    });
+    expect((storedMeta.subscription as any).supersededPaddleSubscriptionIds).toBeUndefined();
+
+    const resumed = await signedReq(
+      subBody({
+        eventType: "subscription.resumed",
+        eventId: "evt_resumed",
+        status: "active",
+        occurredAt: "2026-09-08T10:00:00.000Z",
+      }),
+    );
+    expect((await resumed.json()) as any).toEqual({ ok: true, applied: true });
+    expect(storedMeta.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_123",
+      status: "active",
+      paddleStatus: "active",
+      lastEventId: "evt_resumed",
+    });
+    expect(storedMeta.quota).toMatchObject({ monthlyDraftLimit: 120 });
+  });
+
   it("records resumed subscriptions as active", async () => {
     mocks.getUser.mockResolvedValue(userWith({}));
     const res = await signedReq(subBody({ eventType: "subscription.resumed", status: "active" }));

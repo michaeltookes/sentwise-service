@@ -600,6 +600,10 @@ export interface StoredSubscriptionRecord {
   updatedAt: string;
   paddleOccurredAt: string | null;
   lastEventId: string; // idempotency guard
+  // 124: Paddle's raw subscription status ("paused" stays "paused"). `status`
+  // above is the canonical display status, where paused reads as "canceled";
+  // in-force decisions (another checkout, a replacement) read this field.
+  paddleStatus: string | null;
 }
 
 /**
@@ -613,6 +617,7 @@ export function buildSubscriptionRecord(
   priceId: string | null,
   now: number,
   storedStatus?: SubscriptionStatus | null,
+  storedPaddleStatus?: string | null,
 ): StoredSubscriptionRecord {
   return {
     plan,
@@ -625,5 +630,40 @@ export function buildSubscriptionRecord(
     updatedAt: normalizeIso(event.occurredAt) ?? new Date(now).toISOString(),
     paddleOccurredAt: event.occurredAt,
     lastEventId: event.eventId,
+    // 124: an event that can't determine Paddle's status (absent/unrecognized
+    // data.status on e.g. subscription.updated) keeps the stored raw status of the
+    // same subscription, so a paused subscription can't silently read as canceled.
+    paddleStatus: rawPaddleSubscriptionStatus(event) ?? storedPaddleStatus ?? null,
   };
+}
+
+/**
+ * Paddle's own status for a subscription event (the entity's status first,
+ * then the event type), or null when neither says. Unlike statusFromEvent this
+ * never folds "paused" into "canceled".
+ */
+export function rawPaddleSubscriptionStatus(event: PaddleEvent): string | null {
+  const dataStatus = typeof event.data.status === "string" ? event.data.status : null;
+  if (
+    dataStatus === "active" ||
+    dataStatus === "trialing" ||
+    dataStatus === "past_due" ||
+    dataStatus === "paused" ||
+    dataStatus === "canceled"
+  ) {
+    return dataStatus;
+  }
+  switch (event.eventType) {
+    case "subscription.canceled":
+      return "canceled";
+    case "subscription.paused":
+      return "paused";
+    case "subscription.past_due":
+      return "past_due";
+    case "subscription.activated":
+    case "subscription.resumed":
+      return "active";
+    default:
+      return null;
+  }
 }

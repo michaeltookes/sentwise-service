@@ -39,6 +39,7 @@ import {
   invalidateClerkUser,
 } from "../src/clerk-user-cache";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
+import { computeHmacSha256Hex } from "../src/paddle";
 import {
   PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
   PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
@@ -582,6 +583,43 @@ describe("POST /v1/draft trial handling", () => {
     expect(res.status).toBe(200);
     expect(((await res.json()) as any).text).toBe("paid draft");
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("GET /v1/me reports a paused subscription as canceled with paddleStatus paused, and drafting stays denied (sentwise#124)", async () => {
+    const started = new Date(Date.now() - TRIAL_MS - 1000).toISOString();
+    mocks.verifyToken.mockResolvedValue({ sub: "user_paused_me" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        trialStartedAt: started,
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleStatus: "paused",
+          paddleSubscriptionId: "sub_paused",
+        },
+      }),
+    );
+
+    const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+    expect(me.status).toBe(200);
+    expect(((await me.json()) as any).subscription).toEqual({
+      plan: "pro",
+      status: "canceled",
+      renewsAt: null,
+      manageBillingUrl: null,
+      paddleStatus: "paused",
+    });
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(anthropicOk()));
+    const draft = await worker.fetch(
+      req("/v1/draft", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ messages: [{ role: "user", content: "draft" }] }),
+      }),
+      env,
+    );
+    expect(draft.status).toBe(402);
   });
 
   it("still 402s an expired trial whose subscription is canceled (56c)", async () => {
@@ -1775,6 +1813,135 @@ describe("POST /v1/paddle/checkout", () => {
         init?.method === "POST",
     );
     expect(transactionCreates).toHaveLength(2);
+  });
+
+  it("refuses a new subscription checkout while the stored Paddle subscription is paused (sentwise#124)", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_paused" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleStatus: "paused",
+          paddleSubscriptionId: "sub_paused",
+          paddleCustomerId: "ctm_123",
+        },
+      }),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_active");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a paused subscription paused through an update with no status, so checkout still 409s (sentwise#124)", async () => {
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...(update.privateMetadata as Record<string, unknown>) };
+      return Promise.resolve();
+    });
+    const webhook = async (event: Record<string, unknown>): Promise<Response> => {
+      const rawBody = JSON.stringify(event);
+      const ts = Math.floor(Date.now() / 1000);
+      const h1 = await computeHmacSha256Hex(PADDLE_SECRET, `${ts}:${rawBody}`);
+      return worker.fetch(
+        req("/v1/paddle/webhook", {
+          method: "POST",
+          headers: { "content-type": "application/json", "Paddle-Signature": `ts=${ts};h1=${h1}` },
+          body: rawBody,
+        }),
+        paddleEnv,
+      );
+    };
+    // Paddle API lookups are not needed: the events carry the signed checkout binding.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("{}", { status: 404 }))),
+    );
+    const subscriptionData = {
+      id: "sub_paused_upd",
+      customer_id: "ctm_123",
+      custom_data: await buildPaddleCheckoutCustomData("user_123", paddleEnv),
+      items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+    };
+
+    const paused = await webhook({
+      event_id: "evt_paused_upd_1",
+      event_type: "subscription.paused",
+      occurred_at: "2026-09-06T10:00:00.000Z",
+      data: { ...subscriptionData, status: "paused" },
+    });
+    expect(paused.status).toBe(200);
+    const updated = await webhook({
+      event_id: "evt_paused_upd_2",
+      event_type: "subscription.updated",
+      occurred_at: "2026-09-07T10:00:00.000Z",
+      data: subscriptionData, // no status
+    });
+    expect(updated.status).toBe(200);
+    expect(storedMeta.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_paused_upd",
+      status: "canceled",
+      paddleStatus: "paused",
+      lastEventId: "evt_paused_upd_2",
+    });
+
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_active");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("still allows a new subscription checkout after a real cancellation", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_canceled" });
+    mocks.getUser.mockResolvedValue(
+      userWith({
+        subscription: {
+          plan: "pro",
+          status: "canceled",
+          paddleStatus: "canceled",
+          paddleSubscriptionId: "sub_canceled",
+          paddleCustomerId: "ctm_123",
+        },
+      }),
+    );
+
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
+
+    expect(((await res.json().catch(() => ({}))) as any).error?.type).not.toBe(
+      "billing_subscription_active",
+    );
   });
 
   it("rechecks subscription state after reserving a serialized checkout slot", async () => {

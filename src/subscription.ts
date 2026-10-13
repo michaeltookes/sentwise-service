@@ -26,6 +26,11 @@ export interface Subscription {
   status: SubscriptionStatus;
   renewsAt: string | null; // ISO 8601, or null
   manageBillingUrl: string | null; // Reserved for compatibility; portal links are fetched on demand.
+  // sentwise#124: present only when Paddle has the subscription PAUSED. `status`
+  // stays the display/access status ("canceled": no drafting while paused), so
+  // older apps are unaffected; newer apps read this to show "Paused" and the
+  // resume hint instead of "Canceled".
+  paddleStatus?: "paused";
 }
 
 const PLANS: readonly SubscriptionPlan[] = ["trial", "starter", "pro", "unlimited", "team", "none"];
@@ -70,6 +75,9 @@ export function parseSubscriptionOverride(raw: unknown): Subscription | null {
     status: r.status,
     renewsAt: validIso(r.renewsAt),
     manageBillingUrl: null,
+    ...(r.status === "canceled" && r.paddleStatus === "paused"
+      ? { paddleStatus: "paused" as const }
+      : {}),
   };
 }
 
