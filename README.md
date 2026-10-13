@@ -581,6 +581,14 @@ so it runs before the normal auth. Verification (per Paddle's "Verify webhook si
 | `transaction.completed` (overage / "buy more drafts")                                                   | `privateMetadata.quota.extraDrafts` (+`extraDraftsWindowStart`), stamped to the **current month window** so 56b counts it; requires `EXTRA_DRAFTS_PRICE_ID`                                                                                                      |
 | `adjustment.created` / `.updated` (approved refund/chargeback/credit/reversal)                          | Marks matching overage credits reversed/restored, including partial transaction-item adjustments; pre-purchase reversals are retained until completion                                                                                                           |
 
+**Paused subscriptions.** The record's `status` is the display status `/v1/me` reports, so a paused
+subscription reads `canceled` there (no drafting access). The record also keeps Paddle's raw status
+as `paddleStatus` (`"paused"`). A paused subscription still exists at Paddle and can resume, so it is
+treated as in force: `POST /v1/paddle/checkout` refuses a new subscription checkout with
+`409 billing_subscription_active`, and a different subscription's webhook cannot replace it, which
+keeps a later `subscription.resumed` applicable. Records written before `paddleStatus` existed fall
+back to `status`.
+
 **Account mapping.** `data.custom_data.clerkUserId` identifies the candidate Clerk user only when it
 is accompanied by this Worker's signed `sentwiseCheckoutBinding` from `POST /v1/paddle/checkout`, or
 when the Paddle `customer_id` already matches the account's stored `paddleCustomerId`. Events without
