@@ -33,9 +33,12 @@ import {
   PADDLE_LANE_HEADER,
   paddleClientConfig,
   paddleEnvForLane,
+  paddleEnvForStoredLane,
   paddleLaneForEmail,
   paddleLaneFromHeader,
+  sandboxLaneComplete,
   sandboxLaneEnabled,
+  storedPaddleLane,
 } from "../src/paddle-env";
 import { quotaPeek } from "../src/quota-client";
 import {
@@ -243,6 +246,7 @@ describe("paddleClientConfig", () => {
   it("gives a QA account in sandbox mode the sandbox token and prices", () => {
     expect(paddleClientConfig(laneEnv("sandbox"), "sandbox")).toEqual({
       environment: "sandbox",
+      checkoutAvailable: true,
       clientSideToken: SANDBOX_TOKEN,
       prices: SANDBOX_PRICES,
     });
@@ -250,17 +254,61 @@ describe("paddleClientConfig", () => {
 
   it("never gives a production lane any sandbox value", () => {
     const config = paddleClientConfig(laneEnv("sandbox"), "production");
-    expect(config).toEqual({ environment: "production" });
+    expect(config).toEqual({ environment: "production", checkoutAvailable: true });
     expect(JSON.stringify(config)).not.toContain("test_");
   });
 
-  it("reports production when the sandbox lane is off or incomplete", () => {
+  it("reports production when the sandbox lane is off", () => {
     expect(paddleClientConfig(laneEnv("production"), "sandbox")).toEqual({
       environment: "production",
+      checkoutAvailable: true,
     });
-    const incomplete = laneEnv("sandbox");
-    delete incomplete.PADDLE_SANDBOX_CLIENT_TOKEN;
-    expect(paddleClientConfig(incomplete, "sandbox")).toEqual({ environment: "production" });
+  });
+
+  it("fails closed (sandbox, unavailable) when the sandbox lane is incomplete", () => {
+    for (const missing of [
+      "PADDLE_SANDBOX_CLIENT_TOKEN",
+      "PADDLE_SANDBOX_PRO_PRICE_ID",
+      "PADDLE_SANDBOX_API_KEY",
+      "PADDLE_SANDBOX_WEBHOOK_SECRET",
+    ] as const) {
+      const incomplete = laneEnv("sandbox");
+      delete incomplete[missing];
+      expect(sandboxLaneComplete(incomplete)).toBe(false);
+      expect(paddleClientConfig(incomplete, "sandbox"), missing).toEqual({
+        environment: "sandbox",
+        checkoutAvailable: false,
+      });
+    }
+    const duplicate = {
+      ...laneEnv("sandbox"),
+      PADDLE_SANDBOX_PRO_PRICE_ID: SANDBOX_PRICES.starter,
+    };
+    expect(sandboxLaneComplete(duplicate)).toBe(false);
+  });
+});
+
+describe("paddleEnvForStoredLane", () => {
+  it("routes a sandbox object to the sandbox even after the lane closes", () => {
+    const resolved = paddleEnvForStoredLane(laneEnv("production"), "sandbox");
+    expect(resolved.PADDLE_LANE).toBe("sandbox");
+    expect(resolved.PADDLE_API_BASE).toBe(PADDLE_SANDBOX_API_BASE);
+    expect(resolved.PADDLE_API_KEY).toBe(SANDBOX_KEY);
+  });
+
+  it("routes a live object to live even from a sandbox lane env", () => {
+    const sandbox = paddleEnvForLane(laneEnv("sandbox"), "sandbox");
+    const resolved = paddleEnvForStoredLane(sandbox, "production");
+    expect(resolved.PADDLE_API_BASE).toBe(PADDLE_LIVE_API_BASE);
+    expect(resolved.PADDLE_API_KEY).toBe(LIVE_KEY);
+    expect(resolved.PADDLE_WEBHOOK_SECRET).toBe(LIVE_SECRET);
+  });
+
+  it("reads the stored environment stamp", () => {
+    expect(storedPaddleLane({ paddleEnvironment: "sandbox" })).toBe("sandbox");
+    expect(storedPaddleLane({ paddleEnvironment: "production" })).toBe("production");
+    expect(storedPaddleLane({})).toBe("production");
+    expect(storedPaddleLane(null)).toBe("production");
   });
 });
 
@@ -280,6 +328,7 @@ describe("GET /v1/me billing lane", () => {
     const body = (await res.json()) as any;
     expect(body.billing).toEqual({
       environment: "sandbox",
+      checkoutAvailable: true,
       clientSideToken: SANDBOX_TOKEN,
       prices: SANDBOX_PRICES,
     });
@@ -293,7 +342,7 @@ describe("GET /v1/me billing lane", () => {
       laneEnv("sandbox"),
     );
     const body = (await res.json()) as any;
-    expect(body.billing).toEqual({ environment: "production" });
+    expect(body.billing).toEqual({ environment: "production", checkoutAvailable: true });
     expect(JSON.stringify(body)).not.toContain(SANDBOX_TOKEN);
     expect(JSON.stringify(body)).not.toContain(SANDBOX_PRICES.pro);
   });
@@ -305,7 +354,10 @@ describe("GET /v1/me billing lane", () => {
       new Request("https://sentwise-inference.test/v1/me", { headers: bearer() }),
       laneEnv("production"),
     );
-    expect(((await res.json()) as any).billing).toEqual({ environment: "production" });
+    expect(((await res.json()) as any).billing).toEqual({
+      environment: "production",
+      checkoutAvailable: true,
+    });
   });
 });
 
@@ -432,11 +484,13 @@ async function postWebhook(path: string, env: Env, rawBody: string, secret: stri
 }
 
 describe("Paddle webhook lanes", () => {
-  it("404s the sandbox destination unless PADDLE_ENV=sandbox", async () => {
+  it("404s the sandbox destination when no sandbox lane or secret exists", async () => {
     for (const mode of ["production", undefined]) {
+      const env = laneEnv(mode);
+      delete env.PADDLE_SANDBOX_WEBHOOK_SECRET;
       const res = await postWebhook(
         "/v1/paddle/webhook/sandbox",
-        laneEnv(mode),
+        env,
         subscriptionEvent(SANDBOX_PRICES.pro),
         SANDBOX_SECRET,
       );
@@ -547,5 +601,449 @@ describe("quota-client lane header", () => {
     const env = { ...paddleEnvForLane(laneEnv("sandbox"), "production"), ACCOUNT_QUOTA: ns };
     await quotaPeek(env, "user_lane", { now: Date.now() });
     expect(headers[0].has(PADDLE_LANE_HEADER)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex review fixes: stored lanes, incomplete config
+// ---------------------------------------------------------------------------
+
+function urlOf(input: RequestInfo | URL): string {
+  return typeof input === "string" || input instanceof URL ? String(input) : input.url;
+}
+
+function authOf(init?: RequestInit): string | null {
+  return new Headers(init?.headers).get("Authorization");
+}
+
+async function seedReservation(
+  userId: string,
+  reservation: Record<string, unknown>,
+): Promise<void> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.put(PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY, reservation);
+  });
+}
+
+async function storedReservation(userId: string): Promise<Record<string, unknown> | undefined> {
+  const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName(userId));
+  return runInDurableObject(stub, async (_instance, state) =>
+    state.storage.get<Record<string, unknown>>(
+      PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
+    ),
+  );
+}
+
+function openTransaction(id: string, priceId: string): Response {
+  return new Response(
+    JSON.stringify({
+      data: {
+        id,
+        status: "ready",
+        checkout: { url: `https://checkout.paddle.com/pay?_ptxn=${id}` },
+        items: [{ price: { id: priceId }, quantity: 1 }],
+      },
+    }),
+    { status: 200 },
+  );
+}
+
+async function deleteMe(env: Env): Promise<Response> {
+  return worker.fetch(
+    new Request("https://sentwise-inference.test/v1/me", { method: "DELETE", headers: bearer() }),
+    env,
+  );
+}
+
+describe("pending checkout reservations remember their lane (P1)", () => {
+  it("stamps a sandbox checkout's reservation and leaves a live one unstamped", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: null }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(transactionCreated())),
+    );
+    expect((await postCheckout(laneEnv("sandbox"), SANDBOX_PRICES.pro)).status).toBe(200);
+    expect(await storedReservation("user_lane")).toMatchObject({ paddleEnvironment: "sandbox" });
+
+    await clearReservations("user_lane");
+    __resetClerkUserCache();
+    mocks.getUser.mockResolvedValue(userWithEmail(CUSTOMER_EMAIL, { subscription: null }));
+    expect((await postCheckout(laneEnv("sandbox"), LIVE_PRICES.pro)).status).toBe(200);
+    expect(await storedReservation("user_lane")).not.toHaveProperty("paddleEnvironment");
+  });
+
+  it("checks a pending LIVE checkout on the live API after the sandbox lane opens", async () => {
+    // QA account started a live checkout (e.g. fallback method 1); then
+    // PADDLE_ENV flipped to sandbox. The live transaction is still payable.
+    await seedReservation("user_lane", {
+      reservationId: "res_live",
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      transactionId: "txn_live",
+      priceId: LIVE_PRICES.pro,
+      quantity: 1,
+    });
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: null }));
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlOf(input);
+      if (url.startsWith(PADDLE_LIVE_API_BASE) && authOf(init) === `Bearer ${LIVE_KEY}`) {
+        return Promise.resolve(openTransaction("txn_live", LIVE_PRICES.pro));
+      }
+      // The sandbox has never heard of a live transaction.
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await deleteMe(laneEnv("sandbox"));
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_checkout_pending");
+    expect(await storedReservation("user_lane")).toMatchObject({ transactionId: "txn_live" });
+    for (const [input] of fetchMock.mock.calls) {
+      expect(urlOf(input)).not.toContain("sandbox-api.paddle.com");
+    }
+  });
+
+  it("checks a pending SANDBOX checkout on the sandbox API after the lane closes", async () => {
+    await seedReservation("user_lane", {
+      reservationId: "res_sbx",
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      transactionId: "txn_sbx",
+      priceId: SANDBOX_PRICES.pro,
+      quantity: 1,
+      paddleEnvironment: "sandbox",
+    });
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: null }));
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlOf(input);
+      if (url.startsWith(PADDLE_SANDBOX_API_BASE) && authOf(init) === `Bearer ${SANDBOX_KEY}`) {
+        return Promise.resolve(openTransaction("txn_sbx", SANDBOX_PRICES.pro));
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await deleteMe(laneEnv("production"));
+
+    expect(res.status).toBe(409);
+    expect(await storedReservation("user_lane")).toMatchObject({ transactionId: "txn_sbx" });
+  });
+
+  it("cancels a pending checkout from the other lane where it lives before minting", async () => {
+    await seedReservation("user_lane", {
+      reservationId: "res_live",
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      transactionId: "txn_live",
+      checkoutUrl: "https://checkout.paddle.com/pay?_ptxn=txn_live",
+      priceId: LIVE_PRICES.pro,
+      quantity: 1,
+    });
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: null }));
+    let liveCanceled = false;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlOf(input);
+      if (url === `${PADDLE_LIVE_API_BASE}/transactions/txn_live` && init?.method === "PATCH") {
+        expect(authOf(init)).toBe(`Bearer ${LIVE_KEY}`);
+        liveCanceled = true;
+        return Promise.resolve(new Response("{}", { status: 200 }));
+      }
+      if (url === `${PADDLE_LIVE_API_BASE}/transactions/txn_live`) {
+        if (liveCanceled) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: { id: "txn_live", status: "canceled" } }), {
+              status: 200,
+            }),
+          );
+        }
+        return Promise.resolve(openTransaction("txn_live", LIVE_PRICES.pro));
+      }
+      if (url === `${PADDLE_SANDBOX_API_BASE}/transactions` && init?.method === "POST") {
+        return Promise.resolve(transactionCreated());
+      }
+      return Promise.resolve(new Response("{}", { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postCheckout(laneEnv("sandbox"), SANDBOX_PRICES.pro);
+
+    expect(res.status).toBe(200);
+    expect(liveCanceled).toBe(true);
+    expect(await storedReservation("user_lane")).toMatchObject({
+      transactionId: "txn_lane",
+      paddleEnvironment: "sandbox",
+    });
+  });
+});
+
+const SANDBOX_SUBSCRIPTION = {
+  plan: "pro",
+  status: "active",
+  renewsAt: "2026-11-12T00:00:00.000Z",
+  manageBillingUrl: null,
+  paddleSubscriptionId: "sub_sbx",
+  paddleCustomerId: "ctm_sbx",
+  priceId: SANDBOX_PRICES.pro,
+  paddleEnvironment: "sandbox",
+};
+
+const LIVE_SUBSCRIPTION = {
+  plan: "pro",
+  status: "active",
+  renewsAt: "2026-11-12T00:00:00.000Z",
+  manageBillingUrl: null,
+  paddleSubscriptionId: "sub_live",
+  paddleCustomerId: "ctm_live",
+  priceId: LIVE_PRICES.pro,
+};
+
+async function getMe(env: Env): Promise<any> {
+  const res = await worker.fetch(
+    new Request("https://sentwise-inference.test/v1/me", { headers: bearer() }),
+    env,
+  );
+  expect(res.status).toBe(200);
+  return res.json();
+}
+
+describe("subscriptions remember their environment (P2)", () => {
+  it("a sandbox subscription is paid only while the account is in the sandbox lane", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    const meta = { subscription: SANDBOX_SUBSCRIPTION, quota: { monthlyDraftLimit: 120 } };
+
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, meta));
+    const open = await getMe(laneEnv("sandbox"));
+    expect(open.subscription).toMatchObject({ plan: "pro", status: "active" });
+    expect(open.quota.limit).toBe(120);
+
+    // Lane closed: stranded test data, not a paid plan, no tier cap.
+    __resetClerkUserCache();
+    const closed = await getMe(laneEnv("production"));
+    expect(closed.subscription.plan).not.toBe("pro");
+    expect(closed.quota.limit).not.toBe(120);
+
+    // Email moved off the QA domain while the lane is open: also stranded.
+    __resetClerkUserCache();
+    mocks.getUser.mockResolvedValue(userWithEmail(CUSTOMER_EMAIL, meta));
+    const moved = await getMe(laneEnv("sandbox"));
+    expect(moved.subscription.plan).not.toBe("pro");
+  });
+
+  it("a live subscription stays paid whichever lane the account is in", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: LIVE_SUBSCRIPTION }));
+    for (const mode of ["sandbox", "production"]) {
+      __resetClerkUserCache();
+      expect((await getMe(laneEnv(mode))).subscription).toMatchObject({ plan: "pro" });
+    }
+  });
+
+  it("manage billing for a stranded sandbox subscription goes to the sandbox API", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(QA_EMAIL, { subscription: SANDBOX_SUBSCRIPTION }),
+    );
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(new Response("{}", { status: 500 })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await worker.fetch(
+      new Request("https://sentwise-inference.test/v1/paddle/manage-billing", {
+        headers: bearer(),
+      }),
+      laneEnv("production"),
+    );
+
+    expect(fetchMock).toHaveBeenCalled();
+    for (const [input, init] of fetchMock.mock.calls) {
+      expect(urlOf(input).startsWith(PADDLE_SANDBOX_API_BASE)).toBe(true);
+      expect(authOf(init)).toBe(`Bearer ${SANDBOX_KEY}`);
+    }
+  });
+
+  it("manage billing for a live subscription goes live even inside the sandbox lane", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: LIVE_SUBSCRIPTION }));
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(new Response("{}", { status: 500 })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await worker.fetch(
+      new Request("https://sentwise-inference.test/v1/paddle/manage-billing", {
+        headers: bearer(),
+      }),
+      laneEnv("sandbox"),
+    );
+
+    expect(fetchMock).toHaveBeenCalled();
+    for (const [input, init] of fetchMock.mock.calls) {
+      expect(urlOf(input).startsWith(PADDLE_LIVE_API_BASE)).toBe(true);
+      expect(authOf(init)).toBe(`Bearer ${LIVE_KEY}`);
+    }
+  });
+
+  it("a live checkout ignores a stranded sandbox subscription and its customer id", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(QA_EMAIL, { subscription: SANDBOX_SUBSCRIPTION }),
+    );
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(transactionCreated()),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postCheckout(laneEnv("production"), LIVE_PRICES.pro);
+
+    expect(res.status).toBe(200);
+    expect(urlOf(fetchMock.mock.calls[0][0])).toBe(`${PADDLE_LIVE_API_BASE}/transactions`);
+    const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string) as Record<string, any>;
+    expect(body.customer_id).toBeUndefined();
+  });
+
+  it("an active live subscription still blocks a sandbox checkout", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: LIVE_SUBSCRIPTION }));
+    const fetchMock = vi.fn(() => Promise.resolve(transactionCreated()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postCheckout(laneEnv("sandbox"), SANDBOX_PRICES.pro);
+
+    expect(res.status).toBe(409);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a plan change on a subscription from the other lane", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(QA_EMAIL, { subscription: SANDBOX_SUBSCRIPTION }),
+    );
+    const fetchMock = vi.fn(() => Promise.resolve(new Response("{}", { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      new Request("https://sentwise-inference.test/v1/paddle/change-plan", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: LIVE_PRICES.unlimited }),
+      }),
+      laneEnv("production"),
+    );
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_environment_mismatch");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("stamps a subscription written from a sandbox event", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(QA_EMAIL, { subscription: { paddleCustomerId: "ctm_lane" } }),
+    );
+    const res = await postWebhook(
+      "/v1/paddle/webhook/sandbox",
+      laneEnv("sandbox"),
+      subscriptionEvent(SANDBOX_PRICES.pro),
+      SANDBOX_SECRET,
+    );
+    expect(res.status).toBe(200);
+    const written = mocks.updateUserMetadata.mock.calls.at(-1)?.[1]?.privateMetadata;
+    expect(written?.subscription).toMatchObject({ paddleEnvironment: "sandbox" });
+  });
+
+  it("still delivers a sandbox cancellation after the lane closes and the email changes", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(CUSTOMER_EMAIL, {
+        subscription: {
+          ...SANDBOX_SUBSCRIPTION,
+          paddleSubscriptionId: "sub_lane",
+          paddleCustomerId: "ctm_lane",
+        },
+      }),
+    );
+    const canceled = JSON.parse(subscriptionEvent(SANDBOX_PRICES.pro));
+    canceled.event_type = "subscription.canceled";
+    canceled.data.status = "canceled";
+    const res = await postWebhook(
+      "/v1/paddle/webhook/sandbox",
+      laneEnv("production"),
+      JSON.stringify(canceled),
+      SANDBOX_SECRET,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).not.toMatchObject({ mapped: false });
+    const written = mocks.updateUserMetadata.mock.calls.at(-1)?.[1]?.privateMetadata;
+    expect(written?.subscription).toMatchObject({
+      status: "canceled",
+      paddleEnvironment: "sandbox",
+    });
+  });
+
+  it("never lets a sandbox event overwrite a live subscription in force", async () => {
+    mocks.getUser.mockResolvedValue(
+      userWithEmail(QA_EMAIL, {
+        subscription: { ...LIVE_SUBSCRIPTION, paddleCustomerId: "ctm_lane" },
+      }),
+    );
+    const res = await postWebhook(
+      "/v1/paddle/webhook/sandbox",
+      laneEnv("sandbox"),
+      subscriptionEvent(SANDBOX_PRICES.pro),
+      SANDBOX_SECRET,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ stale: true });
+    expect(mocks.updateUserMetadata).not.toHaveBeenCalled();
+  });
+});
+
+describe("incomplete sandbox lane fails closed (P3)", () => {
+  function incompleteEnv(): Env {
+    const env = laneEnv("sandbox");
+    delete env.PADDLE_SANDBOX_CLIENT_TOKEN;
+    return env;
+  }
+
+  it("/v1/me tells a QA account checkout is unavailable instead of production", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL));
+    expect((await getMe(incompleteEnv())).billing).toEqual({
+      environment: "sandbox",
+      checkoutAvailable: false,
+    });
+  });
+
+  it("checkout refuses the QA account with 503 and never calls Paddle", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: null }));
+    const fetchMock = vi.fn(() => Promise.resolve(transactionCreated()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const price of [LIVE_PRICES.pro, SANDBOX_PRICES.pro]) {
+      const res = await postCheckout(incompleteEnv(), price);
+      expect(res.status).toBe(503);
+      expect(((await res.json()) as any).error.type).toBe("sandbox_checkout_unavailable");
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("production accounts are unaffected by an incomplete sandbox lane", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    mocks.getUser.mockResolvedValue(userWithEmail(CUSTOMER_EMAIL, { subscription: null }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(transactionCreated())),
+    );
+    expect((await getMe(incompleteEnv())).billing).toEqual({
+      environment: "production",
+      checkoutAvailable: true,
+    });
+    expect((await postCheckout(incompleteEnv(), LIVE_PRICES.pro)).status).toBe(200);
   });
 });
