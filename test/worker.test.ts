@@ -39,6 +39,7 @@ import {
   invalidateClerkUser,
 } from "../src/clerk-user-cache";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
+import { computeHmacSha256Hex } from "../src/paddle";
 import {
   PADDLE_OVERAGE_CHECKOUT_RESERVATION_STORAGE_KEY,
   PADDLE_SUBSCRIPTION_CHECKOUT_RESERVATION_STORAGE_KEY,
@@ -1839,6 +1840,77 @@ describe("POST /v1/paddle/checkout", () => {
       paddleEnv,
     );
 
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error.type).toBe("billing_subscription_active");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a paused subscription paused through an update with no status, so checkout still 409s (sentwise#124)", async () => {
+    let storedMeta: Record<string, unknown> = {
+      subscription: { paddleCustomerId: "ctm_123" },
+    };
+    mocks.getUser.mockImplementation(() => Promise.resolve(userWith(storedMeta)));
+    mocks.updateUserMetadata.mockImplementation((_userId, update) => {
+      storedMeta = { ...storedMeta, ...(update.privateMetadata as Record<string, unknown>) };
+      return Promise.resolve();
+    });
+    const webhook = async (event: Record<string, unknown>): Promise<Response> => {
+      const rawBody = JSON.stringify(event);
+      const ts = Math.floor(Date.now() / 1000);
+      const h1 = await computeHmacSha256Hex(PADDLE_SECRET, `${ts}:${rawBody}`);
+      return worker.fetch(
+        req("/v1/paddle/webhook", {
+          method: "POST",
+          headers: { "content-type": "application/json", "Paddle-Signature": `ts=${ts};h1=${h1}` },
+          body: rawBody,
+        }),
+        paddleEnv,
+      );
+    };
+    // Paddle API lookups are not needed: the events carry the signed checkout binding.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("{}", { status: 404 }))),
+    );
+    const subscriptionData = {
+      id: "sub_paused_upd",
+      customer_id: "ctm_123",
+      custom_data: await buildPaddleCheckoutCustomData("user_123", paddleEnv),
+      items: [{ price: { id: PRO_PRICE }, quantity: 1 }],
+    };
+
+    const paused = await webhook({
+      event_id: "evt_paused_upd_1",
+      event_type: "subscription.paused",
+      occurred_at: "2026-09-06T10:00:00.000Z",
+      data: { ...subscriptionData, status: "paused" },
+    });
+    expect(paused.status).toBe(200);
+    const updated = await webhook({
+      event_id: "evt_paused_upd_2",
+      event_type: "subscription.updated",
+      occurred_at: "2026-09-07T10:00:00.000Z",
+      data: subscriptionData, // no status
+    });
+    expect(updated.status).toBe(200);
+    expect(storedMeta.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_paused_upd",
+      status: "canceled",
+      paddleStatus: "paused",
+      lastEventId: "evt_paused_upd_2",
+    });
+
+    mocks.verifyToken.mockResolvedValue({ sub: "user_123" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const res = await worker.fetch(
+      req("/v1/paddle/checkout", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: PRO_PRICE }),
+      }),
+      paddleEnv,
+    );
     expect(res.status).toBe(409);
     expect(((await res.json()) as any).error.type).toBe("billing_subscription_active");
     expect(fetchMock).not.toHaveBeenCalled();
