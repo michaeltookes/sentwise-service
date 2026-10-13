@@ -70,7 +70,7 @@ access past the 14-day trial.
 If you want to verify the claim yourself, read the request path end to end — it is short:
 
 ```
-src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, POST /v1/paddle/webhook/sandbox, /admin/margin, /admin/comp
+src/index.ts      router: /healthz, GET+DELETE /v1/me, /v1/draft, POST /v1/interest, POST /v1/paddle/checkout, POST /v1/paddle/change-plan, GET /v1/paddle/manage-billing, POST /v1/paddle/webhook, POST /v1/paddle/webhook/sandbox, /admin/margin, /admin/comp, POST /admin/paddle-lane-reset
   -> src/auth.ts            verify Clerk JWT, check/init the trial + read quota/subscription; delete user
   -> src/subscription.ts    derive the account's subscription (trial fallback + 56c override) — pure
   -> src/comp.ts            layer an admin-granted comp entitlement over the natural state (111) — pure
@@ -707,15 +707,27 @@ One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddl
   was created in, whatever `PADDLE_ENV` says now, so a live transaction is never looked up in the
   sandbox (and mistaken for gone) or vice versa. A pending checkout from the other lane is cancelled
   where it lives before a new one is minted.
-- **Stranded sandbox subscriptions.** Once the lane closes or the email leaves `@prowlqa.dev`, a
-  sandbox subscription is not a paid plan: `/v1/me` falls back to the trial/none state, its
-  webhook-written tier caps and extras are ignored, a live checkout isn't blocked by it (and never
-  receives its sandbox customer id), and plan changes return `409 billing_environment_mismatch`.
-  Manage billing still opens the sandbox portal so it can be cancelled. A live subscription in force
-  (including a paused subscription) still blocks a sandbox checkout.
-- Replacing a subscription with one from the other environment clears overage credits and their
-  transaction/replay metadata, so purchases from either environment cannot become entitlement in
-  the other. Account quota settings unrelated to overage are preserved.
+- **Lane lock: transitions are refused, not reconciled.** An account's lane is decided by the
+  first billing state it acquires and stored in Clerk `privateMetadata.paddleLane`
+  (`"sandbox" | "production"`), written on the first checkout reservation or subscription
+  (accounts that predate the key are locked by the lane of their stored subscription). After that,
+  neither `PADDLE_ENV` nor an email change moves the account:
+  - checkout and plan changes from the other lane return `409 billing_lane_locked`, naming the
+    reset route; nothing is reserved or written;
+  - `/v1/me` reports `{ "environment": "<locked lane>", "checkoutAvailable": false }` while the lock
+    conflicts with the lane the account would get today;
+  - a webhook event from the other environment is acknowledged as `{ "ignored": "lane_locked" }`
+    and writes nothing (a finished checkout's reservation is still released);
+  - a non-QA account can never acquire sandbox state.
+- **Leaving a lane:** only the QA-only admin reset below. A sandbox subscription whose lane was
+  closed (or whose account's email left `@prowlqa.dev`) is not a paid plan, and Manage billing still
+  opens the sandbox portal so it can be cancelled.
+- **Paused is live.** A paused Paddle subscription keeps Paddle's raw status (`paddleStatus:
+"paused"`; the display `status` stays `"canceled"`). It blocks a second subscription and a
+  replacement, and a later resume event applies to it.
+- **Replay tombstones.** Whenever an overage ledger is retired, its transaction ids are kept as
+  environment-scoped tombstones in the account's Durable Object, so a redelivered old
+  `transaction.completed` is never credited again.
 - The Worker tells the AccountQuota Durable Object the lane with an internal header (the DO is not
   reachable from outside the Worker); the Worker is the gate for who enters the sandbox.
 - The lane for state-changing routes (checkout, plan change, manage billing) is read from a fresh
@@ -726,6 +738,26 @@ One Worker serves both Paddle environments, selected by `PADDLE_ENV` (`src/paddl
   both from one record. Production-only deployments need no separate lane lookup.
 - Setup on Paddle's side (sandbox account, catalog, notification destination, test cards) is in the
   app repo's `docs/billing-qa.md`.
+
+### `POST /admin/paddle-lane-reset` — leave a locked Paddle lane (QA only, item 123)
+
+The only way a QA account leaves its locked Paddle lane. Same `ADMIN_TOKEN` gate as `/admin/comp`
+(404 when unset, 401 otherwise). Only `@prowlqa.dev` accounts can be reset (anything else is
+`403 paddle_lane_reset_forbidden` and writes nothing); an account with a **live** subscription in
+force is refused with `409 billing_live_subscription_active` (the route never touches live Paddle).
+
+It cancels the account's sandbox subscription at the Paddle sandbox immediately (failure is
+`502 subscription_cancel_failed` and nothing is cleared), then, serialized in the account's Durable
+Object: releases its checkout reservations, retires the overage ledger while keeping replay
+tombstones, and clears the Clerk subscription record, the Paddle-written quota fields, and the lane
+lock. The response lists `previousLane`, `canceledSubscriptionId`, `releasedReservations` and
+`retiredCredits`.
+
+```bash
+curl -s -X POST https://sentwise-inference.sentwise-service.workers.dev/admin/paddle-lane-reset \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "content-type: application/json" \
+  -d '{"email":"qa-buyer@prowlqa.dev"}'
+```
 
 ## Development
 
