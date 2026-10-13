@@ -617,6 +617,7 @@ export function buildSubscriptionRecord(
   priceId: string | null,
   now: number,
   storedStatus?: SubscriptionStatus | null,
+  storedPaddleStatus?: string | null,
 ): StoredSubscriptionRecord {
   return {
     plan,
@@ -629,7 +630,10 @@ export function buildSubscriptionRecord(
     updatedAt: normalizeIso(event.occurredAt) ?? new Date(now).toISOString(),
     paddleOccurredAt: event.occurredAt,
     lastEventId: event.eventId,
-    paddleStatus: rawPaddleSubscriptionStatus(event),
+    // 124: an event that can't determine Paddle's status (absent/unrecognized
+    // data.status on e.g. subscription.updated) keeps the stored raw status of the
+    // same subscription, so a paused subscription can't silently read as canceled.
+    paddleStatus: rawPaddleSubscriptionStatus(event) ?? storedPaddleStatus ?? null,
   };
 }
 

@@ -142,6 +142,8 @@ export async function recordPaddleSubscriptionInClerk(
       mapped.priceId,
       body.now,
       storedSubscriptionStatus(existingSub),
+      // Only the same subscription's raw status carries over (sentwise#124).
+      isDifferentSubscription ? null : storedRawPaddleStatus(existingSub),
     ),
     ...supersededSubscriptionHistory(
       supersededSubscriptionIds,
@@ -165,6 +167,11 @@ export async function recordPaddleSubscriptionInClerk(
   }
 
   return { applied: true };
+}
+
+function storedRawPaddleStatus(existingSub: Record<string, unknown> | null): string | null {
+  const raw = existingSub?.paddleStatus;
+  return typeof raw === "string" && raw !== "" ? raw : null;
 }
 
 function planMappingForSubscriptionEvent(
