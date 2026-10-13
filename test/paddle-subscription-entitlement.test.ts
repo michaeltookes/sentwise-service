@@ -4,7 +4,7 @@ import type { Env } from "../src/config";
 import type { PaddleEvent } from "../src/paddle";
 import { buildPaddleCheckoutCustomData } from "../src/paddle-account";
 import { recordPaddleSubscriptionInClerk } from "../src/paddle-subscription-entitlement";
-import { storedPaddleLane } from "../src/paddle-env";
+import { paddleEnvForStoredLane, storedPaddleLane } from "../src/paddle-env";
 
 const mocks = vi.hoisted(() => ({ getUser: vi.fn(), updateUserMetadata: vi.fn() }));
 vi.mock("@clerk/backend", () => ({
@@ -203,5 +203,117 @@ describe("subscription replacements across Paddle environments", () => {
     ).toEqual({ applied: true });
     expect(metadata.quota).toEqual(previousQuota);
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("the environment marker survives Clerk's deep merge correctly", () => {
+  const sandboxEnv = paddleEnvForStoredLane(
+    {
+      ...env,
+      PADDLE_LANE: undefined,
+      PADDLE_ENV: "sandbox",
+      PADDLE_SANDBOX_API_KEY: "test_sandbox_key",
+      PADDLE_SANDBOX_WEBHOOK_SECRET: "test_sandbox_secret",
+      PADDLE_SANDBOX_STARTER_PRICE_ID: "pri_sandbox_starter",
+      PADDLE_SANDBOX_PRO_PRICE_ID: "pri_sandbox_pro",
+      PADDLE_SANDBOX_UNLIMITED_PRICE_ID: "pri_sandbox_unlimited",
+    },
+    "sandbox",
+  );
+
+  async function sandboxEvent(overrides: Partial<PaddleEvent> = {}): Promise<PaddleEvent> {
+    return {
+      eventId: "evt_sandbox_new",
+      eventType: "subscription.created",
+      occurredAt: new Date(now).toISOString(),
+      data: {
+        id: "sub_sandbox_new",
+        customer_id: "ctm_sandbox_new",
+        status: "active",
+        custom_data: await buildPaddleCheckoutCustomData("user_lane", sandboxEnv),
+        items: [{ price: { id: "pri_sandbox_pro" }, quantity: 1 }],
+      },
+      ...overrides,
+    };
+  }
+
+  it("every live write sends an explicit null marker, even within the live lane", async () => {
+    delete metadata.subscription.paddleEnvironment;
+    metadata.subscription.paddleSubscriptionId = "sub_live";
+    metadata.subscription.paddleCustomerId = "ctm_live";
+
+    expect(
+      await recordPaddleSubscriptionInClerk("user_lane", { now, event: await liveEvent() }, env),
+    ).toEqual({ applied: true });
+
+    const patch = mocks.updateUserMetadata.mock.calls.at(-1)?.[1]?.privateMetadata;
+    expect(patch.subscription).toHaveProperty("paddleEnvironment", null);
+    expect(metadata.subscription).not.toHaveProperty("paddleEnvironment");
+  });
+
+  it("sandbox -> live: the merged record has live ids and no sandbox stamp", async () => {
+    expect(
+      await recordPaddleSubscriptionInClerk("user_lane", { now, event: await liveEvent() }, env),
+    ).toEqual({ applied: true });
+
+    expect(metadata.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_live",
+      paddleCustomerId: "ctm_live",
+    });
+    expect(storedPaddleLane(metadata.subscription)).toBe("production");
+  });
+
+  it("live -> sandbox: a sandbox purchase after a cancelled live plan is stamped sandbox", async () => {
+    metadata.subscription = {
+      plan: "pro",
+      status: "canceled",
+      paddleSubscriptionId: "sub_live",
+      paddleCustomerId: "ctm_live",
+      priceId: "pri_live_pro",
+      paddleOccurredAt: "2026-10-11T12:00:00Z",
+    };
+    vi.mocked(fetch).mockResolvedValue(
+      Response.json({ data: { customer_id: "ctm_sandbox_new", status: "active" } }),
+    );
+
+    expect(
+      await recordPaddleSubscriptionInClerk(
+        "user_lane",
+        { now, event: await sandboxEvent() },
+        sandboxEnv,
+      ),
+    ).toEqual({ applied: true });
+
+    expect(metadata.subscription).toMatchObject({
+      paddleSubscriptionId: "sub_sandbox_new",
+      paddleCustomerId: "ctm_sandbox_new",
+      paddleEnvironment: "sandbox",
+    });
+    for (const call of vi.mocked(fetch).mock.calls) {
+      const target = call[0];
+      const url = typeof target === "string" || target instanceof URL ? String(target) : target.url;
+      expect(url).toContain("sandbox-api.paddle.com");
+    }
+  });
+
+  it("live -> sandbox: a sandbox event never overwrites a live plan in force", async () => {
+    metadata.subscription = {
+      plan: "pro",
+      status: "active",
+      paddleSubscriptionId: "sub_live",
+      paddleCustomerId: "ctm_live",
+      priceId: "pri_live_pro",
+      paddleOccurredAt: "2026-10-11T12:00:00Z",
+    };
+    const previous = structuredClone(metadata);
+
+    expect(
+      await recordPaddleSubscriptionInClerk(
+        "user_lane",
+        { now, event: await sandboxEvent() },
+        sandboxEnv,
+      ),
+    ).toEqual({ stale: true });
+    expect(metadata).toEqual(previous);
   });
 });

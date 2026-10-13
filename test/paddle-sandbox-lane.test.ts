@@ -1175,3 +1175,29 @@ describe("mutation lanes come from a fresh Clerk read (PR #36 review)", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("plan change takes lane and subscription id from one snapshot (pass-2 review)", () => {
+  it("refuses when the subscription switched environments after the lane was resolved", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_lane" });
+    // Lane resolution sees the sandbox subscription; by the time the handler
+    // loads the ids, a webhook has replaced it with a live one.
+    mocks.getUser
+      .mockResolvedValueOnce(userWithEmail(QA_EMAIL, { subscription: SANDBOX_SUBSCRIPTION }))
+      .mockResolvedValue(userWithEmail(QA_EMAIL, { subscription: LIVE_SUBSCRIPTION }));
+    const fetchMock = vi.fn(() => Promise.resolve(new Response("{}")));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      new Request("https://sentwise-inference.test/v1/paddle/change-plan", {
+        method: "POST",
+        headers: bearer(),
+        body: JSON.stringify({ priceId: SANDBOX_PRICES.unlimited }),
+      }),
+      laneEnv("sandbox"),
+    );
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).error?.type ?? "").toContain("billing_environment_mismatch");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
