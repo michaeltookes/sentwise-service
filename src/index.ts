@@ -1,24 +1,76 @@
-import { authenticate, requireActiveTrial, resolveAccount } from "./auth";
+import {
+  authenticate,
+  ClerkDeletionOutcomeUnknownError,
+  deleteClerkUser,
+  hasPaidAccess,
+  requireActiveTrial,
+  resolveAccount,
+  resolveAccountIfExists,
+} from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
-import type { Env } from "./config";
+import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_RATE_LIMIT_PER_MIN, type Env } from "./config";
+import {
+  buildQuota,
+  conservativeRequestTokenBound,
+  effectiveEnforcement,
+  windowStartUtc,
+  numFrom,
+  resolveLimits,
+  type WindowState,
+} from "./metering";
+import {
+  quotaBeginAccountDeletion,
+  quotaCancelAccountDeletion,
+  quotaCheck,
+  quotaDeferRelease,
+  quotaDeferSettlement,
+  quotaFinishAccountDeletion,
+  quotaPeek,
+  quotaRelease,
+  quotaReserve,
+  quotaSettle,
+} from "./quota-client";
+import { recordUsage } from "./analytics";
+import { invalidateClerkUser } from "./clerk-user-cache";
+import { handleMargin } from "./admin";
+import { handleAdminComp } from "./admin-comp";
+import { recordInterest } from "./interest";
+import { handlePaddleCheckout, hasOpenPaddleCheckout } from "./paddle-checkout";
+import { handlePaddleManageBilling } from "./paddle-management";
+import { handlePaddleChangePlan } from "./paddle-plan";
+import { handlePaddleWebhook } from "./paddle-webhook";
+import { appCallbackScheme, isCallbackPath, renderCallbackPage } from "./callback";
+
+// Re-export the Durable Object so the runtime can instantiate it (see wrangler.jsonc).
+export { AccountQuota } from "./quota-do";
 
 /**
- * Sentwise managed-inference Worker (backlog 56a).
+ * Sentwise managed-inference Worker (backlog 56a + 56b).
  *
  * Routes:
- *   GET  /healthz    -> liveness, no auth
- *   GET  /v1/me      -> { userId, email, trial } for the account display
- *   POST /v1/draft   -> forwards a drafting request to Anthropic (trial-gated)
+ *   GET    /healthz       -> liveness, no auth
+ *   GET    /auth/callback, /openrouter/callback -> browser landing pages that hand
+ *          the OAuth / key-provisioning result to the Mac app's sentwise:// scheme (89)
+ *   GET    /v1/me         -> { userId, email, trial, subscription, quota } for account display
+ *   DELETE /v1/me         -> delete the account (barrier, Clerk delete, quota tombstone) (73)
+ *   POST   /v1/draft      -> forwards a drafting request to Anthropic (trial + metered)
+ *   POST   /v1/interest   -> record demand for a parked capability (item 75; first click wins)
+ *   POST   /v1/paddle/checkout -> authenticated server-side Paddle transaction checkout
+ *   POST   /v1/paddle/change-plan -> change an active subscription's tier with proration (90)
+ *   GET    /v1/paddle/manage-billing -> JSON fresh Paddle billing-management URL
+ *   POST   /v1/paddle/webhook -> Paddle checkout/licensing events -> entitlement writes (56c; signature-auth, no bearer)
+ *   GET    /admin/margin  -> maintainer margin dashboard (ADMIN_TOKEN; 404 when unset)
+ *   GET/POST/DELETE /admin/comp -> inspect/grant/revoke a comp entitlement for a
+ *          named account (item 111; ADMIN_TOKEN; 404 when unset)
  *
- * Stateless by design: no storage, no content logging. The only persisted
- * state is `trialStartedAt` in the user's Clerk privateMetadata.
- *
- * TODO(56b): per-account token metering, daily/monthly caps, rate limiting,
- * and abuse controls are intentionally out of scope for 56a.
+ * Content-stateless by design: no prompt/draft content is stored or logged. The
+ * only state is counters, timestamps, and random reservation IDs — trial in Clerk,
+ * usage in the AccountQuota Durable Object, aggregate hashed metrics in Analytics
+ * Engine. See src/config.ts.
  */
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const { pathname } = url;
 
@@ -27,15 +79,151 @@ export default {
         return Response.json({ status: "ok" });
       }
 
+      // Browser landing pages for the Google (Clerk) / OpenRouter OAuth
+      // round-trips (items 59 + 89). Static, unauthenticated pages: the browser
+      // reads the callback params client-side (Clerk returns the nonce in the URL
+      // fragment on HTTPS, which never reaches the server) and forwards only the
+      // allow-listed params to the Mac app's sentwise:// scheme. Nothing stored,
+      // nothing logged.
+      if (isCallbackPath(pathname) && request.method === "GET") {
+        return renderCallbackPage(pathname, appCallbackScheme(env));
+      }
+
+      if (pathname === "/admin/margin" && request.method === "GET") {
+        return await handleMargin(request, env);
+      }
+
+      // 111 — comp entitlement for non-billable internal/QA accounts. Same
+      // ADMIN_TOKEN gate as /admin/margin (invisible 404 when unset).
+      if (
+        pathname === "/admin/comp" &&
+        (request.method === "GET" || request.method === "POST" || request.method === "DELETE")
+      ) {
+        return await handleAdminComp(request, env);
+      }
+
+      // 56c — Paddle checkout/licensing webhook. Authenticated by the Paddle
+      // signature (HMAC over ts:rawBody), NOT a Clerk bearer, so it runs before
+      // authenticate(). It writes entitlements into Clerk privateMetadata.
+      if (pathname === "/v1/paddle/webhook" && request.method === "POST") {
+        return await handlePaddleWebhook(request, env);
+      }
+
+      if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
+        const { userId } = await authenticate(request, env);
+        return await handlePaddleManageBilling(userId, request, env);
+      }
+
+      if (pathname === "/v1/paddle/checkout" && request.method === "POST") {
+        const { userId } = await authenticate(request, env);
+        return await handlePaddleCheckout(userId, request, env);
+      }
+
+      if (pathname === "/v1/paddle/change-plan" && request.method === "POST") {
+        const { userId } = await authenticate(request, env);
+        return await handlePaddleChangePlan(userId, request, env);
+      }
+
       if (pathname === "/v1/me" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
-        const account = await resolveAccount(userId, env, { initialize: false });
-        return Response.json(account);
+        // S-M1: this pure read is cache-eligible (short TTL). Drafting access is
+        // still re-checked fresh on /v1/draft, so a stale display can never grant
+        // access — it can only lag account state by at most the cache TTL.
+        const account = await resolveAccount(userId, env, { initialize: false, useCache: true });
+        const { window } = await quotaPeek(env, userId, { now: Date.now() });
+        const baseLimits = resolveLimits(env, account.quotaOverride, window.windowStart);
+        // S-M2: report the same effective mode a draft would enforce, so a trial
+        // account sees "hard" here too (it can't lag behind actual enforcement).
+        const limits = {
+          ...baseLimits,
+          enforcement: effectiveEnforcement(
+            baseLimits.enforcement,
+            hasPaidAccess(account.subscription),
+          ),
+        };
+        // quotaOverride is internal — build the response explicitly, never spread it.
+        return Response.json({
+          userId: account.userId,
+          email: account.email,
+          trial: account.trial,
+          subscription: account.subscription,
+          quota: buildQuota(window, limits),
+        });
+      }
+
+      if (pathname === "/v1/me" && request.method === "DELETE") {
+        const { userId } = await authenticate(request, env);
+        // S-M1: account deletion must never read a cached record (the paid-account
+        // guard below and the post-delete tombstone must see fresh state), and it
+        // drops any entry a concurrent GET /v1/me cached in this isolate.
+        invalidateClerkUser(userId);
+        const account = await resolveAccountIfExists(userId, env, { initialize: false });
+        // 111: a comp-derived subscription has no Paddle subscription behind it —
+        // it must never block deletion behind "cancel your Paddle subscription".
+        if (account && !account.compApplied && hasPaidAccess(account.subscription)) {
+          throw activeSubscriptionDeletionError();
+        }
+        if (account && (await hasOpenPaddleCheckout(userId, env))) {
+          throw new ApiError(
+            409,
+            "billing_checkout_pending",
+            "Complete or cancel your pending Paddle checkout before deleting your account.",
+          );
+        }
+        const deletionAttemptId = crypto.randomUUID();
+        await quotaBeginAccountDeletion(env, userId, deletionAttemptId);
+        if (account) {
+          try {
+            const latestAccount = await resolveAccountIfExists(userId, env, { initialize: false });
+            if (
+              latestAccount &&
+              !latestAccount.compApplied &&
+              hasPaidAccess(latestAccount.subscription)
+            ) {
+              throw activeSubscriptionDeletionError();
+            }
+          } catch (err) {
+            await cancelAccountDeletionBarrier(env, userId, deletionAttemptId, ctx);
+            throw err;
+          }
+        }
+        try {
+          await deleteClerkUser(userId, env);
+        } catch (err) {
+          if (err instanceof ClerkDeletionOutcomeUnknownError) throw err;
+          await cancelAccountDeletionBarrier(env, userId, deletionAttemptId, ctx);
+          throw err;
+        }
+        await finishAccountDeletion(env, userId, deletionAttemptId, ctx);
+        // Drop any record cached between the guard read and now (deleted user).
+        invalidateClerkUser(userId);
+        return new Response(null, { status: 204 });
       }
 
       if (pathname === "/v1/draft" && request.method === "POST") {
         const { userId } = await authenticate(request, env);
-        await requireActiveTrial(userId, env);
+
+        // 1) Rate limit FIRST — before the Clerk trial lookup (S-M1). This runs
+        // the Durable Object limiter ahead of requireActiveTrial's Clerk Backend
+        // API call, so a scripted account is stopped by our per-account limiter
+        // rather than exhausting Clerk's per-instance backend rate limits (which
+        // would surface as account_lookup_failed for every user — a whole-service
+        // DoS). The rate limit is env-derived only (never per-account overridden),
+        // so it needs no Clerk lookup to evaluate.
+        const now = Date.now();
+        const check = await quotaCheck(env, userId, {
+          now,
+          rateLimitPerMin: numFrom(env.RATE_LIMIT_PER_MIN, DEFAULT_RATE_LIMIT_PER_MIN),
+        });
+        if (!check.allowed) {
+          const res = jsonError(429, "rate_limited", "Too many requests. Slow down and retry.", {
+            retryAfterSeconds: check.retryAfterSeconds,
+          });
+          res.headers.set("Retry-After", String(check.retryAfterSeconds));
+          return res;
+        }
+
+        const account = await requireActiveTrial(userId, env);
 
         let body: unknown;
         try {
@@ -44,12 +232,120 @@ export default {
           throw new ApiError(400, "invalid_request", "Request body must be valid JSON.");
         }
         const draft = parseDraftRequest(body);
-        const result = await forwardToAnthropic(draft, env);
-        return Response.json(result);
+        const model = draft.model ?? DEFAULT_MODEL;
+        // S-M2: trial accounts are hard-enforced regardless of ENFORCEMENT_MODE so
+        // a throwaway trial can't run unbounded spend; paid tiers keep the env mode.
+        const baseLimits = resolveLimits(env, account.quotaOverride, windowStartUtc(now));
+        const limits = {
+          ...baseLimits,
+          enforcement: effectiveEnforcement(
+            baseLimits.enforcement,
+            hasPaidAccess(account.subscription),
+          ),
+        };
+
+        // 2) Per-request token safety cap (pre-flight conservative bound).
+        const content = draftContentSize(draft.system, draft.messages);
+        const maxTokens = draft.maxTokens ?? DEFAULT_MAX_TOKENS;
+        const tokenBound = conservativeRequestTokenBound(
+          content.bytes,
+          maxTokens,
+          content.framingItems,
+        );
+        if (tokenBound > limits.maxTokensPerRequest) {
+          throw new ApiError(413, "request_too_large", "The request is too large to draft.");
+        }
+
+        // 3) Monthly quota admission + draft reservation. Hard mode blocks atomically;
+        // soft mode reserves and continues so successful drafts are metered once.
+        const reservationId = crypto.randomUUID();
+        const reservation = await quotaReserve(env, userId, {
+          now,
+          reservationId,
+          estimatedTokens: tokenBound,
+          limits,
+        });
+        if (!reservation.reserved && reservation.blockedByQuota) {
+          const resetsAt = buildQuota(reservation.window, limits).resetsAt;
+          throw new ApiError(429, "quota_exceeded", "You've used your monthly allowance.", {
+            resetsAt,
+          });
+        }
+        if (!reservation.reserved) {
+          throw new Error("quota_reservation_failed");
+        }
+
+        // 4) Forward to Anthropic, recording an aggregate metric either way.
+        const t0 = Date.now();
+        let result;
+        try {
+          result = await forwardToAnthropic(draft, env);
+        } catch (err) {
+          const outcome = err instanceof ApiError ? err.type : "internal_error";
+          await releaseReservedUsage(
+            env,
+            userId,
+            reservation.reservationId,
+            reservation.window,
+            reservation.estimatedTokens,
+            ctx,
+          );
+          await recordUsage(env, {
+            userId,
+            model,
+            inputTokens: 0,
+            outputTokens: 0,
+            latencyMs: Date.now() - t0,
+            outcome,
+          });
+          throw err;
+        }
+        const latencyMs = Date.now() - t0;
+
+        // 5) Record provider usage, then settle it into the reserved window.
+        // Settlement may be delayed by account deletion, but the provider cost
+        // already happened and should still feed aggregate margin metrics.
+        const tokensDelta = result.usage.inputTokens + result.usage.outputTokens;
+        await recordUsage(env, {
+          userId,
+          model,
+          inputTokens: result.usage.inputTokens,
+          outputTokens: result.usage.outputTokens,
+          latencyMs,
+          outcome: "ok",
+        });
+        const window = await settleReservedUsage(
+          env,
+          userId,
+          reservation.reservationId,
+          reservation.window,
+          reservation.estimatedTokens,
+          tokensDelta,
+          ctx,
+        );
+
+        return Response.json({ ...result, quota: buildQuota(window, limits) });
+      }
+
+      if (pathname === "/v1/interest" && request.method === "POST") {
+        const { userId } = await authenticate(request, env);
+        return await recordInterest(userId, request, env);
       }
 
       // Known paths with the wrong method get 405; everything else 404.
-      if (pathname === "/v1/draft" || pathname === "/v1/me" || pathname === "/healthz") {
+      if (
+        pathname === "/v1/draft" ||
+        pathname === "/v1/me" ||
+        pathname === "/v1/interest" ||
+        pathname === "/v1/paddle/checkout" ||
+        pathname === "/v1/paddle/change-plan" ||
+        pathname === "/v1/paddle/manage-billing" ||
+        pathname === "/v1/paddle/webhook" ||
+        pathname === "/healthz" ||
+        isCallbackPath(pathname) ||
+        (pathname === "/admin/margin" && !!env.ADMIN_TOKEN) ||
+        (pathname === "/admin/comp" && !!env.ADMIN_TOKEN)
+      ) {
         return jsonError(405, "method_not_allowed", "Method not allowed.");
       }
       return jsonError(404, "not_found", "Not found.");
@@ -62,3 +358,218 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+function draftContentSize(
+  system: string | undefined,
+  messages: Array<{ content: string }>,
+): { bytes: number; framingItems: number } {
+  const enc = new TextEncoder();
+  let bytes = system ? enc.encode(system).byteLength : 0;
+  for (const message of messages) {
+    bytes += enc.encode(message.content).byteLength;
+  }
+  return { bytes, framingItems: messages.length + (system === undefined ? 0 : 1) };
+}
+
+async function settleReservedUsage(
+  env: Env,
+  userId: string,
+  reservationId: string,
+  reservedWindow: WindowState,
+  estimatedTokens: number,
+  tokensDelta: number,
+  ctx?: ExecutionContext,
+): Promise<WindowState> {
+  const body = {
+    now: Date.now(),
+    reservationId,
+    reservationWindowStart: reservedWindow.windowStart,
+    estimatedTokens,
+    tokensDelta,
+  };
+  try {
+    return (await quotaSettle(env, userId, body)).window;
+  } catch (err) {
+    if (isAccountDeletionInProgressError(err)) {
+      await deferSettlementBlockedByDeletion(env, userId, body, ctx);
+      throw err;
+    }
+    if (isAccountDeletionError(err)) throw err;
+    try {
+      return (await quotaSettle(env, userId, { ...body, now: Date.now() })).window;
+    } catch (retryErr) {
+      if (isAccountDeletionInProgressError(retryErr)) {
+        await deferSettlementBlockedByDeletion(env, userId, body, ctx);
+        throw retryErr;
+      }
+      if (isAccountDeletionError(retryErr)) throw retryErr;
+      try {
+        await quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
+      } catch (deferErr) {
+        if (isAccountDeletionError(deferErr)) throw deferErr;
+        ctx?.waitUntil(
+          quotaDeferSettlement(env, userId, { ...body, now: Date.now() }).catch(() => undefined),
+        );
+      }
+      return optimisticSettledWindow(reservedWindow, reservationId, estimatedTokens, tokensDelta);
+    }
+  }
+}
+
+async function deferSettlementBlockedByDeletion(
+  env: Env,
+  userId: string,
+  body: {
+    reservationId: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+    tokensDelta: number;
+  },
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const defer = () => quotaDeferSettlement(env, userId, { ...body, now: Date.now() });
+  try {
+    await defer();
+  } catch (err) {
+    if (isAccountDeletionError(err)) return;
+    ctx?.waitUntil(defer().catch(() => undefined));
+  }
+}
+
+function optimisticSettledWindow(
+  reservedWindow: WindowState,
+  reservationId: string,
+  estimatedTokens: number,
+  tokensDelta: number,
+): WindowState {
+  return {
+    ...reservedWindow,
+    tokensUsed: reservedWindow.tokensUsed + tokensDelta,
+    tokensReserved: Math.max(0, (reservedWindow.tokensReserved ?? 0) - estimatedTokens),
+    activeReservations: reservedWindow.activeReservations?.filter((r) => r.id !== reservationId),
+  };
+}
+
+async function releaseReservedUsage(
+  env: Env,
+  userId: string,
+  reservationId: string,
+  reservedWindow: WindowState,
+  estimatedTokens: number,
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const body = {
+    now: Date.now(),
+    reservationId,
+    reservationWindowStart: reservedWindow.windowStart,
+    estimatedTokens,
+  };
+  try {
+    await quotaRelease(env, userId, body);
+  } catch (err) {
+    if (isAccountDeletionInProgressError(err)) {
+      await deferReleaseBlockedByDeletion(env, userId, body, ctx);
+      return;
+    }
+    if (isAccountDeletionError(err)) return;
+    try {
+      await quotaRelease(env, userId, { ...body, now: Date.now() });
+    } catch (retryErr) {
+      if (isAccountDeletionInProgressError(retryErr)) {
+        await deferReleaseBlockedByDeletion(env, userId, body, ctx);
+        return;
+      }
+      if (isAccountDeletionError(retryErr)) return;
+      // The reservation also has a DO-side TTL, so a repeated release outage
+      // cannot hold quota capacity until the monthly reset.
+    }
+  }
+}
+
+async function deferReleaseBlockedByDeletion(
+  env: Env,
+  userId: string,
+  body: {
+    reservationId: string;
+    reservationWindowStart: number;
+    estimatedTokens: number;
+  },
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const defer = () => quotaDeferRelease(env, userId, { ...body, now: Date.now() });
+  try {
+    await defer();
+  } catch (err) {
+    if (isAccountDeletionError(err)) return;
+    ctx?.waitUntil(defer().catch(() => undefined));
+  }
+}
+
+async function cancelAccountDeletionBarrier(
+  env: Env,
+  userId: string,
+  attemptId: string,
+  ctx?: ExecutionContext,
+): Promise<void> {
+  const cancel = async () => {
+    const result = await quotaCancelAccountDeletion(env, userId, attemptId);
+    if (!result.cancelled && result.barrierActive) {
+      throw new Error("account deletion barrier is still active");
+    }
+    return result;
+  };
+  try {
+    await retryQuotaSideEffect(cancel);
+  } catch {
+    ctx?.waitUntil(retryQuotaSideEffect(cancel).catch(() => undefined));
+    throw new ApiError(
+      503,
+      "account_deletion_recovery_failed",
+      "Could not restore account deletion state. Please try again.",
+    );
+  }
+}
+
+async function finishAccountDeletion(
+  env: Env,
+  userId: string,
+  attemptId: string,
+  ctx?: ExecutionContext,
+): Promise<void> {
+  try {
+    await retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId, attemptId));
+  } catch {
+    ctx?.waitUntil(
+      retryQuotaSideEffect(() => quotaFinishAccountDeletion(env, userId, attemptId)).catch(
+        () => undefined,
+      ),
+    );
+  }
+}
+
+async function retryQuotaSideEffect<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch {
+    return operation();
+  }
+}
+
+function isAccountDeletionError(err: unknown): err is ApiError {
+  return (
+    err instanceof ApiError &&
+    (err.type === "account_deleted" || err.type === "account_deletion_in_progress")
+  );
+}
+
+function isAccountDeletionInProgressError(err: unknown): err is ApiError {
+  return err instanceof ApiError && err.type === "account_deletion_in_progress";
+}
+
+function activeSubscriptionDeletionError(): ApiError {
+  return new ApiError(
+    409,
+    "billing_subscription_active",
+    "Cancel your Paddle subscription before deleting your account.",
+  );
+}

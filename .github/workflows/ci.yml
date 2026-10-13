@@ -26,6 +26,8 @@ jobs:
       - run: npm ci
       - name: Privacy guard (no body logging)
         run: npm run check-no-body-logging
+      - name: Sandbox deployment ref guard
+        run: bash scripts/test-deploy-sandbox.sh
       - name: Lint (ESLint + Prettier)
         run: npm run lint
       - name: Typecheck

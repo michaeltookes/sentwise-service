@@ -1,12 +1,23 @@
 // Central constants and the Worker environment binding shape.
 //
-// PRIVACY NOTE (backlog 56a): this Worker is a *stateless* drafting proxy. It
-// holds nothing on disk, keeps no database, and — critically — never logs the
-// contents of `system`/`messages` (the user's mail) or the model's reply. The
-// only persisted state anywhere is a single `trialStartedAt` timestamp stored
-// in the user's Clerk `privateMetadata`. If you are auditing this claim, the
-// entire request path is: src/index.ts -> src/auth.ts -> src/anthropic.ts.
-// Grep the repo for `console.` — the only logging is error *types*, never bodies.
+// PRIVACY NOTE (backlog 56a/56b): this Worker is a *content-stateless* drafting
+// proxy. It never logs the contents of `system`/`messages` (the user's mail) or
+// the model's reply, and it never stores them anywhere. The only state it keeps
+// is counters, timestamps, and random reservation IDs, never content:
+//   1. `trialStartedAt` in the user's Clerk `privateMetadata` (56a).
+//   2. Per-account usage counters + timestamps in a Durable Object (`AccountQuota`,
+//      56b) — monthly drafts/tokens used, in-flight token reservations, a sliding
+//      rate-limit window, and random reservation IDs keyed by Clerk userId. No
+//      prompts, no drafts, no emails.
+//   3. Aggregate, hashed usage metrics in Workers Analytics Engine (56b) — a SHA-256
+//      hash of the userId (never the raw id), model, token counts, estimated cost,
+//      latency, and outcome. No content.
+// If you are auditing this claim, the request path is:
+//   src/index.ts -> src/auth.ts -> src/anthropic.ts (draft forward)
+//                -> src/quota-do.ts / src/quota-client.ts (counters)
+//                -> src/analytics.ts (aggregate metrics)
+// Grep the repo for `console.` — there is none; the only telemetry is error *types*
+// and aggregate metrics, never bodies. Enforced in CI by scripts/check-no-body-logging.sh.
 
 export interface Env {
   // Secrets — provided via `wrangler secret put` (prod) or .dev.vars (local).
@@ -14,6 +25,75 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   // Public — safe to commit / expose. Present for parity / future use.
   CLERK_PUBLISHABLE_KEY: string;
+  // S-L1 (security pass 2026-09-13) — optional comma-separated allow-list of
+  // Clerk `azp` (authorized party) values passed to verifyToken. When unset,
+  // token verification is unchanged (no azp pinning). Config opt-in at cutover:
+  // @clerk/backend rejects tokens with absent or non-matching `azp` once this is
+  // set, and native-app session tokens may lack `azp`. Confirm the app's tokens
+  // carry a matching `azp` before enabling it. See src/auth.ts.
+  CLERK_AUTHORIZED_PARTIES?: string;
+  // Custom URL scheme the OAuth landing pages (src/callback.ts) forward to.
+  // Defaults to "sentwise"; a deployment serving a differently identified app
+  // build sets that build's scheme.
+  APP_CALLBACK_SCHEME?: string;
+
+  // 56b — metering. Durable Object namespace holding per-account usage counters.
+  ACCOUNT_QUOTA: DurableObjectNamespace;
+  // 56b — margin dashboard. Aggregate, hashed usage metrics. Optional so the
+  // Worker still runs (and tests pass) if the binding is absent.
+  USAGE_ANALYTICS?: AnalyticsEngineDataset;
+  // S-I2 (security pass 2026-09-13) — optional secret key for the analytics userId
+  // hash (wrangler secret). When set, the userId is hashed with keyed HMAC-SHA256
+  // (prevents offline re-identification of the deterministic pseudonym); when
+  // unset, the hash falls back to the original unkeyed SHA-256 so nothing breaks
+  // before the secret is provisioned. NOTE: enabling the key changes every
+  // pseudonym, discontinuing hash continuity on the margin dashboard (accepted).
+  ANALYTICS_HASH_KEY?: string;
+
+  // 56b — tunable limits (wrangler `vars`; strings or numbers, coerced in metering.ts).
+  MONTHLY_DRAFT_LIMIT?: string | number;
+  MONTHLY_TOKEN_LIMIT?: string | number;
+  RATE_LIMIT_PER_MIN?: string | number;
+  MAX_TOKENS_PER_REQUEST?: string | number;
+  ENFORCEMENT_MODE?: string; // "soft" (default) | "hard"
+
+  // 56b — margin dashboard config. CF_ACCOUNT_ID is a public var; the two tokens
+  // are secrets set via `wrangler secret put` and are optional (endpoint degrades).
+  CF_ACCOUNT_ID?: string;
+  // Analytics Engine dataset /admin/margin queries. Must match the
+  // analytics_engine_datasets binding of the same deployment; defaults to
+  // USAGE_DATASET. A second deployment writes to its own dataset so its usage
+  // never appears on another deployment's dashboard.
+  USAGE_DATASET_NAME?: string;
+  ADMIN_TOKEN?: string; // guards GET /admin/margin; endpoint 404s when unset
+  CF_ANALYTICS_API_TOKEN?: string; // Cloudflare API token for the Analytics Engine SQL API
+
+  // 56c — checkout + licensing (Paddle). The two Paddle credentials are SECRETS
+  // (set via `wrangler secret put`, never committed); the rest are public vars.
+  PADDLE_WEBHOOK_SECRET?: string; // Paddle notification-destination secret (pdl_ntfset_…); verifies webhooks + signs checkout binding
+  PADDLE_API_KEY?: string; // Paddle API key (pdl_…); creates checkouts, verifies mapping, reads management/current subscription state
+  PADDLE_API_BASE?: string; // Paddle REST base; defaults to the live base (PADDLE_LIVE_API_BASE)
+  PADDLE_WEBHOOK_TOLERANCE_SEC?: string | number; // signature freshness window (seconds); default DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC
+  PADDLE_WEBHOOK_MAX_BODY_BYTES?: string | number; // max signed webhook payload bytes; default DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES
+  PADDLE_CHECKOUT_BINDING_SECRET?: string; // stable HMAC secret for server-minted checkout binding; defaults to PADDLE_WEBHOOK_SECRET
+  PADDLE_CHECKOUT_BINDING_PREVIOUS_SECRET?: string; // previous checkout-binding secret accepted during rotations
+  PADDLE_STARTER_PRICE_ID?: string; // subscription price id for starter (required for checkout)
+  PADDLE_PRO_PRICE_ID?: string; // subscription price id for pro (required for checkout)
+  PADDLE_UNLIMITED_PRICE_ID?: string; // subscription price id for unlimited (required for checkout)
+
+  // 56c — per-tier monthly draft limits (the marketed caps; owner decision
+  // 2026-09-16). Tunable per-deploy without shipping a new binary, and written
+  // per-account into Clerk `privateMetadata.quota.monthlyDraftLimit` by the
+  // webhook so 56b enforcement uses them.
+  STARTER_DRAFT_LIMIT?: string | number;
+  PRO_DRAFT_LIMIT?: string | number;
+  UNLIMITED_DRAFT_LIMIT?: string | number;
+
+  // 56c — overage ("buy more drafts"). The one-time price id that credits extra
+  // drafts, and how many drafts one unit buys. When unset, overage purchases are
+  // ignored; buyer-supplied custom_data is never trusted for the credit amount.
+  EXTRA_DRAFTS_PRICE_ID?: string;
+  EXTRA_DRAFTS_PER_UNIT?: string | number;
 }
 
 export const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
@@ -23,11 +103,158 @@ export const ANTHROPIC_VERSION = "2023-06-01";
 export const DEFAULT_MODEL = "claude-sonnet-4-6";
 export const DEFAULT_MAX_TOKENS = 4096;
 
+// Bound the pre-Clerk deletion barrier. The Worker gives the Clerk delete call a
+// shorter timeout; the Durable Object alarm uses the longer barrier timeout to
+// re-check the Clerk outcome, retrying deletion for still-present users and
+// finalizing only after Clerk confirms the user is gone.
+export const CLERK_DELETE_TIMEOUT_MS = 10_000;
+export const ACCOUNT_DELETION_BARRIER_TIMEOUT_MS = 60_000;
+
 // Full-featured trial length. Enforced server-side (56a decision).
 export const TRIAL_DAYS = 14;
 export const TRIAL_MS = TRIAL_DAYS * 24 * 60 * 60 * 1000;
 
-// Blunt input caps to bound Anthropic cost until per-account metering (56b)
-// replaces them. TODO(56b): swap these fixed limits for per-account token
-// metering, daily/monthly caps, and rate limiting.
+// Coarse per-request input cap (bytes of prompt content). This is a cheap
+// pre-flight guard; 56b adds a token-estimate safety cap on top (see below).
 export const MAX_TOTAL_CONTENT_CHARS = 200_000;
+
+// ---------------------------------------------------------------------------
+// 56b — metering + limits.
+// ---------------------------------------------------------------------------
+
+// Base monthly allotment for accounts without a per-tier override — trial
+// accounts and any fallback. The window is a calendar month in UTC (owner
+// decision 2026-09-16; see the window computation in metering.ts). These
+// preserve the intent of the earlier weekly base (100 drafts / 2M tokens per
+// week) at a monthly cadence — ~4.3x the weekly figure, rounded to clean
+// numbers. Overridable per-deploy via wrangler `vars`, and per-account via
+// Clerk `privateMetadata.quota` (56c writes purchased extras there). The trial
+// is also time-bounded to TRIAL_DAYS and hard-enforced (see effectiveEnforcement),
+// so a single trial rarely spans a full monthly allotment.
+export const DEFAULT_MONTHLY_DRAFT_LIMIT = 400;
+export const DEFAULT_MONTHLY_TOKEN_LIMIT = 8_000_000;
+
+// Abuse-prevention rate limit (sliding 60s window), per account.
+export const DEFAULT_RATE_LIMIT_PER_MIN = 10;
+
+// Per-request token safety cap. The request path uses a conservative bound:
+// UTF-8 input bytes + per-message framing + DEFAULT_MAX_TOKENS (the completion
+// ceiling). 55_000 keeps the default ASCII/code-ish input budget near 50 KB
+// while still rejecting dense multibyte input or many tiny messages before they
+// ever reach Anthropic.
+export const DEFAULT_MAX_TOKENS_PER_REQUEST = 55_000;
+
+// Enforcement mode. "soft" meters and reports but never blocks on quota (only the
+// rate limit and safety cap are hard); "hard" also blocks over-limit drafts (429).
+export type EnforcementMode = "soft" | "hard";
+export const DEFAULT_ENFORCEMENT_MODE: EnforcementMode = "soft";
+
+// ---------------------------------------------------------------------------
+// 56b — margin dashboard.
+// ---------------------------------------------------------------------------
+
+// Default Workers Analytics Engine dataset name (must match the binding in
+// wrangler.jsonc). Overridable per deployment with the USAGE_DATASET_NAME var.
+export const USAGE_DATASET = "sentwise_usage";
+
+// The dataset name is interpolated into Analytics Engine SQL, so only plain
+// identifiers are accepted; anything else falls back to the default.
+export function usageDatasetName(env: Pick<Env, "USAGE_DATASET_NAME">): string {
+  const configured = env.USAGE_DATASET_NAME?.trim() ?? "";
+  return /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(configured) ? configured : USAGE_DATASET;
+}
+
+// Assumed per-active-account monthly revenue, for margin math on /admin/margin.
+export const ASSUMED_MONTHLY_REVENUE_USD = 19;
+
+// Cost table (USD per 1M tokens). Sonnet 4.6 is the default row. Easily editable:
+// add a row per model id the proxy may forward to. Source: Anthropic list pricing.
+export interface ModelCost {
+  inputPerMTokUsd: number;
+  outputPerMTokUsd: number;
+}
+export const MODEL_COSTS: Record<string, ModelCost> = {
+  "claude-sonnet-4-6": { inputPerMTokUsd: 3, outputPerMTokUsd: 15 },
+};
+export const DEFAULT_MODEL_COST: ModelCost = MODEL_COSTS[DEFAULT_MODEL] ?? {
+  inputPerMTokUsd: 3,
+  outputPerMTokUsd: 15,
+};
+
+// ---------------------------------------------------------------------------
+// 56c — checkout + licensing (Paddle).
+// ---------------------------------------------------------------------------
+
+// Paddle REST base used when PADDLE_API_BASE is unset. Every deployment of this
+// Worker runs the same code; a deployment that talks to a different Paddle
+// environment sets PADDLE_API_BASE (and its own price ids and secrets) in its
+// wrangler environment (second deployments are documented under docs/).
+export const PADDLE_LIVE_API_BASE = "https://api.paddle.com";
+
+// Webhook signature freshness window. Paddle's own SDK helpers default to a very
+// tight 5s tolerance; a serverless webhook with clock skew + provider retries
+// needs more headroom, and idempotency guards (not the clock) are our real replay
+// defense. Tunable via PADDLE_WEBHOOK_TOLERANCE_SEC.
+export const DEFAULT_PADDLE_WEBHOOK_TOLERANCE_SEC = 300;
+
+// Paddle webhooks are small JSON payloads. Keep the public unauthenticated
+// endpoint from buffering arbitrarily large bodies before signature verification.
+export const DEFAULT_PADDLE_WEBHOOK_MAX_BODY_BYTES = 128 * 1024;
+
+// The three paid launch tiers. "team" is reserved (no price mapped yet).
+export type PaidPlan = "starter" | "pro" | "unlimited";
+
+// Paddle price id -> paid tier comes only from the three PADDLE_*_PRICE_ID vars
+// of the deployment. There is no compiled-in fallback map: a deployment without
+// all three distinct ids has no subscription prices, and checkout is unavailable.
+// The *plan* is stable; the tier's monthly draft limit is resolved from a var
+// at runtime (see PLAN_DRAFT_LIMIT_VAR / resolvePlanDraftLimit in
+// src/paddle.ts) so it stays tunable without a release.
+export type PaddlePriceConfigEnv = Pick<
+  Env,
+  "PADDLE_STARTER_PRICE_ID" | "PADDLE_PRO_PRICE_ID" | "PADDLE_UNLIMITED_PRICE_ID"
+>;
+
+export function priceToPlanForEnv(env?: PaddlePriceConfigEnv): Record<string, PaidPlan> {
+  return configuredPriceToPlan(env);
+}
+
+export function planForPrice(priceId: string, env?: PaddlePriceConfigEnv): PaidPlan | undefined {
+  return priceToPlanForEnv(env)[priceId];
+}
+
+export function hasPaddleTierPriceConfig(env?: PaddlePriceConfigEnv): boolean {
+  const plans = new Set(Object.values(priceToPlanForEnv(env)));
+  return plans.has("starter") && plans.has("pro") && plans.has("unlimited");
+}
+
+function configuredPriceToPlan(env?: PaddlePriceConfigEnv): Record<string, PaidPlan> {
+  const starter = normalizedPriceId(env?.PADDLE_STARTER_PRICE_ID);
+  const pro = normalizedPriceId(env?.PADDLE_PRO_PRICE_ID);
+  const unlimited = normalizedPriceId(env?.PADDLE_UNLIMITED_PRICE_ID);
+  if (!starter || !pro || !unlimited) return {};
+  if (new Set([starter, pro, unlimited]).size !== 3) return {};
+  return {
+    [starter]: "starter",
+    [pro]: "pro",
+    [unlimited]: "unlimited",
+  };
+}
+
+function normalizedPriceId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+// Per-tier MONTHLY draft-limit defaults (owner decision 2026-09-16): the caps
+// the marketing site sells — "30 follow-ups a month" (starter), "120 a month"
+// (pro), fair-use unlimited. Enforced over a calendar-month UTC window (see
+// metering.ts). Overridable per-deploy via the STARTER/PRO/UNLIMITED_DRAFT_LIMIT
+// vars.
+export const DEFAULT_STARTER_DRAFT_LIMIT = 30;
+export const DEFAULT_PRO_DRAFT_LIMIT = 120;
+export const DEFAULT_UNLIMITED_DRAFT_LIMIT = 100_000; // fair-use ceiling, not "infinite"
+
+// Default drafts credited per unit of the configured overage price.
+export const DEFAULT_EXTRA_DRAFTS_PER_UNIT = 1;

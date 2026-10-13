@@ -1,7 +1,16 @@
 import { verifyToken, createClerkClient } from "@clerk/backend";
-import type { Env } from "./config";
+import { CLERK_DELETE_TIMEOUT_MS, type Env } from "./config";
+import { getCachedClerkUser, invalidateClerkUser } from "./clerk-user-cache";
 import { ApiError } from "./errors";
 import { computeTrial, type TrialState } from "./trial";
+import { parseQuotaOverride, type QuotaOverride } from "./metering";
+import { applyCompEntitlement, parseCompEntitlement } from "./comp";
+import { resolvePlanDraftLimit } from "./paddle";
+import { deriveSubscription, hasPaidAccess, type Subscription } from "./subscription";
+
+// Re-exported unchanged after the item-111 move into subscription.ts (pure home,
+// avoids an auth <-> comp import cycle); callers keep importing it from here.
+export { hasPaidAccess };
 
 export interface AuthedUser {
   userId: string;
@@ -11,6 +20,28 @@ export interface AccountInfo {
   userId: string;
   email: string | null;
   trial: TrialState;
+  // 73: the account's subscription. Placeholder derived from the trial until 56c
+  // writes privateMetadata.subscription; built explicitly, safe to expose on /v1/me.
+  subscription: Subscription;
+  // 56b: per-account limit overrides from privateMetadata.quota, read on the SAME
+  // Clerk getUser as the trial (no extra Clerk round-trip). Not exposed on /v1/me.
+  quotaOverride: QuotaOverride;
+  // 111: true when `subscription` is comp-derived (an active privateMetadata.comp
+  // with no real paid subscription). Internal — never exposed on /v1/me; used by
+  // DELETE /v1/me so a comp never blocks account deletion behind a nonexistent
+  // Paddle subscription.
+  compApplied: boolean;
+}
+
+export class ClerkDeletionOutcomeUnknownError extends ApiError {
+  constructor() {
+    super(
+      503,
+      "account_deletion_status_unknown",
+      "Account deletion is still being confirmed. Please try again.",
+    );
+    this.name = "ClerkDeletionOutcomeUnknownError";
+  }
 }
 
 /**
@@ -31,7 +62,16 @@ export async function authenticate(request: Request, env: Env): Promise<AuthedUs
   }
 
   try {
-    const claims = await verifyToken(token, { secretKey: env.CLERK_SECRET_KEY });
+    // S-L1: optionally pin the token's authorized party (`azp`). When
+    // CLERK_AUTHORIZED_PARTIES is unset the option is omitted and verification is
+    // unchanged. When configured, @clerk/backend rejects tokens whose `azp` is
+    // absent or not in this list, so confirm native-app tokens carry a matching
+    // `azp` before enabling it.
+    const authorizedParties = parseAuthorizedParties(env.CLERK_AUTHORIZED_PARTIES);
+    const claims = await verifyToken(token, {
+      secretKey: env.CLERK_SECRET_KEY,
+      ...(authorizedParties ? { authorizedParties } : {}),
+    });
     if (!claims.sub) {
       throw new ApiError(401, "unauthenticated", "Your session is invalid. Sign in again.");
     }
@@ -43,12 +83,36 @@ export async function authenticate(request: Request, env: Env): Promise<AuthedUs
   }
 }
 
+/**
+ * Parse the comma-separated CLERK_AUTHORIZED_PARTIES env var into a trimmed,
+ * de-duplicated allow-list, or `undefined` when unset/empty (verification then
+ * pins no authorized party — the pre-S-L1 behavior). Exported for testing.
+ */
+export function parseAuthorizedParties(raw: string | undefined): string[] | undefined {
+  if (typeof raw !== "string") return undefined;
+  const parties = [
+    ...new Set(
+      raw
+        .split(",")
+        .map((p) => p.trim())
+        .filter((p) => p !== ""),
+    ),
+  ];
+  return parties.length > 0 ? parties : undefined;
+}
+
 const TRIAL_METADATA_KEY = "trialStartedAt";
 
-// TODO(56b): trial state is read from Clerk on every draft, costing two Clerk
-// Backend API calls per request (getUser + updateUserMetadata on first draft).
-// Cache it (KV/D1, short TTL keyed by userId) so steady-state drafts skip the
-// lookup; metering (56b) will introduce that store anyway.
+// Account lookup options.
+//   initialize — start the trial (`trialStartedAt`) on this call if absent.
+//   useCache   — serve/store the Clerk getUser via the short-TTL cache (S-M1).
+//                Only pure-read, hammer-able routes (GET /v1/me) opt in; the draft
+//                path (rate-limit reorder) and DELETE /v1/me read fresh.
+export interface ResolveAccountOptions {
+  initialize: boolean;
+  useCache?: boolean;
+}
+
 /**
  * Read the user's trial state, initializing `trialStartedAt` in Clerk
  * privateMetadata on the first authenticated call. Returns account info.
@@ -59,14 +123,27 @@ const TRIAL_METADATA_KEY = "trialStartedAt";
 export async function resolveAccount(
   userId: string,
   env: Env,
-  options: { initialize: boolean },
+  options: ResolveAccountOptions,
 ): Promise<AccountInfo> {
-  const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+  const account = await resolveAccountIfExists(userId, env, options);
+  if (account) return account;
+  throw new ApiError(
+    502,
+    "account_lookup_failed",
+    "Could not load your account. Please try again.",
+  );
+}
 
+export async function resolveAccountIfExists(
+  userId: string,
+  env: Env,
+  options: ResolveAccountOptions,
+): Promise<AccountInfo | null> {
   let user;
   try {
-    user = await clerk.users.getUser(userId);
-  } catch {
+    user = await getCachedClerkUser(env, userId, { useCache: options.useCache });
+  } catch (err) {
+    if (isClerkNotFoundError(err)) return null;
     throw new ApiError(
       502,
       "account_lookup_failed",
@@ -74,7 +151,16 @@ export async function resolveAccount(
     );
   }
 
-  const meta = (user.privateMetadata ?? {}) as Record<string, unknown>;
+  return accountInfoFromUser(userId, env, user, options);
+}
+
+async function accountInfoFromUser(
+  userId: string,
+  env: Env,
+  user: ClerkUserLike,
+  options: ResolveAccountOptions,
+): Promise<AccountInfo> {
+  const meta = user.privateMetadata ?? {};
   let startedAt = typeof meta[TRIAL_METADATA_KEY] === "string" ? meta[TRIAL_METADATA_KEY] : null;
   // A corrupt/unparseable timestamp must not permanently expire the trial —
   // treat it as not-started so it re-initializes below.
@@ -84,6 +170,7 @@ export async function resolveAccount(
 
   if (!startedAt && options.initialize) {
     startedAt = new Date().toISOString();
+    const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
     try {
       await clerk.users.updateUserMetadata(userId, {
         privateMetadata: { [TRIAL_METADATA_KEY]: startedAt },
@@ -91,36 +178,140 @@ export async function resolveAccount(
     } catch {
       throw new ApiError(502, "trial_init_failed", "Could not start your trial. Please try again.");
     }
+    // The just-started trial must not be masked by an earlier cached (pre-init)
+    // record served to a later GET /v1/me in this isolate.
+    invalidateClerkUser(userId);
   }
 
   const email = primaryEmail(user);
+  let quotaOverride = parseQuotaOverride(meta.quota);
 
-  if (!startedAt) {
-    // /v1/me before the trial has started (no draft yet): report a not-yet-started trial.
-    return { userId, email, trial: { startedAt: "", endsAt: "", active: false } };
+  // Report a not-yet-started trial when there's no stamp yet (viewing before the
+  // first draft); otherwise compute it. Subscription is derived on the SAME
+  // getUser — no extra Clerk round-trip (73).
+  const trial: TrialState = startedAt
+    ? computeTrial(startedAt)
+    : { startedAt: "", endsAt: "", active: false };
+  const natural = deriveSubscription(trial, meta.subscription);
+
+  // 111: layer an admin-granted comp over the natural state. A real paid
+  // subscription wins (comp inert); otherwise an unexpired comp presents as an
+  // active paid plan of the granted tier and the tier's monthly draft cap
+  // applies, so metering/enforcement behave exactly as that tier normally does.
+  const comp = parseCompEntitlement(meta.comp);
+  const layered = applyCompEntitlement(natural, comp, Date.now());
+  const subscription = layered.subscription;
+  if (layered.compApplied && comp) {
+    quotaOverride = { ...quotaOverride, monthlyDraftLimit: resolvePlanDraftLimit(env, comp.plan) };
   }
 
-  return { userId, email, trial: computeTrial(startedAt) };
+  return { userId, email, trial, subscription, quotaOverride, compApplied: layered.compApplied };
 }
 
-/** Enforce the trial: throw 402 when expired. Returns the resolved account. */
+/** Return whether Clerk still has this user; 404 means already deleted. */
+export async function clerkUserExists(userId: string, env: Env): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CLERK_DELETE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+      headers: {
+        Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (res.ok) return true;
+    if (res.status === 404) return false;
+    throw new ApiError(
+      502,
+      "account_lookup_failed",
+      "Could not confirm your account deletion status. Please try again.",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Clerk's SDK versions expose 404s with slightly different error shapes. */
+export function isClerkNotFoundError(err: unknown): boolean {
+  const record = isRecord(err) ? err : null;
+  if (!record) return false;
+
+  const status = record.status ?? record.statusCode;
+  if (status === 404) return true;
+
+  const errors = record.errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some((item) => {
+    const error = isRecord(item) ? item : null;
+    const code = error?.code;
+    return code === "resource_not_found" || code === "not_found";
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * Gate drafting access. Returns the resolved account when access is granted, else
+ * throws 402. Access is granted by an active trial OR (56c) an active paid
+ * subscription written by the Paddle webhook — so a paying customer is not blocked
+ * when the 14-day trial clock runs out.
+ */
 export async function requireActiveTrial(userId: string, env: Env): Promise<AccountInfo> {
   const account = await resolveAccount(userId, env, { initialize: true });
-  if (!account.trial.active) {
-    // TODO(56c): once checkout ships, allow paid accounts past this gate.
-    throw new ApiError(402, "trial_expired", "Your 14-day free trial has ended.", {
-      trialEndsAt: account.trial.endsAt,
-    });
+  if (account.trial.active || hasPaidAccess(account.subscription)) {
+    return account;
   }
-  return account;
+  throw new ApiError(402, "trial_expired", "Your 14-day free trial has ended.", {
+    trialEndsAt: account.trial.endsAt,
+  });
+}
+
+/**
+ * Delete the Clerk user (73, account deletion). Idempotent: a user that is
+ * already gone (Clerk 404) resolves successfully so DELETE /v1/me stays 204 on
+ * retry. Definitive non-404 Clerk responses become a user-safe 502; rejected
+ * requests are treated as unknown outcomes because Clerk may have committed the
+ * delete before the transport failed.
+ *
+ * The caller wraps this with the AccountQuota deletion barrier so in-flight
+ * requests cannot mutate quota state while Clerk deletion is in progress.
+ */
+export async function deleteClerkUser(userId: string, env: Env): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CLERK_DELETE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (res.ok || res.status === 404) return;
+    throw new ApiError(
+      502,
+      "account_deletion_failed",
+      "Could not delete your account. Please try again.",
+    );
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ClerkDeletionOutcomeUnknownError();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 interface ClerkUserLike {
+  privateMetadata?: Record<string, unknown> | null;
   primaryEmailAddressId?: string | null;
   emailAddresses?: Array<{ id: string; emailAddress: string }>;
 }
 
-function primaryEmail(user: ClerkUserLike): string | null {
+export function primaryEmail(user: ClerkUserLike): string | null {
   const list = user.emailAddresses ?? [];
   const primary = list.find((e) => e.id === user.primaryEmailAddressId);
   return (primary ?? list[0])?.emailAddress ?? null;

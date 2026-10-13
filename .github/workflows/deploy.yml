@@ -30,6 +30,26 @@ jobs:
       - run: npm ci
       - name: Lint, typecheck, test
         run: npm run lint && npm run typecheck && npm test
+      - name: Rotate production Clerk secret
+        run: |
+          if [ -z "$CLERK_SECRET_KEY" ]; then
+            echo "::error::Missing production CLERK_SECRET_KEY secret"
+            exit 1
+          fi
+
+          case "$CLERK_SECRET_KEY" in
+            sk_live_*) ;;
+            *)
+              echo "::error::Production CLERK_SECRET_KEY must be a live Clerk secret (sk_live_...)"
+              exit 1
+              ;;
+          esac
+
+          printf '%s' "$CLERK_SECRET_KEY" | npx wrangler secret put CLERK_SECRET_KEY
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
       - name: Deploy
         run: npx wrangler deploy
         env:

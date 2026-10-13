@@ -13,9 +13,128 @@
       "invocation_logs": false,
     },
   },
-  // Public, safe-to-commit key. Secrets (CLERK_SECRET_KEY, ANTHROPIC_API_KEY)
-  // are pushed with `wrangler secret put` and never live in this file.
+  // Public, safe-to-commit key. Secrets are pushed with `wrangler secret put` and
+  // never live in this file:
+  //   CLERK_SECRET_KEY, ANTHROPIC_API_KEY            (56a)
+  //   ADMIN_TOKEN, CF_ANALYTICS_API_TOKEN            (56b margin dashboard)
+  //   PADDLE_WEBHOOK_SECRET, PADDLE_API_KEY          (56c checkout + licensing)
+  // NOTE: `wrangler secret put` reads the value from stdin — run it from a REAL
+  // terminal (TTY). A non-interactive/piped invocation can upload an EMPTY secret
+  // silently (a known 56b gotcha), which then fails webhook verification with 401.
   "vars": {
-    "CLERK_PUBLISHABLE_KEY": "pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA",
+    "CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsuc2VudHdpc2UuYWkk", // production instance (clerk.sentwise.ai)
+    "APP_CALLBACK_SCHEME": "sentwise", // scheme the /auth/callback page forwards to (app Info.plist)
+
+    // --- 56b metering limits (placeholder defaults; final numbers land with 56c) ---
+    "MONTHLY_DRAFT_LIMIT": "400", // base drafts per account per calendar month (1st 00:00 UTC reset); governs trials + fallback
+    "MONTHLY_TOKEN_LIMIT": "8000000", // input+output tokens per account per calendar month
+    "RATE_LIMIT_PER_MIN": "10", // abuse guard: requests per 60s per account
+    "MAX_TOKENS_PER_REQUEST": "55000", // per-request safety cap (see config.ts derivation)
+    "ENFORCEMENT_MODE": "soft", // "soft" meters only; "hard" also blocks over-quota drafts
+
+    // --- 56b margin dashboard ---
+    // Public Cloudflare account id (already present as `account_id` above); used to
+    // build the Analytics Engine SQL API URL in /admin/margin.
+    "CF_ACCOUNT_ID": "313171820c15d1a8f14bed4dbcb699af",
+    // Dataset /admin/margin queries; must match analytics_engine_datasets below.
+    "USAGE_DATASET_NAME": "sentwise_usage",
+
+    // --- 56c checkout + licensing (Paddle) ---
+    // LIVE Paddle API (item 74 cutover, 2026-09-20) with the live tier price
+    // ids (docs/tier-matrix.md: Starter $9 / Pro $19 / Unlimited $39 monthly).
+    // Live PADDLE_API_KEY / PADDLE_WEBHOOK_SECRET secrets are set. Flip base to
+    // https://sandbox-api.paddle.com (and clear the price vars) only for
+    // sandbox testing with matching sandbox secrets.
+    "PADDLE_API_BASE": "https://api.paddle.com",
+    "PADDLE_STARTER_PRICE_ID": "pri_01m307sdxtk64vb7yjn4vptrcx",
+    "PADDLE_PRO_PRICE_ID": "pri_01m307vkn7zf0k194trcmx0qg1",
+    "PADDLE_UNLIMITED_PRICE_ID": "pri_01m307xfej4zjp0n7wkf4rf9cd",
+    "PADDLE_WEBHOOK_TOLERANCE_SEC": "300", // signature freshness window (seconds)
+    // Per-tier MONTHLY draft limits (owner decision 2026-09-16): the caps the
+    // marketing site sells — "30 follow-ups a month" / "120 a month" — enforced over
+    // a calendar-month UTC window. The webhook writes the resolved value per-account
+    // into Clerk privateMetadata.quota.monthlyDraftLimit.
+    "STARTER_DRAFT_LIMIT": "30",
+    "PRO_DRAFT_LIMIT": "120",
+    "UNLIMITED_DRAFT_LIMIT": "100000", // fair-use ceiling, not "infinite"
+    "EXTRA_DRAFTS_PER_UNIT": "1", // drafts credited per unit of the overage price
+    // EXTRA_DRAFTS_PRICE_ID: set to the one-time "buy more drafts" price id once it
+    // exists; until then transaction.completed overage crediting stays disabled.
+  },
+
+  // 56b — per-account usage counters (monthly drafts/tokens + sliding rate-limit
+  // window). SQLite-backed Durable Object; stores integers and timestamps only,
+  // never content. Keyed by Clerk userId via idFromName.
+  "durable_objects": {
+    "bindings": [{ "name": "ACCOUNT_QUOTA", "class_name": "AccountQuota" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountQuota"] }],
+
+  // 56b — aggregate, hashed usage metrics for the maintainer margin dashboard.
+  // No content; a SHA-256 of the userId, model, token counts, cost, latency, outcome.
+  "analytics_engine_datasets": [{ "binding": "USAGE_ANALYTICS", "dataset": "sentwise_usage" }],
+
+  // ---------------------------------------------------------------------------
+  // Sandbox deployment (sentwise item 123; docs/sandbox-deployment.md).
+  //
+  // `wrangler deploy --env sandbox` (npm run deploy:sandbox) deploys the SAME code
+  // a second time as its own Worker, configured entirely for the Paddle sandbox
+  // and a Clerk development instance. QA builds of the app point at it; the
+  // production Worker above carries no sandbox state. No code path branches on
+  // which deployment it is: only the values below and the secrets differ.
+  //
+  // Wrangler does not inherit `vars`, `durable_objects`, or
+  // `analytics_engine_datasets` into an environment, so each is restated here.
+  // test/sandbox-config.test.ts fails if a production binding or var is missing.
+  // Values written <like-this> are placeholders the owner or vendor-ops fills in
+  // (docs/sandbox-deployment.md, "Placeholders"). Secrets use the production
+  // names and are set with `wrangler secret put <NAME> --env sandbox`.
+  // ---------------------------------------------------------------------------
+  "env": {
+    "sandbox": {
+      "name": "sentwise-inference-sandbox",
+      // Served at https://sentwise-inference-sandbox.sentwise-service.workers.dev,
+      // the base URL QA builds use (SENTWISE_SERVICE_BASE_URL in QA.xcconfig).
+      "workers_dev": true,
+      "vars": {
+        "CLERK_PUBLISHABLE_KEY": "<clerk-development-publishable-key>", // pk_test_… of the Clerk development instance
+        // The QA app build registers its own scheme (SENTWISE_URL_SCHEME in the
+        // app's QA.xcconfig) so production sign-in callbacks never reach it.
+        "APP_CALLBACK_SCHEME": "sentwise-qa",
+
+        // Metering: same limits as production.
+        "MONTHLY_DRAFT_LIMIT": "400",
+        "MONTHLY_TOKEN_LIMIT": "8000000",
+        "RATE_LIMIT_PER_MIN": "10",
+        "MAX_TOKENS_PER_REQUEST": "55000",
+        "ENFORCEMENT_MODE": "soft",
+
+        // Margin dashboard. The deploy workflow passes the real account id with
+        // `--var CF_ACCOUNT_ID:…`; it is only read by /admin/margin.
+        "CF_ACCOUNT_ID": "<cloudflare-account-id>",
+        "USAGE_DATASET_NAME": "sentwise_usage_sandbox",
+
+        // Paddle sandbox: sandbox API base and the sandbox catalog's price ids
+        // (products mirror docs/tier-matrix.md in the app repo).
+        "PADDLE_API_BASE": "https://sandbox-api.paddle.com",
+        "PADDLE_STARTER_PRICE_ID": "<paddle-sandbox-starter-price-id>",
+        "PADDLE_PRO_PRICE_ID": "<paddle-sandbox-pro-price-id>",
+        "PADDLE_UNLIMITED_PRICE_ID": "<paddle-sandbox-unlimited-price-id>",
+        "PADDLE_WEBHOOK_TOLERANCE_SEC": "300",
+        "STARTER_DRAFT_LIMIT": "30",
+        "PRO_DRAFT_LIMIT": "120",
+        "UNLIMITED_DRAFT_LIMIT": "100000",
+        "EXTRA_DRAFTS_PER_UNIT": "1",
+      },
+      // Its own AccountQuota namespace: Durable Objects belong to the Worker, so
+      // this deployment's counters never touch production's. The `v1` migration
+      // above applies to this Worker on its first deploy.
+      "durable_objects": {
+        "bindings": [{ "name": "ACCOUNT_QUOTA", "class_name": "AccountQuota" }],
+      },
+      "analytics_engine_datasets": [
+        { "binding": "USAGE_ANALYTICS", "dataset": "sentwise_usage_sandbox" },
+      ],
+    },
   },
 }

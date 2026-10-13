@@ -3,3 +3,20 @@
 CLERK_PUBLISHABLE_KEY="pk_test_..."
 CLERK_SECRET_KEY="sk_test_..."
 ANTHROPIC_API_KEY="sk-ant-..."
+
+# 56b margin dashboard (optional locally). Set ADMIN_TOKEN to exercise
+# GET /admin/margin; without it the endpoint 404s. CF_ANALYTICS_API_TOKEN is a
+# Cloudflare API token with Account Analytics read for the Analytics Engine SQL
+# API; without it /admin/margin returns 503. In production these are set with
+# `wrangler secret put` (see README), not committed.
+# ADMIN_TOKEN="dev-admin-token"
+# CF_ANALYTICS_API_TOKEN="cf-api-token"
+
+# Sandbox deployment (item 123, docs/sandbox-deployment.md). `wrangler dev`
+# always runs the production config; the sandbox Worker's secrets use the same
+# names and are set with `wrangler secret put <NAME> --env sandbox` or by the
+# Deploy sandbox workflow from SANDBOX_-prefixed repository secrets. Keep local
+# copies in ~/.config/sentwise-service/.env as SANDBOX_<NAME>, for example:
+# SANDBOX_CLERK_SECRET_KEY="sk_test_..."
+# SANDBOX_PADDLE_API_KEY="pdl_sdbx_apikey_..."
+# SANDBOX_PADDLE_WEBHOOK_SECRET="pdl_ntfset_..."
