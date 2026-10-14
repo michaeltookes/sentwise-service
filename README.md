@@ -686,7 +686,7 @@ Requires Node ≥ 22 (`.nvmrc`) and a Cloudflare account (Wrangler 4).
 
 ```bash
 npm install
-npm test           # vitest (Cloudflare Workers pool)
+npm test           # vitest 5 + @cloudflare/vitest-plugin (runs inside workerd)
 npm run typecheck
 npm run gen-dev-vars   # writes .dev.vars from ~/.config/sentwise-service/.env (gitignored)
 npm run dev            # wrangler dev
