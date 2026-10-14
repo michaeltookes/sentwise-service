@@ -27,14 +27,14 @@
     "@clerk/backend": "^3.23.2"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^5.20260820.1",
+    "@cloudflare/vitest-pool-workers": "^0.23.0",
+    "@cloudflare/workers-types": "^5.20261010.1",
     "@eslint/js": "^10.0.1",
-    "eslint": "^10.9.0",
+    "eslint": "^10.12.0",
     "eslint-config-prettier": "^10.1.8",
-    "prettier": "^3.9.6",
+    "prettier": "^3.9.10",
     "typescript": "^5.6.0",
-    "typescript-eslint": "^8.67.0",
+    "typescript-eslint": "^8.71.1",
     "vitest": "^4.1.0",
     "wrangler": "^4.0.0"
   },
