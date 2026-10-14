@@ -97,7 +97,7 @@
       // the base URL QA builds use (SENTWISE_SERVICE_BASE_URL in QA.xcconfig).
       "workers_dev": true,
       "vars": {
-        "CLERK_PUBLISHABLE_KEY": "<clerk-development-publishable-key>", // pk_test_… of the Clerk development instance
+        "CLERK_PUBLISHABLE_KEY": "pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA", // Clerk development instance
         // The QA app build registers its own scheme (SENTWISE_URL_SCHEME in the
         // app's QA.xcconfig) so production sign-in callbacks never reach it.
         "APP_CALLBACK_SCHEME": "sentwise-qa",
@@ -117,9 +117,9 @@
         // Paddle sandbox: sandbox API base and the sandbox catalog's price ids
         // (products mirror docs/tier-matrix.md in the app repo).
         "PADDLE_API_BASE": "https://sandbox-api.paddle.com",
-        "PADDLE_STARTER_PRICE_ID": "<paddle-sandbox-starter-price-id>",
-        "PADDLE_PRO_PRICE_ID": "<paddle-sandbox-pro-price-id>",
-        "PADDLE_UNLIMITED_PRICE_ID": "<paddle-sandbox-unlimited-price-id>",
+        "PADDLE_STARTER_PRICE_ID": "pri_01m1syd7nfarp8pggpcnvjbgyy",
+        "PADDLE_PRO_PRICE_ID": "pri_01m1symsxarc4c3jdea0ntb09w",
+        "PADDLE_UNLIMITED_PRICE_ID": "pri_01m1syrdg05f49kz705gbzn6tz",
         "PADDLE_WEBHOOK_TOLERANCE_SEC": "300",
         "STARTER_DRAFT_LIMIT": "30",
         "PRO_DRAFT_LIMIT": "120",
