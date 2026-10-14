@@ -11,7 +11,7 @@ Cloudflare Worker behind Sentwise: runs model calls for signed-in users and hand
 
 ## Backlog
 
-`docs/backlog.md` (create on the first item; numbered items, newest at the bottom of each priority tier). Items that touch the app and the service together are tracked in `michaeltookes/sentwise` and referenced here by number.
+`docs/backlog.md` (numbered items with stable IDs, newest at the bottom of each priority tier; format in its header). Items that touch the app and the service together are tracked in `michaeltookes/sentwise` and referenced here by number.
 
 ## Orchestration
 
