@@ -877,6 +877,61 @@ describe("S-M1 Clerk user cache", () => {
     expect(del.status).toBe(409);
     expect(((await del.json()) as any).error.type).toBe("billing_subscription_active");
   });
+
+  it("never serves GET /v1/paddle/manage-billing from cache — a new subscription is seen at once", async () => {
+    const paddleEnv: Env = {
+      ...env,
+      PADDLE_API_KEY: "pdl_apikey",
+      PADDLE_API_BASE: "https://sandbox-api.paddle.com",
+    };
+    mocks.verifyToken.mockResolvedValue({ sub: "user_billing_fresh" });
+    const subscribed = (id: string) =>
+      userWith({
+        trialStartedAt: new Date(Date.now() - 1000).toISOString(),
+        subscription: { plan: "pro", status: "active", paddleSubscriptionId: id },
+      });
+    // /v1/me caches the account while it still holds the old subscription.
+    mocks.getUser.mockResolvedValue(subscribed("sub_old"));
+    expect((await worker.fetch(req("/v1/me", { headers: bearer() }), env)).status).toBe(200);
+
+    // A webhook then replaces the subscription.
+    mocks.getUser.mockResolvedValue(subscribed("sub_new"));
+    const fetchMock = vi.fn((url: string) => {
+      const id = url.split("/").pop();
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: {
+              management_urls: {
+                update_payment_method: `https://portal.paddle.com/manage/${id}`,
+                cancel: `https://portal.paddle.com/cancel/${id}`,
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing", { headers: bearer() }),
+      paddleEnv,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      managementUrl: "https://portal.paddle.com/manage/sub_new",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sandbox-api.paddle.com/subscriptions/sub_new",
+      expect.anything(),
+    );
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+
+    // /v1/me still serves the cached record (no further Clerk lookup).
+    expect((await worker.fetch(req("/v1/me", { headers: bearer() }), env)).status).toBe(200);
+    expect(mocks.getUser).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("GET /v1/paddle/manage-billing", () => {

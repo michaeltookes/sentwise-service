@@ -97,9 +97,11 @@ async function loadPaddleBillingAccount(
   env: Env,
 ): Promise<PaddleBillingAccount | null> {
   try {
-    // S-M1: pure read of billing metadata — cache-eligible (short TTL). A stale
-    // subscription id only affects which portal URL we mint, never entitlement.
-    const user = await getCachedClerkUser(env, userId, { useCache: true });
+    // Read fresh, never through the S-M1 display cache: right after a webhook
+    // creates or replaces a subscription, a cached record would 404 or mint a
+    // portal URL for the old subscription. This route already makes a Paddle API
+    // call per request, so the extra Clerk read adds no new amplification.
+    const user = await getCachedClerkUser(env, userId, { useCache: false });
     const meta = user.privateMetadata ?? {};
     const subscriptionId = storedPaddleSubscriptionId(meta.subscription);
     if (!subscriptionId) return null;
