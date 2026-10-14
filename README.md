@@ -682,11 +682,13 @@ Purchase-path testing against the Paddle sandbox uses the separate sandbox deplo
 
 ## Development
 
-Requires Node ≥ 22 (`.nvmrc`) and a Cloudflare account (Wrangler 4).
+Requires Node 22.13+ within 22.x, 24.x, or 26+ (`^22.13.0 || ^24.0.0 || >=26.0.0`),
+compatible with Vitest 5 and ESLint 10, and a Cloudflare account (Wrangler 4).
+`.nvmrc` selects the latest Node 22 release.
 
 ```bash
 npm install
-npm test           # vitest (Cloudflare Workers pool)
+npm test           # vitest 5 + @cloudflare/vitest-plugin (runs inside workerd)
 npm run typecheck
 npm run gen-dev-vars   # writes .dev.vars from ~/.config/sentwise-service/.env (gitignored)
 npm run dev            # wrangler dev

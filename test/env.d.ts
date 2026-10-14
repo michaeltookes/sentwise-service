@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /// <reference types="vite/client" />
 import type { Env as WorkerEnv } from "../src/config";
 
