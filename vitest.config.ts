@@ -1,7 +1,13 @@
 import { defineConfig } from "vitest/config";
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
 
 export default defineConfig({
+  test: {
+    // Vitest 5 turns the on-disk module cache on by default, but the Workers
+    // runner reads modules from inside workerd, which cannot see that host
+    // directory ("no such file or directory, readAll .../.vitest-cache/...").
+    fsModuleCache: false,
+  },
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
