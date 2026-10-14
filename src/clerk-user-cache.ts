@@ -10,7 +10,7 @@
 // the cache — GET /v1/me (`useCache: true`).
 // POST /v1/draft is protected by the rate-limit reorder instead and reads fresh;
 // GET /v1/paddle/manage-billing reads fresh so a just-written subscription is
-// never missed (backlog 1); DELETE /v1/me and every read-modify-write entitlement
+// never missed (backlog 1) and is rate-limited per account instead; DELETE /v1/me and every read-modify-write entitlement
 // path read fresh so a concurrent write is never lost.
 //
 // Safety of the TTL: entitlement is never *granted* from a stale entry — actual

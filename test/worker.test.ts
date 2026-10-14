@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
-import { CLERK_DELETE_TIMEOUT_MS, TRIAL_MS } from "../src/config";
+import {
+  CLERK_DELETE_TIMEOUT_MS,
+  MANAGE_BILLING_RATE_LIMIT_PER_MIN,
+  TRIAL_MS,
+} from "../src/config";
 import {
   windowStartUtc,
   windowResetsAt,
@@ -1047,6 +1051,60 @@ describe("GET /v1/paddle/manage-billing", () => {
     expect(res.status).toBe(404);
     expect(((await res.json()) as any).error.type).toBe("billing_subscription_not_found");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rate limits per account before the Clerk lookup; under the limit every request reads fresh", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_billing_rl" });
+    // No subscription: the 404 path never reaches Paddle, so only the limiter
+    // stops this from becoming one Clerk call per request.
+    mocks.getUser.mockResolvedValue(
+      userWith({ subscription: { plan: "trial", status: "trialing" } }),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (let i = 1; i <= MANAGE_BILLING_RATE_LIMIT_PER_MIN; i += 1) {
+      const res = await worker.fetch(
+        req("/v1/paddle/manage-billing", { headers: bearer() }),
+        paddleEnv,
+      );
+      expect(res.status).toBe(404);
+      expect(mocks.getUser).toHaveBeenCalledTimes(i); // fresh read each time
+    }
+
+    const limited = await worker.fetch(
+      req("/v1/paddle/manage-billing", { headers: bearer() }),
+      paddleEnv,
+    );
+    expect(limited.status).toBe(429);
+    const body = (await limited.json()) as any;
+    expect(body.error.type).toBe("rate_limited");
+    expect(body.error.retryAfterSeconds).toBeGreaterThan(0);
+    expect(limited.headers.get("Retry-After")).toBeTruthy();
+    // The over-limit request made no Clerk call and never reached Paddle.
+    expect(mocks.getUser).toHaveBeenCalledTimes(MANAGE_BILLING_RATE_LIMIT_PER_MIN);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses its own rate-limit bucket, so drafting does not block billing", async () => {
+    mocks.verifyToken.mockResolvedValue({ sub: "user_billing_bucket" });
+    mocks.getUser.mockResolvedValue(activeTrial());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(anthropicOk("ok"))),
+    );
+
+    // Fill the draft bucket to at least the billing limit (same 60s window).
+    for (let i = 0; i < MANAGE_BILLING_RATE_LIMIT_PER_MIN; i += 1) {
+      expect((await worker.fetch(draftReq("user_billing_bucket"), paddleEnv)).status).toBe(200);
+    }
+
+    // A shared bucket would 429 here; billing still reaches its fresh lookup.
+    const res = await worker.fetch(
+      req("/v1/paddle/manage-billing", { headers: bearer() }),
+      paddleEnv,
+    );
+    expect(res.status).toBe(404);
   });
 
   it("returns 502 when Paddle does not provide a valid management URL", async () => {

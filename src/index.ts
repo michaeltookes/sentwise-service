@@ -9,7 +9,13 @@ import {
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
 import { ApiError, jsonError } from "./errors";
-import { DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_RATE_LIMIT_PER_MIN, type Env } from "./config";
+import {
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_MODEL,
+  DEFAULT_RATE_LIMIT_PER_MIN,
+  MANAGE_BILLING_RATE_LIMIT_PER_MIN,
+  type Env,
+} from "./config";
 import {
   buildQuota,
   conservativeRequestTokenBound,
@@ -111,6 +117,14 @@ export default {
 
       if (pathname === "/v1/paddle/manage-billing" && request.method === "GET") {
         const { userId } = await authenticate(request, env);
+        // Rate limit before the fresh (uncached) Clerk lookup, like /v1/draft, so
+        // a scripted account cannot drain Clerk's shared Backend API limit.
+        const check = await quotaCheck(env, userId, {
+          now: Date.now(),
+          rateLimitPerMin: MANAGE_BILLING_RATE_LIMIT_PER_MIN,
+          bucket: "manage_billing",
+        });
+        if (!check.allowed) return rateLimitedResponse(check.retryAfterSeconds);
         return await handlePaddleManageBilling(userId, request, env);
       }
 
@@ -215,13 +229,7 @@ export default {
           now,
           rateLimitPerMin: numFrom(env.RATE_LIMIT_PER_MIN, DEFAULT_RATE_LIMIT_PER_MIN),
         });
-        if (!check.allowed) {
-          const res = jsonError(429, "rate_limited", "Too many requests. Slow down and retry.", {
-            retryAfterSeconds: check.retryAfterSeconds,
-          });
-          res.headers.set("Retry-After", String(check.retryAfterSeconds));
-          return res;
-        }
+        if (!check.allowed) return rateLimitedResponse(check.retryAfterSeconds);
 
         const account = await requireActiveTrial(userId, env);
 
@@ -358,6 +366,15 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+/** The per-account rate limiter's 429, shared by /v1/draft and manage-billing. */
+function rateLimitedResponse(retryAfterSeconds: number): Response {
+  const res = jsonError(429, "rate_limited", "Too many requests. Slow down and retry.", {
+    retryAfterSeconds,
+  });
+  res.headers.set("Retry-After", String(retryAfterSeconds));
+  return res;
+}
 
 function draftContentSize(
   system: string | undefined,

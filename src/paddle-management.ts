@@ -99,8 +99,10 @@ async function loadPaddleBillingAccount(
   try {
     // Read fresh, never through the S-M1 display cache: right after a webhook
     // creates or replaces a subscription, a cached record would 404 or mint a
-    // portal URL for the old subscription. This route already makes a Paddle API
-    // call per request, so the extra Clerk read adds no new amplification.
+    // portal URL for the old subscription. Every request therefore costs a Clerk
+    // Backend API call (even the no-subscription 404 path, which never reaches
+    // Paddle), so the router rate-limits this route per account before calling
+    // here (MANAGE_BILLING_RATE_LIMIT_PER_MIN).
     const user = await getCachedClerkUser(env, userId, { useCache: false });
     const meta = user.privateMetadata ?? {};
     const subscriptionId = storedPaddleSubscriptionId(meta.subscription);
