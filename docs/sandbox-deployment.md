@@ -161,16 +161,20 @@ and `CLOUDFLARE_ACCOUNT_ID` repository secrets.
 
 ### 5. Values to fill in `wrangler.jsonc` (`env.sandbox.vars`)
 
-| Placeholder                                                         | Value                                                           |
-| ------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `CLERK_PUBLISHABLE_KEY` = `<clerk-development-publishable-key>`     | Clerk development instance publishable key (`pk_test_…`)        |
-| `PADDLE_STARTER_PRICE_ID` = `<paddle-sandbox-starter-price-id>`     | Sandbox Starter price (`pri_…`)                                 |
-| `PADDLE_PRO_PRICE_ID` = `<paddle-sandbox-pro-price-id>`             | Sandbox Pro price (`pri_…`)                                     |
-| `PADDLE_UNLIMITED_PRICE_ID` = `<paddle-sandbox-unlimited-price-id>` | Sandbox Unlimited price (`pri_…`)                               |
-| `CF_ACCOUNT_ID` = `<cloudflare-account-id>`                         | Leave as is: filled at deploy time from `CLOUDFLARE_ACCOUNT_ID` |
+Filled on 2026-10-14 with the values vendor-ops created and verified (Clerk development instance and
+the Paddle sandbox catalog). The table records what each one is.
 
-These are public values (a publishable key and price ids), so they are committed once known. Until
-they are, `npm run deploy:sandbox` and the workflow refuse to deploy.
+| Variable                    | Value                                                        | What it is                                         |
+| --------------------------- | ------------------------------------------------------------ | -------------------------------------------------- |
+| `CLERK_PUBLISHABLE_KEY`     | `pk_test_cGVhY2VmdWwtZWVsLTk2NjAuY2xlcmsuYWNjb3VudHMuZGV2JA` | Clerk development instance publishable key         |
+| `PADDLE_STARTER_PRICE_ID`   | `pri_01m1syd7nfarp8pggpcnvjbgyy`                             | Sandbox Starter price                              |
+| `PADDLE_PRO_PRICE_ID`       | `pri_01m1symsxarc4c3jdea0ntb09w`                             | Sandbox Pro price                                  |
+| `PADDLE_UNLIMITED_PRICE_ID` | `pri_01m1syrdg05f49kz705gbzn6tz`                             | Sandbox Unlimited price                            |
+| `CF_ACCOUNT_ID`             | `<cloudflare-account-id>` (left as is)                       | Filled at deploy time from `CLOUDFLARE_ACCOUNT_ID` |
+
+These are public values (a publishable key and price ids), so they are committed. If one of them is
+reset to a `<placeholder>`, `npm run deploy:sandbox` and the workflow refuse to deploy until it is
+filled again. `EXTRA_DRAFTS_PRICE_ID` is not set in the sandbox (optional).
 
 ## Paddle sandbox test cards
 
