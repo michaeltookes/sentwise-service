@@ -137,6 +137,14 @@ export const DEFAULT_MONTHLY_TOKEN_LIMIT = 8_000_000;
 // Abuse-prevention rate limit (sliding 60s window), per account.
 export const DEFAULT_RATE_LIMIT_PER_MIN = 10;
 
+// GET /v1/paddle/manage-billing reads Clerk fresh on every request (backlog 1),
+// so it gets its own per-account sliding-60s bucket on the same Durable Object
+// limiter as drafts, checked before the Clerk lookup. A person opening the
+// billing portal makes one or two requests; 10 per minute is far above that
+// and keeps one account from draining Clerk's shared Backend API limit.
+// Separate from the draft bucket so drafting never blocks billing, or back.
+export const MANAGE_BILLING_RATE_LIMIT_PER_MIN = 10;
+
 // Per-request token safety cap. The request path uses a conservative bound:
 // UTF-8 input bytes + per-message framing + DEFAULT_MAX_TOKENS (the completion
 // ceiling). 55_000 keeps the default ASCII/code-ish input budget near 50 KB

@@ -6,6 +6,7 @@
 // Storage keys:
 //   "window" -> WindowState  (monthly usage, in-flight token reservations, reset timestamps)
 //   "rate"   -> number[]     (recent request timestamps, sliding 60s window)
+//   "rate:manage_billing" -> number[] (same, for GET /v1/paddle/manage-billing)
 //   "pending_settlement:<reservationId>" -> PendingSettlement (alarm-retried settlement metadata)
 //   "settled_settlement:<reservationId>" -> SettledSettlementMarker (idempotency marker)
 //   "paddle_overage_credits" -> refundable Paddle overage credit ledger
@@ -14,7 +15,7 @@
 //   "account_deletion" -> deletion barrier/tombstone plus retry metadata
 //
 // The Worker calls these ops over the DO's internal fetch (see quota-client.ts):
-//   POST /check   { now, rateLimitPerMin } -> { allowed, retryAfterSeconds, window }
+//   POST /check   { now, rateLimitPerMin, bucket? } -> { allowed, retryAfterSeconds, window }
 //   POST /reserve { now, reservationId, estimatedTokens, limits } -> { reserved, ... }
 //   POST /settle  { now, reservationId, reservationWindowStart, estimatedTokens, tokensDelta }
 //   POST /interest { topic } -> serialize Clerk interest metadata writes per user
@@ -81,6 +82,14 @@ import {
 interface CheckBody {
   now: number;
   rateLimitPerMin: number;
+  /** Which sliding-window bucket to use; omitted means drafts ("rate"). */
+  bucket?: RateLimitBucket;
+}
+
+export type RateLimitBucket = "draft" | "manage_billing";
+
+function rateStorageKey(bucket: RateLimitBucket | undefined): string {
+  return bucket === "manage_billing" ? "rate:manage_billing" : "rate";
 }
 interface SettleBody {
   now: number;
@@ -279,7 +288,8 @@ export class AccountQuota {
       if (deletion) return accountDeletionResponse(deletion);
 
       const window = await this.loadWindowFrom(txn, body.now);
-      let stamps = pruneStamps((await txn.get<number[]>("rate")) ?? [], body.now);
+      const rateKey = rateStorageKey(body.bucket);
+      let stamps = pruneStamps((await txn.get<number[]>(rateKey)) ?? [], body.now);
       let allowed = true;
       let retryAfterSeconds = 0;
       if (stamps.length >= body.rateLimitPerMin) {
@@ -291,7 +301,7 @@ export class AccountQuota {
       }
 
       await txn.put("window", window);
-      await txn.put("rate", stamps);
+      await txn.put(rateKey, stamps);
       return Response.json({ allowed, retryAfterSeconds, window });
     });
   }

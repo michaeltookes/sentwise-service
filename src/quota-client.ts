@@ -5,6 +5,7 @@ import type { Env, PaidPlan } from "./config";
 import { ApiError, type ErrorExtra } from "./errors";
 import type { ResolvedLimits, WindowState } from "./metering";
 import type { InterestTopic } from "./interest";
+import type { RateLimitBucket } from "./quota-do";
 import type {
   OverageAdjustmentAction,
   OverageAdjustmentItem,
@@ -138,7 +139,7 @@ async function quotaError(res: Response, op: string): Promise<Error> {
 export function quotaCheck(
   env: Env,
   userId: string,
-  body: { now: number; rateLimitPerMin: number },
+  body: { now: number; rateLimitPerMin: number; bucket?: RateLimitBucket },
 ): Promise<CheckResult> {
   return call<CheckResult>(env, userId, "/check", body);
 }

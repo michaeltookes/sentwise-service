@@ -6,11 +6,12 @@
 // (which would surface as account_lookup_failed for every user - a whole-service
 // DoS).
 //
-// Scope (deliberately narrow): only the pure-READ, hammer-able request paths use
-// the cache — GET /v1/me and GET /v1/paddle/manage-billing (`useCache: true`).
+// Scope (deliberately narrow): only the pure-READ, hammer-able display path uses
+// the cache — GET /v1/me (`useCache: true`).
 // POST /v1/draft is protected by the rate-limit reorder instead and reads fresh;
-// DELETE /v1/me and every read-modify-write entitlement path read fresh so a
-// concurrent write is never lost.
+// GET /v1/paddle/manage-billing reads fresh so a just-written subscription is
+// never missed (backlog 1) and is rate-limited per account instead; DELETE /v1/me and every read-modify-write entitlement
+// path read fresh so a concurrent write is never lost.
 //
 // Safety of the TTL: entitlement is never *granted* from a stale entry — actual
 // drafting access is re-checked fresh on /v1/draft (requireActiveTrial, uncached),
