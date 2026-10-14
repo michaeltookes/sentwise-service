@@ -22,4 +22,10 @@ _None open._
 
 ## Low Priority
 
-_None open._
+2. **Move tests to `@cloudflare/vitest-plugin`, vitest 5 and the newest TypeScript** — **Done** (branch `vitest-plugin-migration`)
+   `@cloudflare/vitest-pool-workers` is deprecated (renamed to `@cloudflare/vitest-plugin`) and its 0.23 peer range pins vitest ^4.1, so dependabot could not move vitest or TypeScript past their majors (genkei-ops 6g, second half; the dependabot ignore rules came in PR #42).
+   - ✅ `vitest.config.ts`, `tsconfig.json` and `test/env.d.ts` use `@cloudflare/vitest-plugin`; `@cloudflare/vitest-pool-workers` is removed.
+   - ✅ vitest 5. Its default `fsModuleCache` is turned off because the workerd runner cannot read the host-side `node_modules/.vitest-cache`.
+   - ✅ TypeScript 6.0.3 (`~6.0.3`). TypeScript 7 typechecks the repo cleanly but typescript-eslint 8.71 supports `typescript <6.1.0`, so 7 waits for typescript-eslint.
+   - ✅ All 505 tests pass; lint, typecheck and `check-no-body-logging` are clean.
+   - ✅ dependabot's vitest major-ignore rule is lifted; the TypeScript one stays until typescript-eslint supports 7.
