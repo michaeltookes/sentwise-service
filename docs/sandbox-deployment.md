@@ -59,7 +59,7 @@ its history. It checks out that exact SHA before installing dependencies, runnin
 or making deployment credentials available. Unmerged branch commits and tags pointing to them are
 rejected. The job then lints, typechecks, and tests the selected commit, maps the `SANDBOX_`-prefixed
 repository secrets to the production secret names, refuses a live Clerk or Paddle key, uploads the
-secrets with the deploy (`wrangler deploy --env sandbox --secrets-file`), and smoke-checks `/healthz`.
+secrets with the deploy (`wrangler deploy --env sandbox --secrets-file`), and smoke-checks `/healthz`, retrying under one 120-second deadline (a poll every 8 seconds, each transfer capped at 15 seconds) to cover first-deploy `workers.dev` propagation.
 The production `deploy.yml` is untouched by this workflow.
 
 Clearing an optional `SANDBOX_` repository secret overwrites its deployed value with an empty string

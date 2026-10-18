@@ -125,4 +125,28 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/sandbox-secrets.json"
       - name: Smoke check
-        run: curl -fsS https://sentwise-inference-sandbox.sentwise-service.workers.dev/healthz
+        run: |
+          url=https://sentwise-inference-sandbox.sentwise-service.workers.dev/healthz
+          # A first deploy can 404 on workers.dev for a while. Retry under one overall
+          # deadline (SECONDS is bash's elapsed-time counter), polling every 8 s, with
+          # each transfer capped at 15 s so a stalled connection cannot eat the job timeout.
+          deadline=120
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
+            rc=0
+            : > "$RUNNER_TEMP/healthz.body"   # fresh file, so a response-less failure never shows a stale body
+            code=$(curl -sS --connect-timeout 5 --max-time 15 -o "$RUNNER_TEMP/healthz.body" -w '%{http_code}' "$url") || rc=$?
+            # Success needs both a clean transfer (curl exit 0) and HTTP 200;
+            # a reset after the 200 headers must retry, not pass.
+            if [ "$rc" -eq 0 ] && [ "$code" = "200" ]; then
+              cat "$RUNNER_TEMP/healthz.body"
+              exit 0
+            fi
+            echo "Attempt $attempt at ${SECONDS}s: HTTP ${code:-000}, curl exit $rc"
+            [ "$SECONDS" -ge "$deadline" ] && break
+            sleep 8
+          done
+          echo "Smoke check failed after $attempt attempts in ${SECONDS}s (deadline ${deadline}s). Last status: HTTP ${code:-000}, curl exit $rc"
+          [ -f "$RUNNER_TEMP/healthz.body" ] && cat "$RUNNER_TEMP/healthz.body"
+          exit 1
