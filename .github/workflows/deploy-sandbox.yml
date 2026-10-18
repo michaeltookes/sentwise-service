@@ -129,14 +129,17 @@ jobs:
           url=https://sentwise-inference-sandbox.sentwise-service.workers.dev/healthz
           # A first deploy can 404 on workers.dev for a while; retry for about 90 seconds.
           for attempt in $(seq 1 12); do
-            code=$(curl -sS -o "$RUNNER_TEMP/healthz.body" -w '%{http_code}' "$url" || true)
-            if [ "$code" = "200" ]; then
+            rc=0
+            code=$(curl -sS -o "$RUNNER_TEMP/healthz.body" -w '%{http_code}' "$url") || rc=$?
+            # Success needs both a clean transfer (curl exit 0) and HTTP 200;
+            # a reset after the 200 headers must retry, not pass.
+            if [ "$rc" -eq 0 ] && [ "$code" = "200" ]; then
               cat "$RUNNER_TEMP/healthz.body"
               exit 0
             fi
-            echo "Attempt $attempt/12: HTTP $code"
+            echo "Attempt $attempt/12: HTTP ${code:-000}, curl exit $rc"
             [ "$attempt" -lt 12 ] && sleep 8
           done
-          echo "Smoke check failed after 12 attempts. Last status: $code"
-          cat "$RUNNER_TEMP/healthz.body"
+          echo "Smoke check failed after 12 attempts. Last status: HTTP ${code:-000}, curl exit $rc"
+          [ -f "$RUNNER_TEMP/healthz.body" ] && cat "$RUNNER_TEMP/healthz.body"
           exit 1
