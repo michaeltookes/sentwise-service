@@ -125,4 +125,18 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/sandbox-secrets.json"
       - name: Smoke check
-        run: curl -fsS https://sentwise-inference-sandbox.sentwise-service.workers.dev/healthz
+        run: |
+          url=https://sentwise-inference-sandbox.sentwise-service.workers.dev/healthz
+          # A first deploy can 404 on workers.dev for a while; retry for about 90 seconds.
+          for attempt in $(seq 1 12); do
+            code=$(curl -sS -o "$RUNNER_TEMP/healthz.body" -w '%{http_code}' "$url" || true)
+            if [ "$code" = "200" ]; then
+              cat "$RUNNER_TEMP/healthz.body"
+              exit 0
+            fi
+            echo "Attempt $attempt/12: HTTP $code"
+            [ "$attempt" -lt 12 ] && sleep 8
+          done
+          echo "Smoke check failed after 12 attempts. Last status: $code"
+          cat "$RUNNER_TEMP/healthz.body"
+          exit 1
