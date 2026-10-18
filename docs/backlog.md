@@ -29,3 +29,10 @@ _None open._
    - ✅ TypeScript 6.0.3 (`~6.0.3`). TypeScript 7 typechecks the repo cleanly but typescript-eslint 8.71 supports `typescript <6.1.0`, so 7 waits for typescript-eslint.
    - ✅ All 505 tests pass; lint, typecheck and `check-no-body-logging` are clean.
    - ✅ dependabot's vitest major-ignore rule is lifted; the TypeScript one stays until typescript-eslint supports 7.
+
+3. **Sandbox deploy smoke check retries during workers.dev propagation**
+   The `Smoke check` step in `.github/workflows/deploy-sandbox.yml` runs `curl -fsS .../healthz` once, one second after `wrangler deploy`. On the first deploy of the sandbox Worker (run 38646948889, 2026-10-18) the new `workers.dev` hostname returned 404 before it was live, the step failed, and the run was red although the Worker was healthy seconds later. Item 123 (sentwise) found it.
+   - [ ] The smoke check retries `GET /healthz` for up to about 90 seconds (for example 12 attempts, 8 s apart) and fails only after the last attempt; the body of the final failed response is printed.
+   - [ ] A 200 ends the loop at once, so the common case stays as fast as today.
+   - [ ] `docs/sandbox-deployment.md` names the retry window in the smoke-check sentence.
+   - [ ] No change to the deploy command, the secrets file handling, or the production workflow.
