@@ -32,7 +32,7 @@ _None open._
 
 3. **Sandbox deploy smoke check retries during workers.dev propagation** — **Done** (branch `sandbox-smoke-retry`)
    The `Smoke check` step in `.github/workflows/deploy-sandbox.yml` runs `curl -fsS .../healthz` once, one second after `wrangler deploy`. On the first deploy of the sandbox Worker (run 38646948889, 2026-10-18) the new `workers.dev` hostname returned 404 before it was live, the step failed, and the run was red although the Worker was healthy seconds later. Item 123 (sentwise) found it.
-   - [x] The smoke check retries `GET /healthz` for up to about 90 seconds (for example 12 attempts, 8 s apart) and fails only after the last attempt; the body of the final failed response is printed.
+   - [x] The smoke check retries `GET /healthz` under one overall deadline of about two minutes (polling every 8 s, each transfer time-capped) and fails only when the deadline passes; the body of the final failed response is printed.
    - [x] A 200 ends the loop at once, so the common case stays as fast as today.
    - [x] `docs/sandbox-deployment.md` names the retry window in the smoke-check sentence.
    - [x] No change to the deploy command, the secrets file handling, or the production workflow.
