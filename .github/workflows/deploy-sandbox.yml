@@ -130,7 +130,8 @@ jobs:
           # A first deploy can 404 on workers.dev for a while; retry for about 90 seconds.
           for attempt in $(seq 1 12); do
             rc=0
-            code=$(curl -sS -o "$RUNNER_TEMP/healthz.body" -w '%{http_code}' "$url") || rc=$?
+            : > "$RUNNER_TEMP/healthz.body"   # fresh file, so a response-less failure never shows a stale body
+            code=$(curl -sS --connect-timeout 5 --max-time 15 -o "$RUNNER_TEMP/healthz.body" -w '%{http_code}' "$url") || rc=$?
             # Success needs both a clean transfer (curl exit 0) and HTTP 200;
             # a reset after the 200 headers must retry, not pass.
             if [ "$rc" -eq 0 ] && [ "$code" = "200" ]; then
