@@ -24,7 +24,7 @@
     "audit": "npm audit --audit-level=high"
   },
   "dependencies": {
-    "@clerk/backend": "^3.23.2"
+    "@clerk/backend": "^3.25.0"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.2",
