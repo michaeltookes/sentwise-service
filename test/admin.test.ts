@@ -33,6 +33,15 @@ describe("SQL builders", () => {
     expect(sql).toContain("blob3 = 'ok'");
     expect(sql).toContain("quantileWeighted(0.5)");
     expect(sql).toContain("quantileWeighted(0.95)");
+    // 139: learning rows count toward spend but not draft counts or cost-per-draft.
+    expect(sql).toContain("SUM(_sample_interval * if(blob4 = 'voice_learning', 0, 1)) AS drafts");
+    expect(sql).toContain("SUM(_sample_interval * double3) AS cost_usd");
+    expect(sql).toContain(
+      "quantileWeighted(0.5)(double3, _sample_interval * if(blob4 = 'voice_learning', 0, 1))",
+    );
+    expect(sql).toContain(
+      "quantileWeighted(0.95)(double3, _sample_interval * if(blob4 = 'voice_learning', 0, 1))",
+    );
     expect(sql).toContain("COUNT(DISTINCT index1) AS active_accounts");
     // Analytics Engine rejects scalar subqueries in the SELECT list (verified
     // live 2026-08-29: 422 unsupported expression type) — never reintroduce one.
@@ -44,6 +53,8 @@ describe("SQL builders", () => {
     expect(sql).toContain("GROUP BY index1");
     expect(sql).toContain("ORDER BY cost_usd DESC");
     expect(sql).toContain("LIMIT 10");
+    expect(sql).toContain("SUM(_sample_interval * double3) AS cost_usd");
+    expect(sql).toContain("SUM(_sample_interval * if(blob4 = 'voice_learning', 0, 1)) AS drafts");
   });
   it("isoForSql yields a space-separated UTC timestamp with no ms/Z", () => {
     expect(isoForSql(Date.parse("2026-08-29T09:15:30.500Z"))).toBe("2026-08-29 09:15:30");

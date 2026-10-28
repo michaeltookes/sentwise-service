@@ -8,6 +8,7 @@ import {
   resolveAccountIfExists,
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
+import { buildLearningRequest, LEARNING_MONTHLY_LIMIT } from "./learning";
 import { ApiError, jsonError } from "./errors";
 import {
   DEFAULT_MAX_TOKENS,
@@ -32,6 +33,8 @@ import {
   quotaDeferRelease,
   quotaDeferSettlement,
   quotaFinishAccountDeletion,
+  quotaLearningRelease,
+  quotaLearningReserve,
   quotaPeek,
   quotaRelease,
   quotaReserve,
@@ -252,6 +255,55 @@ export default {
           ),
         };
 
+        // 139: voice learning is a server-defined operation: fixed system prompt,
+        // output constraints and input cap (the client's are ignored), metered by
+        // its own per-account allowance and never as a draft. The allowance
+        // reserve also hits the deletion barrier, so a deleted account gets 410
+        // before any provider call.
+        if (draft.purpose === "voice_learning") {
+          const learnReq = buildLearningRequest(draft);
+          await quotaLearningReserve(env, userId, { now, limit: LEARNING_MONTHLY_LIMIT });
+          const learnModel = learnReq.model ?? DEFAULT_MODEL;
+          const t1 = Date.now();
+          let learned;
+          try {
+            learned = await forwardToAnthropic(learnReq, env);
+          } catch (err) {
+            await quotaLearningRelease(env, userId, { now }).catch(() => undefined);
+            await recordUsage(env, {
+              userId,
+              model: learnModel,
+              inputTokens: 0,
+              outputTokens: 0,
+              latencyMs: Date.now() - t1,
+              outcome: err instanceof ApiError ? err.type : "internal_error",
+              purpose: "voice_learning",
+            });
+            throw err;
+          }
+          await recordUsage(env, {
+            userId,
+            model: learnModel,
+            inputTokens: learned.usage.inputTokens,
+            outputTokens: learned.usage.outputTokens,
+            latencyMs: Date.now() - t1,
+            outcome: "ok",
+            purpose: "voice_learning",
+          });
+          // Fresh timestamp: the request may have crossed a UTC month boundary,
+          // and a stale `now` would roll (erase) the new month's usage.
+          const { window: peeked } = await quotaPeek(env, userId, { now: Date.now() });
+          const peekedBase = resolveLimits(env, account.quotaOverride, peeked.windowStart);
+          const peekedLimits = {
+            ...peekedBase,
+            enforcement: effectiveEnforcement(
+              peekedBase.enforcement,
+              hasPaidAccess(account.subscription),
+            ),
+          };
+          return Response.json({ ...learned, quota: buildQuota(peeked, peekedLimits) });
+        }
+
         // 2) Per-request token safety cap (pre-flight conservative bound).
         const content = draftContentSize(draft.system, draft.messages);
         const maxTokens = draft.maxTokens ?? DEFAULT_MAX_TOKENS;
@@ -262,37 +314,6 @@ export default {
         );
         if (tokenBound > limits.maxTokensPerRequest) {
           throw new ApiError(413, "request_too_large", "The request is too large to draft.");
-        }
-
-        // 139: voice learning is authenticated, rate limited, trial-checked and
-        // token-capped like a draft, but it is never a draft: no quota unit is
-        // reserved or settled and the drafts-used counters stay untouched.
-        if (draft.purpose === "voice_learning") {
-          const t1 = Date.now();
-          let learned;
-          try {
-            learned = await forwardToAnthropic(draft, env);
-          } catch (err) {
-            await recordUsage(env, {
-              userId,
-              model,
-              inputTokens: 0,
-              outputTokens: 0,
-              latencyMs: Date.now() - t1,
-              outcome: err instanceof ApiError ? err.type : "internal_error",
-            });
-            throw err;
-          }
-          await recordUsage(env, {
-            userId,
-            model,
-            inputTokens: learned.usage.inputTokens,
-            outputTokens: learned.usage.outputTokens,
-            latencyMs: Date.now() - t1,
-            outcome: "ok",
-          });
-          const { window: peeked } = await quotaPeek(env, userId, { now });
-          return Response.json({ ...learned, quota: buildQuota(peeked, limits) });
         }
 
         // 3) Monthly quota admission + draft reservation. Hard mode blocks atomically;

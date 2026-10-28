@@ -75,6 +75,8 @@ import {
   rollWindow,
   RATE_WINDOW_MS,
   wouldExceedQuota,
+  windowResetsAt,
+  windowStartUtc,
   type ResolvedLimits,
   type WindowState,
 } from "./metering";
@@ -113,6 +115,14 @@ interface ReleaseBody {
 }
 interface PeekBody {
   now: number;
+}
+interface LearnReserveBody {
+  now: number;
+  limit: number;
+}
+interface LearningState {
+  windowStart: number;
+  count: number;
 }
 interface DeletionBody {
   now?: number;
@@ -236,6 +246,10 @@ export class AccountQuota {
         return this.handleRelease(await request.json<ReleaseBody>());
       case "/peek":
         return this.handlePeek(await request.json<PeekBody>());
+      case "/learn-reserve":
+        return this.handleLearnReserve(await request.json<LearnReserveBody>());
+      case "/learn-release":
+        return this.handleLearnRelease(await request.json<PeekBody>());
       case "/interest":
         return this.handleInterest(await request.json<unknown>());
       case "/paddle-subscription":
@@ -526,6 +540,39 @@ export class AccountQuota {
       const window = await this.loadWindowFrom(txn, body.now);
       await txn.put("window", window);
       return Response.json({ window });
+    });
+  }
+
+  // 139: independent voice-learning allowance. Own counter, own key, never touches
+  // the draft window. Behind the deletion preflight AND re-checked in the
+  // transaction, so a deleted account is refused before any provider call. The
+  // "learning" key is wiped with the rest of the account's storage on deletion.
+  private async handleLearnReserve(body: LearnReserveBody): Promise<Response> {
+    return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return accountDeletionResponse(deletion);
+      const start = windowStartUtc(body.now);
+      const stored = await txn.get<LearningState>("learning");
+      const count = stored && stored.windowStart === start ? stored.count : 0;
+      if (count >= body.limit) {
+        return jsonError(429, "learning_limit_exceeded", "Voice learning limit reached.", {
+          resetsAt: new Date(windowResetsAt(body.now)).toISOString(),
+        });
+      }
+      await txn.put<LearningState>("learning", { windowStart: start, count: count + 1 });
+      return Response.json({ count: count + 1 });
+    });
+  }
+
+  private async handleLearnRelease(body: PeekBody): Promise<Response> {
+    return this.storage.transaction(async (txn) => {
+      const start = windowStartUtc(body.now);
+      const stored = await txn.get<LearningState>("learning");
+      const count = stored && stored.windowStart === start ? Math.max(0, stored.count - 1) : 0;
+      if (stored && stored.windowStart === start) {
+        await txn.put<LearningState>("learning", { windowStart: start, count });
+      }
+      return Response.json({ count });
     });
   }
 

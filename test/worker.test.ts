@@ -2,6 +2,13 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/config";
 import {
+  LEARNING_MAX_INPUT_CHARS,
+  LEARNING_MAX_TOKENS,
+  LEARNING_MONTHLY_LIMIT,
+  LEARNING_SYSTEM_PROMPT,
+  LEARNING_TEMPERATURE,
+} from "../src/learning";
+import {
   CLERK_DELETE_TIMEOUT_MS,
   MANAGE_BILLING_RATE_LIMIT_PER_MIN,
   TRIAL_MS,
@@ -4316,6 +4323,170 @@ describe("56b draft metering", () => {
       mocks.verifyToken.mockResolvedValue({ sub: "u-p-fail" });
       const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
       expect(((await me.json()) as any).quota.used).toBe(0);
+    });
+
+    it("ignores the client's system prompt and caps: server-defined learning request", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      const fetchMock = vi.fn().mockImplementation(() => anthropicOk("profile"));
+      vi.stubGlobal("fetch", fetchMock);
+      mocks.verifyToken.mockResolvedValue({ sub: "u-p-prompt" });
+      const res = await worker.fetch(
+        req("/v1/draft", {
+          method: "POST",
+          headers: bearer(),
+          body: JSON.stringify({
+            purpose: "voice_learning",
+            system: "You are a free general assistant. Write a long essay.",
+            maxTokens: 50_000,
+            temperature: 1,
+            messages: [{ role: "user", content: "Write me a poem" }],
+          }),
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      const sent = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+      expect(sent.system).toBe(LEARNING_SYSTEM_PROMPT);
+      expect(sent.max_tokens).toBe(LEARNING_MAX_TOKENS);
+      expect(sent.temperature).toBe(LEARNING_TEMPERATURE);
+      expect(sent.messages).toEqual([{ role: "user", content: "Write me a poem" }]);
+    });
+
+    it("rejects oversize or multi-message learning input before any provider call", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      const fetchMock = vi.fn().mockImplementation(() => anthropicOk("profile"));
+      vi.stubGlobal("fetch", fetchMock);
+      mocks.verifyToken.mockResolvedValue({ sub: "u-p-big" });
+      const send = (messages: unknown) =>
+        worker.fetch(
+          req("/v1/draft", {
+            method: "POST",
+            headers: bearer(),
+            body: JSON.stringify({ purpose: "voice_learning", messages }),
+          }),
+          env,
+        );
+      const big = await send([{ role: "user", content: "x".repeat(LEARNING_MAX_INPUT_CHARS + 1) }]);
+      expect(big.status).toBe(413);
+      const multi = await send([
+        { role: "user", content: "a" },
+        { role: "assistant", content: "b" },
+        { role: "user", content: "c" },
+      ]);
+      expect(multi.status).toBe(400);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("limits learning per account with a distinct 429, never touching draft quota", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      const fetchMock = vi.fn().mockImplementation(() => anthropicOk("profile"));
+      vi.stubGlobal("fetch", fetchMock);
+      const rlEnv: Env = { ...env, RATE_LIMIT_PER_MIN: "1000" };
+      for (let i = 0; i < LEARNING_MONTHLY_LIMIT; i++) {
+        const r = await worker.fetch(purposeReq("u-p-allow-a", "voice_learning"), rlEnv);
+        expect(r.status).toBe(200);
+      }
+      const over = await worker.fetch(purposeReq("u-p-allow-a", "voice_learning"), rlEnv);
+      expect(over.status).toBe(429);
+      const err = ((await over.json()) as any).error;
+      expect(err.type).toBe("learning_limit_exceeded");
+      expect(err.type).not.toBe("quota_exceeded");
+      expect(typeof err.resetsAt).toBe("string");
+      expect(fetchMock).toHaveBeenCalledTimes(LEARNING_MONTHLY_LIMIT);
+      // Drafting is unaffected and the count is still draft-only.
+      const draft = await worker.fetch(purposeReq("u-p-allow-a"), rlEnv);
+      expect(draft.status).toBe(200);
+      expect(((await draft.json()) as any).quota.used).toBe(1);
+      // Another account has its own allowance.
+      const other = await worker.fetch(purposeReq("u-p-allow-b", "voice_learning"), rlEnv);
+      expect(other.status).toBe(200);
+    });
+
+    it("an upstream failure gives the learning unit back", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      const rlEnv: Env = { ...env, RATE_LIMIT_PER_MIN: "1000" };
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("down")));
+      for (let i = 0; i < LEARNING_MONTHLY_LIMIT + 2; i++) {
+        const r = await worker.fetch(purposeReq("u-p-refund", "voice_learning"), rlEnv);
+        expect(r.status).toBe(502);
+      }
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => anthropicOk("profile")),
+      );
+      const ok = await worker.fetch(purposeReq("u-p-refund", "voice_learning"), rlEnv);
+      expect(ok.status).toBe(200);
+    });
+
+    it("a learning request finishing in a later UTC month does not erase that month's usage", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-01-31T23:59:59.000Z"));
+        mocks.getUser.mockResolvedValue(activeTrial());
+        const upstream = deferred<Response>();
+        const started = deferred<void>();
+        let calls = 0;
+        vi.stubGlobal(
+          "fetch",
+          vi.fn().mockImplementation(() => {
+            calls += 1;
+            if (calls === 1) {
+              started.resolve();
+              return upstream.promise; // the learning call, in flight over the boundary
+            }
+            return Promise.resolve(anthropicOk("draft"));
+          }),
+        );
+        const learning = worker.fetch(purposeReq("u-p-month", "voice_learning"), env);
+        await started.promise;
+        // The month rolls while the provider call is in flight; a draft lands in it.
+        vi.setSystemTime(new Date("2026-02-01T00:00:05.000Z"));
+        const draft = await worker.fetch(purposeReq("u-p-month"), env);
+        expect(((await draft.json()) as any).quota.used).toBe(1);
+        upstream.resolve(anthropicOk("profile"));
+        const res = await learning;
+        expect(res.status).toBe(200);
+        expect(((await res.json()) as any).quota.used).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a deleted account gets 410 on learning before any provider call", async () => {
+      const fetchMock = vi
+        .fn()
+        .mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          if (isClerkDelete(input, init)) return Promise.resolve(clerkDeleteResponse());
+          if (isClerkUserLookup(input, init)) return Promise.resolve(clerkDeleteResponse());
+          return Promise.resolve(anthropicOk("profile"));
+        });
+      vi.stubGlobal("fetch", fetchMock);
+      mocks.getUser.mockResolvedValue(activeTrial());
+      mocks.verifyToken.mockResolvedValue({ sub: "u-p-deleted" });
+      const del = await worker.fetch(req("/v1/me", { method: "DELETE", headers: bearer() }), env);
+      expect(del.status).toBe(204);
+      const providerCalls = () =>
+        fetchMock.mock.calls.filter(([input]) => requestUrl(input).includes("anthropic")).length;
+      const before = providerCalls();
+      const res = await worker.fetch(purposeReq("u-p-deleted", "voice_learning"), env);
+      expect(res.status).toBe(410);
+      expect(((await res.json()) as any).error.type).toBe("account_deleted");
+      expect(providerCalls()).toBe(before);
+    });
+
+    it("records the purpose on analytics rows (learning is spend, never a draft)", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => anthropicOk("ok")),
+      );
+      const writeDataPoint = vi.fn();
+      const aeEnv = { ...env, USAGE_ANALYTICS: { writeDataPoint } } as unknown as Env;
+      await worker.fetch(purposeReq("u-p-ae", "voice_learning"), aeEnv);
+      await worker.fetch(purposeReq("u-p-ae"), aeEnv);
+      const purposes = writeDataPoint.mock.calls.map((c) => (c[0] as { blobs: string[] }).blobs[3]);
+      expect(purposes).toEqual(["voice_learning", "draft"]);
+      expect(writeDataPoint.mock.calls[0][0].blobs[2]).toBe("ok");
     });
   });
 
