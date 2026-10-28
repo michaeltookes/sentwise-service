@@ -264,6 +264,37 @@ export default {
           throw new ApiError(413, "request_too_large", "The request is too large to draft.");
         }
 
+        // 139: voice learning is authenticated, rate limited, trial-checked and
+        // token-capped like a draft, but it is never a draft: no quota unit is
+        // reserved or settled and the drafts-used counters stay untouched.
+        if (draft.purpose === "voice_learning") {
+          const t1 = Date.now();
+          let learned;
+          try {
+            learned = await forwardToAnthropic(draft, env);
+          } catch (err) {
+            await recordUsage(env, {
+              userId,
+              model,
+              inputTokens: 0,
+              outputTokens: 0,
+              latencyMs: Date.now() - t1,
+              outcome: err instanceof ApiError ? err.type : "internal_error",
+            });
+            throw err;
+          }
+          await recordUsage(env, {
+            userId,
+            model,
+            inputTokens: learned.usage.inputTokens,
+            outputTokens: learned.usage.outputTokens,
+            latencyMs: Date.now() - t1,
+            outcome: "ok",
+          });
+          const { window: peeked } = await quotaPeek(env, userId, { now });
+          return Response.json({ ...learned, quota: buildQuota(peeked, limits) });
+        }
+
         // 3) Monthly quota admission + draft reservation. Hard mode blocks atomically;
         // soft mode reserves and continues so successful drafts are metered once.
         const reservationId = crypto.randomUUID();

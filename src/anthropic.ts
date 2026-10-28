@@ -16,7 +16,11 @@ export interface DraftRequest {
   messages: Array<{ role: "user" | "assistant"; content: string }>;
   maxTokens?: number;
   temperature?: number;
+  /** 139: `draft` (default, metered) or `voice_learning` (never counts as a draft). */
+  purpose?: DraftPurpose;
 }
+
+export type DraftPurpose = "draft" | "voice_learning";
 
 // Wire shape returned by POST /v1/draft — mirrors the app's `LLMResponse`.
 export interface DraftResponse {
@@ -73,6 +77,11 @@ export function parseDraftRequest(body: unknown): DraftRequest {
     // Clamp into [1, DEFAULT_MAX_TOKENS] rather than reject, so a generous client
     // value still works but can never exceed the server ceiling.
     req.maxTokens = Math.min(Math.max(Math.floor(b.maxTokens), 1), DEFAULT_MAX_TOKENS);
+  }
+  if (b.purpose !== undefined) {
+    if (b.purpose !== "draft" && b.purpose !== "voice_learning")
+      throw new ApiError(400, "invalid_request", "Unsupported `purpose`.");
+    req.purpose = b.purpose;
   }
   if (b.temperature !== undefined) {
     if (typeof b.temperature !== "number")

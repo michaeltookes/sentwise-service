@@ -4231,6 +4231,94 @@ describe("56b draft metering", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  describe("139 purpose", () => {
+    function purposeReq(sub: string, purpose?: unknown) {
+      mocks.verifyToken.mockResolvedValue({ sub });
+      const body: Record<string, unknown> = { messages: [{ role: "user", content: "learn" }] };
+      if (purpose !== undefined) body.purpose = purpose;
+      return req("/v1/draft", { method: "POST", headers: bearer(), body: JSON.stringify(body) });
+    }
+
+    it("counts a draft when purpose is absent or `draft`", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => anthropicOk("ok")),
+      );
+      const a = await worker.fetch(purposeReq("u-p-default"), env);
+      expect(((await a.json()) as any).quota.used).toBe(1);
+      const b = await worker.fetch(purposeReq("u-p-default", "draft"), env);
+      expect(((await b.json()) as any).quota.used).toBe(2);
+    });
+
+    it("voice_learning reserves, settles and counts nothing, and a later draft is 1", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      const fetchMock = vi.fn().mockImplementation(() => anthropicOk("profile"));
+      vi.stubGlobal("fetch", fetchMock);
+      for (let i = 0; i < 2; i++) {
+        const res = await worker.fetch(purposeReq("u-p-learn", "voice_learning"), env);
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as any;
+        expect(body.text).toBe("profile");
+        expect(body.quota).toMatchObject({
+          unit: "drafts",
+          used: 0,
+          remaining: 400,
+          tokensUsed: 0,
+        });
+      }
+      const draft = await worker.fetch(purposeReq("u-p-learn"), env);
+      expect(((await draft.json()) as any).quota.used).toBe(1);
+    });
+
+    it("voice_learning may initialize the trial like a draft", async () => {
+      mocks.getUser.mockResolvedValue(userWith({}));
+      mocks.updateUserMetadata.mockResolvedValue(undefined);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => anthropicOk("profile")),
+      );
+      const res = await worker.fetch(purposeReq("u-p-trial", "voice_learning"), env);
+      expect(res.status).toBe(200);
+      expect(mocks.updateUserMetadata).toHaveBeenCalledOnce();
+      expect(((await res.json()) as any).quota.used).toBe(0);
+    });
+
+    it("rejects an unknown purpose with 400 invalid_request and never forwards", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      const fetchMock = vi.fn().mockImplementation(() => anthropicOk("ok"));
+      vi.stubGlobal("fetch", fetchMock);
+      const res = await worker.fetch(purposeReq("u-p-bad", "free_inference"), env);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as any).error.type).toBe("invalid_request");
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("a rate-limited voice_learning call reserves nothing and never forwards", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      const fetchMock = vi.fn().mockImplementation(() => anthropicOk("ok"));
+      vi.stubGlobal("fetch", fetchMock);
+      const rlEnv: Env = { ...env, RATE_LIMIT_PER_MIN: "1" };
+      expect((await worker.fetch(purposeReq("u-p-rl", "voice_learning"), rlEnv)).status).toBe(200);
+      const second = await worker.fetch(purposeReq("u-p-rl", "voice_learning"), rlEnv);
+      expect(second.status).toBe(429);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      mocks.verifyToken.mockResolvedValue({ sub: "u-p-rl" });
+      const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+      expect(((await me.json()) as any).quota.used).toBe(0);
+    });
+
+    it("an upstream failure on voice_learning counts nothing", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("down")));
+      const res = await worker.fetch(purposeReq("u-p-fail", "voice_learning"), env);
+      expect(res.status).toBe(502);
+      mocks.verifyToken.mockResolvedValue({ sub: "u-p-fail" });
+      const me = await worker.fetch(req("/v1/me", { headers: bearer() }), env);
+      expect(((await me.json()) as any).quota.used).toBe(0);
+    });
+  });
+
   it("runs the rate limiter BEFORE the Clerk trial lookup (S-M1)", async () => {
     // The DoS fix: a rate-limited request must not reach requireActiveTrial's
     // Clerk Backend API getUser, so a scripted account can't exhaust Clerk's
