@@ -4452,6 +4452,111 @@ describe("56b draft metering", () => {
       }
     });
 
+    function quotaEnvFailing(ops: Record<string, Response | (() => Response)>): Env {
+      const ns = testEnv.ACCOUNT_QUOTA;
+      return {
+        ...env,
+        RATE_LIMIT_PER_MIN: "1000",
+        ACCOUNT_QUOTA: {
+          idFromName: (n: string) => ns.idFromName(n),
+          get: (id: DurableObjectId) => {
+            const stub = ns.get(id);
+            return {
+              fetch: (url: string, init?: RequestInit) => {
+                const op = new URL(url).pathname;
+                const fail = ops[op];
+                if (fail)
+                  return Promise.resolve(typeof fail === "function" ? fail() : fail.clone());
+                return stub.fetch(url, init);
+              },
+            };
+          },
+        } as unknown as DurableObjectNamespace,
+      };
+    }
+
+    it("a failed provider call followed by a failed refund does not consume a slot forever", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-03-10T00:00:00.000Z"));
+        vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("down")));
+        const noRefund = quotaEnvFailing({ "/learn-finish": new Response("x", { status: 500 }) });
+        for (let i = 0; i < LEARNING_MONTHLY_LIMIT; i++) {
+          const r = await worker.fetch(purposeReq("u-p-lost", "voice_learning"), noRefund);
+          expect(r.status).toBe(502);
+        }
+        vi.stubGlobal(
+          "fetch",
+          vi.fn().mockImplementation(() => anthropicOk("profile")),
+        );
+        const full = quotaEnvFailing({});
+        const blocked = await worker.fetch(purposeReq("u-p-lost", "voice_learning"), full);
+        expect(blocked.status).toBe(429);
+        // The lost refunds expire like draft reservations do.
+        vi.setSystemTime(
+          new Date("2026-03-10T00:00:00.000Z").getTime() + RESERVATION_TTL_MS + 1000,
+        );
+        const ok = await worker.fetch(purposeReq("u-p-lost", "voice_learning"), full);
+        expect(ok.status).toBe(200);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a late old-month reservation never resets newer-month learning usage", async () => {
+      const stub = testEnv.ACCOUNT_QUOTA.get(testEnv.ACCOUNT_QUOTA.idFromName("u-p-late"));
+      const call = (op: string, body: unknown) =>
+        stub.fetch(`https://account-quota.internal${op}`, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+      const feb = Date.UTC(2026, 1, 1, 0, 0, 5);
+      const jan = Date.UTC(2026, 0, 31, 23, 59, 59);
+      for (let i = 0; i < 3; i++) {
+        expect(
+          (await call("/learn-reserve", { now: feb, limit: 3, reservationId: `n${i}` })).status,
+        ).toBe(200);
+      }
+      // A request stamped in January arrives late: counted against February, rejected at the limit.
+      const late = await call("/learn-reserve", { now: jan, limit: 3, reservationId: "old" });
+      expect(late.status).toBe(429);
+      // And the February usage is intact for the next February call.
+      const next = await call("/learn-reserve", { now: feb + 1000, limit: 3, reservationId: "n3" });
+      expect(next.status).toBe(429);
+    });
+
+    it("returns the learning result with a fallback quota when the post-read fails transiently", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => anthropicOk("profile")),
+      );
+      const e = quotaEnvFailing({ "/peek": new Response("boom", { status: 500 }) });
+      const res = await worker.fetch(purposeReq("u-p-peekfail", "voice_learning"), e);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as any;
+      expect(body.text).toBe("profile");
+      expect(body.quota.used).toBe(0);
+    });
+
+    it("still surfaces account deletion from the post-read as 410", async () => {
+      mocks.getUser.mockResolvedValue(activeTrial());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => anthropicOk("profile")),
+      );
+      const e = quotaEnvFailing({
+        "/peek": () =>
+          Response.json(
+            { error: { type: "account_deleted", message: "This account has been deleted." } },
+            { status: 410 },
+          ),
+      });
+      const res = await worker.fetch(purposeReq("u-p-peekdel", "voice_learning"), e);
+      expect(res.status).toBe(410);
+    });
+
     it("a deleted account gets 410 on learning before any provider call", async () => {
       const fetchMock = vi
         .fn()

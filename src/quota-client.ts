@@ -204,18 +204,18 @@ export function quotaPeek(env: Env, userId: string, body: { now: number }): Prom
 export function quotaLearningReserve(
   env: Env,
   userId: string,
-  body: { now: number; limit: number },
+  body: { now: number; limit: number; reservationId: string },
 ): Promise<{ count: number }> {
   return call<{ count: number }>(env, userId, "/learn-reserve", body);
 }
 
-/** 139: give back a learning unit when the provider call failed. */
-export function quotaLearningRelease(
+/** 139: settle (provider succeeded) or refund a learning reservation, idempotent by id. */
+export function quotaLearningFinish(
   env: Env,
   userId: string,
-  body: { now: number },
+  body: { now: number; reservationId: string; settle: boolean },
 ): Promise<{ count: number }> {
-  return call<{ count: number }>(env, userId, "/learn-release", body);
+  return call<{ count: number }>(env, userId, "/learn-finish", body);
 }
 
 /** Serialize and record an interest signal through the user's Durable Object. */

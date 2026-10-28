@@ -21,6 +21,7 @@ import {
   buildQuota,
   conservativeRequestTokenBound,
   effectiveEnforcement,
+  freshWindow,
   windowStartUtc,
   numFrom,
   resolveLimits,
@@ -33,7 +34,7 @@ import {
   quotaDeferRelease,
   quotaDeferSettlement,
   quotaFinishAccountDeletion,
-  quotaLearningRelease,
+  quotaLearningFinish,
   quotaLearningReserve,
   quotaPeek,
   quotaRelease,
@@ -262,14 +263,30 @@ export default {
         // before any provider call.
         if (draft.purpose === "voice_learning") {
           const learnReq = buildLearningRequest(draft);
-          await quotaLearningReserve(env, userId, { now, limit: LEARNING_MONTHLY_LIMIT });
+          const learnId = crypto.randomUUID();
+          await quotaLearningReserve(env, userId, {
+            now,
+            limit: LEARNING_MONTHLY_LIMIT,
+            reservationId: learnId,
+          });
+          // Best effort with one retry; a lost call self-heals when the reservation expires.
+          const finish = async (settle: boolean) => {
+            for (let i = 0; i < 2; i++) {
+              try {
+                await quotaLearningFinish(env, userId, { now, reservationId: learnId, settle });
+                return;
+              } catch {
+                /* retry once */
+              }
+            }
+          };
           const learnModel = learnReq.model ?? DEFAULT_MODEL;
           const t1 = Date.now();
           let learned;
           try {
             learned = await forwardToAnthropic(learnReq, env);
           } catch (err) {
-            await quotaLearningRelease(env, userId, { now }).catch(() => undefined);
+            await finish(false);
             await recordUsage(env, {
               userId,
               model: learnModel,
@@ -290,9 +307,18 @@ export default {
             outcome: "ok",
             purpose: "voice_learning",
           });
+          await finish(true);
           // Fresh timestamp: the request may have crossed a UTC month boundary,
-          // and a stale `now` would roll (erase) the new month's usage.
-          const { window: peeked } = await quotaPeek(env, userId, { now: Date.now() });
+          // and a stale `now` would roll (erase) the new month's usage. The profile
+          // is already paid for, so a transient read failure returns it with an
+          // empty-window snapshot; an explicit account-deletion error still surfaces.
+          let peeked;
+          try {
+            ({ window: peeked } = await quotaPeek(env, userId, { now: Date.now() }));
+          } catch (err) {
+            if (err instanceof ApiError && (err.status === 410 || err.status === 409)) throw err;
+            peeked = freshWindow(Date.now());
+          }
           const peekedBase = resolveLimits(env, account.quotaOverride, peeked.windowStart);
           const peekedLimits = {
             ...peekedBase,
