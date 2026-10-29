@@ -75,6 +75,8 @@ import {
   rollWindow,
   RATE_WINDOW_MS,
   wouldExceedQuota,
+  windowResetsAt,
+  windowStartUtc,
   type ResolvedLimits,
   type WindowState,
 } from "./metering";
@@ -113,6 +115,22 @@ interface ReleaseBody {
 }
 interface PeekBody {
   now: number;
+}
+interface LearnReserveBody {
+  now: number;
+  limit: number;
+  reservationId: string;
+}
+interface LearnFinishBody {
+  now: number;
+  reservationId: string;
+  /** true: the provider call succeeded (count it); false: refund. */
+  settle: boolean;
+}
+interface LearningState {
+  windowStart: number;
+  count: number;
+  reservations: Array<{ id: string; expiresAt: number }>;
 }
 interface DeletionBody {
   now?: number;
@@ -236,6 +254,10 @@ export class AccountQuota {
         return this.handleRelease(await request.json<ReleaseBody>());
       case "/peek":
         return this.handlePeek(await request.json<PeekBody>());
+      case "/learn-reserve":
+        return this.handleLearnReserve(await request.json<LearnReserveBody>());
+      case "/learn-finish":
+        return this.handleLearnFinish(await request.json<LearnFinishBody>());
       case "/interest":
         return this.handleInterest(await request.json<unknown>());
       case "/paddle-subscription":
@@ -526,6 +548,62 @@ export class AccountQuota {
       const window = await this.loadWindowFrom(txn, body.now);
       await txn.put("window", window);
       return Response.json({ window });
+    });
+  }
+
+  // 139: independent voice-learning allowance. Own key, never touches the draft
+  // window. Behind the deletion preflight AND re-checked in the transaction, so a
+  // deleted account is refused before any provider call. The "learning" key is
+  // wiped with the rest of the account's storage on deletion.
+  //
+  // Reservations carry an id and expire (RESERVATION_TTL_MS), like draft
+  // reservations: a lost release/settle self-heals instead of consuming a slot
+  // forever. Used = settled count + live reservations. A stored window is never
+  // moved backwards, so a late request stamped in an older month cannot reset
+  // newer-month usage.
+  private async loadLearning(txn: StorageReader, now: number): Promise<LearningState> {
+    const stored = await txn.get<LearningState>("learning");
+    const start = Math.max(windowStartUtc(now), stored?.windowStart ?? 0);
+    const base: LearningState =
+      stored && stored.windowStart === start
+        ? stored
+        : { windowStart: start, count: 0, reservations: [] };
+    const nowMs = Date.now();
+    return {
+      ...base,
+      reservations: (base.reservations ?? []).filter((r) => r.expiresAt > nowMs),
+    };
+  }
+
+  private async handleLearnReserve(body: LearnReserveBody): Promise<Response> {
+    return this.storage.transaction(async (txn) => {
+      const deletion = await this.loadAccountDeletionMarkerFrom(txn);
+      if (deletion) return accountDeletionResponse(deletion);
+      const state = await this.loadLearning(txn, body.now);
+      if (state.count + state.reservations.length >= body.limit) {
+        await txn.put<LearningState>("learning", state);
+        return jsonError(429, "learning_limit_exceeded", "Voice learning limit reached.", {
+          resetsAt: new Date(windowResetsAt(state.windowStart)).toISOString(),
+        });
+      }
+      state.reservations.push({
+        id: body.reservationId,
+        expiresAt: Date.now() + RESERVATION_TTL_MS,
+      });
+      await txn.put<LearningState>("learning", state);
+      return Response.json({ count: state.count + state.reservations.length });
+    });
+  }
+
+  /** Idempotent by reservation id: unknown or repeated ids are no-ops. */
+  private async handleLearnFinish(body: LearnFinishBody): Promise<Response> {
+    return this.storage.transaction(async (txn) => {
+      const state = await this.loadLearning(txn, body.now);
+      const held = state.reservations.some((r) => r.id === body.reservationId);
+      state.reservations = state.reservations.filter((r) => r.id !== body.reservationId);
+      if (held && body.settle) state.count += 1;
+      await txn.put<LearningState>("learning", state);
+      return Response.json({ count: state.count + state.reservations.length });
     });
   }
 

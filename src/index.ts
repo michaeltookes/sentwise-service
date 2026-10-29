@@ -8,6 +8,7 @@ import {
   resolveAccountIfExists,
 } from "./auth";
 import { forwardToAnthropic, parseDraftRequest } from "./anthropic";
+import { buildLearningRequest, LEARNING_MONTHLY_LIMIT } from "./learning";
 import { ApiError, jsonError } from "./errors";
 import {
   DEFAULT_MAX_TOKENS,
@@ -20,6 +21,7 @@ import {
   buildQuota,
   conservativeRequestTokenBound,
   effectiveEnforcement,
+  freshWindow,
   windowStartUtc,
   numFrom,
   resolveLimits,
@@ -32,6 +34,8 @@ import {
   quotaDeferRelease,
   quotaDeferSettlement,
   quotaFinishAccountDeletion,
+  quotaLearningFinish,
+  quotaLearningReserve,
   quotaPeek,
   quotaRelease,
   quotaReserve,
@@ -251,6 +255,80 @@ export default {
             hasPaidAccess(account.subscription),
           ),
         };
+
+        // 139: voice learning is a server-defined operation: fixed system prompt,
+        // output constraints and input cap (the client's are ignored), metered by
+        // its own per-account allowance and never as a draft. The allowance
+        // reserve also hits the deletion barrier, so a deleted account gets 410
+        // before any provider call.
+        if (draft.purpose === "voice_learning") {
+          const learnReq = buildLearningRequest(draft);
+          const learnId = crypto.randomUUID();
+          await quotaLearningReserve(env, userId, {
+            now,
+            limit: LEARNING_MONTHLY_LIMIT,
+            reservationId: learnId,
+          });
+          // Best effort with one retry; a lost call self-heals when the reservation expires.
+          const finish = async (settle: boolean) => {
+            for (let i = 0; i < 2; i++) {
+              try {
+                await quotaLearningFinish(env, userId, { now, reservationId: learnId, settle });
+                return;
+              } catch {
+                /* retry once */
+              }
+            }
+          };
+          const learnModel = learnReq.model ?? DEFAULT_MODEL;
+          const t1 = Date.now();
+          let learned;
+          try {
+            learned = await forwardToAnthropic(learnReq, env);
+          } catch (err) {
+            await finish(false);
+            await recordUsage(env, {
+              userId,
+              model: learnModel,
+              inputTokens: 0,
+              outputTokens: 0,
+              latencyMs: Date.now() - t1,
+              outcome: err instanceof ApiError ? err.type : "internal_error",
+              purpose: "voice_learning",
+            });
+            throw err;
+          }
+          await recordUsage(env, {
+            userId,
+            model: learnModel,
+            inputTokens: learned.usage.inputTokens,
+            outputTokens: learned.usage.outputTokens,
+            latencyMs: Date.now() - t1,
+            outcome: "ok",
+            purpose: "voice_learning",
+          });
+          await finish(true);
+          // Fresh timestamp: the request may have crossed a UTC month boundary,
+          // and a stale `now` would roll (erase) the new month's usage. The profile
+          // is already paid for, so a transient read failure returns it with an
+          // empty-window snapshot; an explicit account-deletion error still surfaces.
+          let peeked;
+          try {
+            ({ window: peeked } = await quotaPeek(env, userId, { now: Date.now() }));
+          } catch (err) {
+            if (err instanceof ApiError && (err.status === 410 || err.status === 409)) throw err;
+            peeked = freshWindow(Date.now());
+          }
+          const peekedBase = resolveLimits(env, account.quotaOverride, peeked.windowStart);
+          const peekedLimits = {
+            ...peekedBase,
+            enforcement: effectiveEnforcement(
+              peekedBase.enforcement,
+              hasPaidAccess(account.subscription),
+            ),
+          };
+          return Response.json({ ...learned, quota: buildQuota(peeked, peekedLimits) });
+        }
 
         // 2) Per-request token safety cap (pre-flight conservative bound).
         const content = draftContentSize(draft.system, draft.messages);

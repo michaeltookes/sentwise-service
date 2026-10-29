@@ -13,6 +13,8 @@ export interface UsageEvent {
   outputTokens: number;
   latencyMs: number;
   outcome: string; // "ok" or an error type
+  /** 139: absent means a draft. Learning counts toward spend, never toward draft counts. */
+  purpose?: "draft" | "voice_learning";
 }
 
 function toHex(buffer: ArrayBuffer): string {
@@ -85,7 +87,7 @@ export async function recordUsage(env: Env, ev: UsageEvent): Promise<void> {
     const hashed = await hashUserId(ev.userId, env.ANALYTICS_HASH_KEY);
     dataset.writeDataPoint({
       indexes: [hashed],
-      blobs: [hashed, ev.model, ev.outcome],
+      blobs: [hashed, ev.model, ev.outcome, ev.purpose ?? "draft"],
       doubles: [
         ev.inputTokens,
         ev.outputTokens,

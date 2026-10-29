@@ -200,6 +200,24 @@ export function quotaPeek(env: Env, userId: string, body: { now: number }): Prom
   return call<WindowResult>(env, userId, "/peek", body);
 }
 
+/** 139: reserve one unit of the independent voice-learning allowance (never a draft). */
+export function quotaLearningReserve(
+  env: Env,
+  userId: string,
+  body: { now: number; limit: number; reservationId: string },
+): Promise<{ count: number }> {
+  return call<{ count: number }>(env, userId, "/learn-reserve", body);
+}
+
+/** 139: settle (provider succeeded) or refund a learning reservation, idempotent by id. */
+export function quotaLearningFinish(
+  env: Env,
+  userId: string,
+  body: { now: number; reservationId: string; settle: boolean },
+): Promise<{ count: number }> {
+  return call<{ count: number }>(env, userId, "/learn-finish", body);
+}
+
 /** Serialize and record an interest signal through the user's Durable Object. */
 export function quotaRecordInterest(
   env: Env,

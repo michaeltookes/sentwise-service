@@ -21,6 +21,12 @@ export function isoForSql(ms: number): string {
   return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
 }
 
+// 139: 1 for a draft row, 0 for a voice-learning row. Rows written before the
+// purpose blob existed have no blob4 and count as drafts. Learning rows still
+// count toward tokens, cost and active accounts (real inference spend) but not
+// toward draft counts or the cost-per-draft percentiles.
+const DRAFT_ROW = `if(blob4 = 'voice_learning', 0, 1)`;
+
 /** Aggregate query for one time window. `_sample_interval` reweights AE sampling. */
 export function aggregateSql(dataset: string, sinceIso: string): string {
   const where = `timestamp >= toDateTime('${sinceIso}') AND blob3 = 'ok'`;
@@ -34,11 +40,11 @@ export function aggregateSql(dataset: string, sinceIso: string): string {
   const activeAccountsSql = `COUNT(DISTINCT index1) AS active_accounts`;
   return (
     `SELECT ` +
-    `SUM(_sample_interval) AS drafts, ` +
+    `SUM(_sample_interval * ${DRAFT_ROW}) AS drafts, ` +
     `SUM(_sample_interval * (double1 + double2)) AS tokens, ` +
     `SUM(_sample_interval * double3) AS cost_usd, ` +
-    `quantileWeighted(0.5)(double3, _sample_interval) AS cost_p50, ` +
-    `quantileWeighted(0.95)(double3, _sample_interval) AS cost_p95, ` +
+    `quantileWeighted(0.5)(double3, _sample_interval * ${DRAFT_ROW}) AS cost_p50, ` +
+    `quantileWeighted(0.95)(double3, _sample_interval * ${DRAFT_ROW}) AS cost_p95, ` +
     `${activeAccountsSql} ` +
     `FROM ${dataset} ` +
     `WHERE ${where}`
@@ -50,7 +56,7 @@ export function topAccountsSql(dataset: string, sinceIso: string): string {
   return (
     `SELECT index1 AS account, ` +
     `SUM(_sample_interval * double3) AS cost_usd, ` +
-    `SUM(_sample_interval) AS drafts ` +
+    `SUM(_sample_interval * ${DRAFT_ROW}) AS drafts ` +
     `FROM ${dataset} ` +
     `WHERE timestamp >= toDateTime('${sinceIso}') AND blob3 = 'ok' ` +
     `GROUP BY index1 ORDER BY cost_usd DESC LIMIT 10`
